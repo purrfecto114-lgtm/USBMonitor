@@ -156,33 +156,3 @@ build\windows_nuitka.bat onefile
 [`upx/LICENSE`](upx/LICENSE) 和 [`upx/README.txt`](upx/README.txt)。
 
 主应用本身的许可证见仓库根目录（如未提供则默认私有）。
-
-
-## v1.3.0 product reliability and closed-loop pass
-
-- Fixed automation hook persistence: validated `hooks` now round-trip through `config.json` instead of being silently discarded.
-- Hardened hook execution with bounded argv rules, documented-placeholder-only substitution, explicit `shell=False`, and bounded-memory child output handling.
-- Added a canonical per-drive safe-eject state machine that rejects duplicate requests and retains each `QThread` until Qt emits `finished`.
-- Added persistent operation status to the tray menu and tooltip so eject results remain discoverable when Windows notifications are disabled.
-- Turned recent-volume data into a usable “最近使用” submenu with online/offline state, last-seen time, copy-path, and clear actions.
-
-## v1.2.7 markdown report full-fix pass
-
-- Implemented the 2026-06-30 Markdown audit pass across startup, notification registration, Toast timers, hook matching, logging cleanup, startup copy hygiene, and dead-code cleanup.
-- Startup now uses `--silent` / tray-only behavior to reduce login noise, while device-listener failures are surfaced as startup errors instead of silently degrading.
-- Added regression coverage for crash-log preservation, case-insensitive hooks, silent startup, mutex-name sanitizing, device-notification buffer fallback, and module-entry dead-code removal.
-
-## v1.2.6 tray split and open-button pass
-
-- Split tray interactions: left click opens the USB-device operations menu directly; right click opens a compact app/settings menu without the device list.
-- Enlarged the global “打开U盘” button and the expanded per-volume “打开” buttons for easier touch/mouse use.
-- Added regression tests for tray menu split and button sizing.
-
-## v1.2.5 markdown follow-up stability pass
-
-- Reworked DriveReconciler scheduling so immediate / short / settle scans are kept as independent scheduled jobs instead of sharing overwrite-prone keys.
-- Changed volume removal into a pending-confirmation workflow: a drive letter is only removed from state after a follow-up scan confirms it is gone, reducing GUI flicker and duplicate events.
-- Replaced ToastWindow's global application event filter with QApplication.focusChanged-based auto-hide logic.
-- HookRunner now uses a bounded ThreadPoolExecutor instead of spawning an unbounded thread per matching hook.
-- Single-instance mutex creation failure is logged and handled without crashing at startup.
-- Toast repositioning refreshes the work area after resize, making monitor/taskbar/DPI changes less likely to leave stale geometry.
