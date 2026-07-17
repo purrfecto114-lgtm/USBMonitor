@@ -34,7 +34,7 @@ from .core import (
     format_bytes,
     group_title,
     group_volumes,
-    hash_id,
+    stable_fingerprint,
     normalize_drive_path,
     normalize_hook_rules,
     normalize_recent_records,
@@ -52,7 +52,7 @@ from .core import (
 # the explicit names above take precedence and we can safely glob the rest.
 from .app import *  # noqa: E402, F401, F403
 
-__version__ = "1.3.2"
+__version__ = "1.0.0"
 __all__ = [
     # core
     "AppConfig",
@@ -69,7 +69,7 @@ __all__ = [
     "format_bytes",
     "group_title",
     "group_volumes",
-    "hash_id",
+    "stable_fingerprint",
     "normalize_drive_path",
     "normalize_hook_rules",
     "normalize_recent_records",

@@ -52,4 +52,4 @@ def test_versions_are_consistent() -> None:
     build_source = (ROOT / "build" / "windows_nuitka.bat").read_text(encoding="utf-8")
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     for source in (init_source, app_source, build_source, pyproject):
-        assert "1.3.2" in source
+        assert "1.0.0" in source

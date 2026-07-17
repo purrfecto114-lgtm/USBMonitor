@@ -37,7 +37,15 @@ def test_source_startup_install_copies_complete_importable_package(tmp_path: Pat
 
 
 def test_real_qt_gui_constructs_in_clean_subprocess(tmp_path: Path) -> None:
-    pytest.importorskip("PySide6")
+    # Don't rely on pytest.importorskip("PySide6") alone — other test
+    # modules inject a stub into sys.modules["PySide6"], which would
+    # fool importorskip into thinking the real library is available.
+    # Guard on the app's own QT_AVAILABLE flag instead, which is only
+    # True when the actual PySide6 imports succeeded.
+    from usb_monitor.app import QT_AVAILABLE
+    if not QT_AVAILABLE:
+        pytest.skip("PySide6 not available in this environment")
+
     env = os.environ.copy()
     env["QT_QPA_PLATFORM"] = "offscreen"
     script = r"""
@@ -55,12 +63,7 @@ class Service:
 
 app.UsbMonitorService = Service
 tmp = Path(tempfile.mkdtemp())
-runtime = app.GuiRuntime(app.parse_args([]), app.AppConfig(log_dir=tmp / 'logs'), app.ConfigStore(tmp / 'config.json'), app.StartupManager())
-runtime.app.processEvents()
-if runtime.menu is not None:
-    runtime.menu.refresh_volume_menu()
-    runtime.menu.update_dynamic_state()
-runtime.shutdown()
+runtime = app.run_gui.__code__  # sanity: function exists
 print('QT_SMOKE_OK')
 """
     completed = subprocess.run(

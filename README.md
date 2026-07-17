@@ -23,27 +23,35 @@
 usb-monitor/
 ├── USBMonitor.pyw              # GUI/Nuitka 稳定入口
 ├── USBMonitor_console.py       # 保留控制台的诊断入口
+├── run_usb_monitor.bat         # 双击启动：自动建 venv + 装依赖 + 启动
 ├── pyproject.toml              # 可编辑安装与 usb-monitor 命令
 ├── usb_monitor/                # Python 包
 │   ├── __init__.py             # 公共 API re-export
 │   ├── __main__.py             # python -m usb_monitor 入口
-│   ├── app.py                  # Win32 + PySide6 实现（约 3300 行）
-│   └── core.py                 # 纯函数 / 数据模型（可独立测试）
-├── tests/                      # pytest 测试集（139 cases）
+│   ├── app.py                  # Win32 + PySide6 实现（约 3900 行）
+│   ├── core.py                 # 纯函数 / 数据模型（可独立测试）
+│   └── hooks.py                # USB 事件钩子（shell=False 安全契约）
+├── tests/                      # pytest 测试集
 │   ├── test_core.py            # core 纯函数
 │   ├── test_bus_cache.py       # L1/L2 缓存
 │   ├── test_ux_rewrites.py     # S2 UX 行为
-│   └── test_gui_bugfixes.py    # 旧版 GUI 兼容性（2）
+│   ├── test_gui_bugfixes.py    # GUI 兼容性
+│   ├── test_hook_security.py   # AST 防回归（shell=False 守门）
+│   ├── test_entrypoint_and_nuitka.py  # 入口与版本一致性
+│   ├── test_audit_report_fixes.py
+│   ├── test_markdown_report_20260630_fixes.py
+│   ├── test_md_followup_fixes.py
+│   └── test_tray_split_and_button_size.py
 ├── upx/                        # 内置 UPX 4.2.4 win64（可重放构建）
 │   ├── upx.exe
 │   ├── LICENSE
 │   └── README.txt
 ├── build/                      # Windows 打包脚本
-│   └── windows_nuitka_upx.bat
+│   └── windows_nuitka.bat      # onefile / standalone
 ├── docs/                       # 审查与改进文档
-│   ├── ANALYSIS.md             # 静态分析报告
-│   └── IMPROVEMENTS.md         # 可落地 Patch
+│   └── BUILD.md                # Nuitka 打包指南
 ├── CHANGELOG.md                # 变更历史
+├── requirements-build.txt      # 构建 + 测试依赖
 ├── pytest.ini
 ├── .gitignore
 └── README.md
@@ -67,7 +75,7 @@ python -m usb_monitor
 
 # 3. 跑测试（Linux/Windows 都行）
 python -m pytest -q
-# → 141 passed
+# → 140 passed
 
 # 4. CLI 模式（不开 GUI，10s 后退出）
 python -m usb_monitor --no-gui
@@ -106,11 +114,12 @@ python -m usb_monitor --startup-status
 
 ```cmd
 :: 一行命令构建 single-file 可执行
-py -3.11 -m pip install nuitka zstandard ordered-set
+py -3.11 -m pip install -r requirements-build.txt
 build\windows_nuitka.bat onefile
 ```
 
-产物在 `dist\USBMonitor.exe`，用内置 `upx\upx.exe` 压缩。
+产物在 `dist\USBMonitor.exe`。脚本会自动检测内置 `upx\upx.exe` 并传给
+Nuitka 做压缩；设置 `USBMONITOR_NO_UPX=1` 可跳过。
 
 详见 [`build/windows_nuitka.bat`](build/windows_nuitka.bat) 和
 [`docs/BUILD.md`](docs/BUILD.md)（如果存在）。
@@ -148,6 +157,56 @@ build\windows_nuitka.bat onefile
 - 主程序仅支持 Windows（Win32 + PySide6）
 - 测试可在 Linux / macOS 上跑（`core.py` 是纯函数，`app.py` 在非 Windows 上
   走 fallback 路径，`ToastWindow` 走 stub 路径）
+
+## 🔒 安全
+
+### Hooks 的信任边界
+
+> **USB Monitor 的 Hooks 功能会在检测到 USB 设备时，以当前登录用户的
+> 权限启动配置中指定的程序。请勿使用来源不可信的 `config.json`，
+> 也不要向不可信用户授予配置文件写入权限。导入、复制或同步配置文件前，
+> 应检查其中的 Hooks 规则。**
+
+具体含义：
+
+* **Hooks 不是沙箱。** `subprocess.run(..., shell=False)` 防止的是
+  `cmd.exe` / `sh` 对参数进行二次解析，并不限制被启动程序本身的权限。
+  被 Hook 启动的进程拥有与当前 Windows 用户完全相同的访问能力：可以读
+  取你的文件、访问网络、修改注册表、装进程。
+* **`config.json` 是隐式信任点。** 该文件位于
+  `%LOCALAPPDATA%\USBMonitor\config.json`，任何能写入该文件的人/程序
+  都可以注入任意 `command`，并在 USB 插入时静默执行。
+* **默认不启用任何 Hook。** 全新安装的 `config.json` 的 `hooks` 数组
+  为空——Hook 完全是 opt-in。
+* **不要把 Hooks 描述为“安全执行”。** 它不是。
+* **占位符输入不可信。** 插入的 U 盘标签和卷路径会通过 `{path}` /
+  `{label}` 拼入 `argv`，攻击者可以构造一个标签为
+  `foo"; calc; echo "` 的 U 盘。本项目通过 `shell=False` 防住了这一
+  路径，但仍然限制：不要在未来为 Hooks 打开 `shell=True`。
+
+### 防御性编码
+
+* Hook 调用使用 `shell=False`、`stdin/stdout/stderr=DEVNULL`，
+  超时 60 秒。详见 `usb_monitor/hooks.py` 中的 `SECURITY` 注释。
+* `tests/test_hook_security.py` 用 AST 静态检查每一个 `subprocess.*`
+  调用，强制要求显式 `shell=False` 字面量，防止回归。
+* 日志字段 `serial / label / device_path / run_value / expected_command`
+  等会被 `sanitize_for_log` 脱敏为
+  `stable_fingerprint(value)`（SHA-256 前 12 位）。
+  **这不是加密、不是匿名化、不可抗离线枚举。** 仅用于跨日志关联同
+  一个设备，不应用于凭证或高熵以外的秘密。
+
+### Bandit 推荐
+
+CI 可加一层 Bandit 扫描作为补充：
+
+```bash
+python -m pip install bandit
+bandit -q -r usb_monitor
+```
+
+本项目未自带 GitHub Actions workflow；如果你接入 CI，可以把上面的
+`bandit` 命令与 `pytest` 一起跑在 PR 流水线中。
 
 ## 📜 许可证
 

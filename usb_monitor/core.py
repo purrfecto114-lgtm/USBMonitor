@@ -128,7 +128,31 @@ def as_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
     return max(result, minimum) if minimum is not None else result
 
 
-def hash_id(value: Any) -> str:
+def stable_fingerprint(value: Any) -> str:
+    """Return a short, deterministic correlation identifier.
+
+    Intended use: correlating the same identifier across log records
+    (e.g. a USB serial appearing in multiple events).  The output is
+    **not** encryption, **not** anonymization, and **not** protection
+    against dictionary attacks — it is a plain truncated SHA-256 of
+    the input with no salt.
+
+    Implications for callers:
+
+    * Same input → same output across processes, machines, and reboots.
+    * Low-entropy inputs (short labels, predictable patterns) can be
+      enumerated offline.
+    * Truncating SHA-256 to 12 hex chars (48 bits) reduces collision
+      resistance; collisions are unlikely for the high-entropy USB
+      identifiers this app handles, but the value is not a hash with
+      cryptographic guarantees.
+    * Do not use this for secrets, credentials, or anything that needs
+      to resist reversal.
+
+    The function is named for what it *is* (a stable fingerprint) rather
+    than for what callers use it for — see :func:`redact` for the
+    redaction helper that wraps it.
+    """
     return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
@@ -321,9 +345,9 @@ def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): redact(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [f"redacted:{hash_id(item)}" for item in value]
+        return [f"redacted:{stable_fingerprint(item)}" for item in value]
     text = str(value)
-    return "" if not text else f"redacted:{hash_id(text)}"
+    return "" if not text else f"redacted:{stable_fingerprint(text)}"
 
 
 def sanitize_for_log(value: Any, raw: bool = False) -> Any:
@@ -436,7 +460,7 @@ __all__ = [
     "AppConfig",
     "as_bool",
     "as_int",
-    "hash_id",
+    "stable_fingerprint",
     "normalize_drive_path",
     "display_name_for_path",
     "normalize_recent_records",

@@ -62,7 +62,7 @@ build\windows_nuitka.bat onefile
 - onefile 和 standalone 两种模式；
 - GUI 默认禁用控制台，支持调试时强制控制台；
 - 生成 `build\nuitka\nuitka-report.xml` 供依赖审计；
-- PE 文件版本使用四段式 `1.3.2.0`；
+- PE 文件版本使用四段式 `1.0.0.0`；
 - onefile 可选本地 UPX，目录版不执行 UPX；
 - 可通过 `USBMONITOR_NO_UPX=1` 禁用 UPX；
 - 可通过 `NUITKA_EXTRA_ARGS` 注入额外参数；

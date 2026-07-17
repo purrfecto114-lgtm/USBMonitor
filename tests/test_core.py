@@ -26,7 +26,7 @@ from usb_monitor.core import (
     format_bytes,
     group_title,
     group_volumes,
-    hash_id,
+    stable_fingerprint,
     normalize_drive_path,
     normalize_recent_records,
     precise_percent,
@@ -171,16 +171,32 @@ def test_as_int(raw, default, minimum, expected):
     assert as_int(raw, default, minimum) == expected
 
 
-def test_hash_id_stable():
-    assert hash_id("hello") == hash_id("hello")
+def test_stable_fingerprint_stable():
+    assert stable_fingerprint("hello") == stable_fingerprint("hello")
 
 
-def test_hash_id_distinguishes_inputs():
-    assert hash_id("hello") != hash_id("world")
+def test_stable_fingerprint_distinguishes_inputs():
+    assert stable_fingerprint("hello") != stable_fingerprint("world")
 
 
-def test_hash_id_short():
-    assert len(hash_id("anything")) == 12
+def test_stable_fingerprint_short():
+    assert len(stable_fingerprint("anything")) == 12
+
+
+def test_stable_fingerprint_is_documented_as_not_cryptographic():
+    """Guard against future regression of the security docstring.
+
+    The function is intentionally a plain truncated SHA-256 with no salt.
+    Its name and docstring must keep telling callers that it is not
+    encryption, not anonymization, and not safe for secrets.  This test
+    fails if anyone removes or weakens that wording, so the security
+    contract is enforced alongside the implementation.
+    """
+    from usb_monitor import core
+    doc = (core.stable_fingerprint.__doc__ or "").lower()
+    assert "not" in doc and "encryption" in doc
+    assert "not" in doc and "anonymization" in doc
+    assert "salt" in doc  # the docstring must mention the absence of salt
 
 
 # ---------------------------------------------------------------------------

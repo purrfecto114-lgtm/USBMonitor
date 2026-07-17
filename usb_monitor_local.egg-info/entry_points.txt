@@ -1,2 +1,0 @@
-[console_scripts]
-usb-monitor = usb_monitor.app:main

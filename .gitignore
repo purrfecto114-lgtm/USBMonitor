@@ -28,3 +28,10 @@ htmlcov/
 *.log
 *.local.json
 .env
+.venv/
+
+# Keep bundled UPX binary (required for reproducible builds)
+!upx/upx.exe
+
+# Diagnostic / scratch
+optimized-prompt.md

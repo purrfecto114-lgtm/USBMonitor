@@ -60,7 +60,7 @@ from .core import (
     format_bytes,
     group_title,
     group_volumes,
-    hash_id,
+    stable_fingerprint,
     normalize_drive_path,
     normalize_hook_rules,
     normalize_recent_records,
@@ -75,7 +75,7 @@ from .core import (
 APP_NAME = "USBMonitor"
 APP_ORG = "BellaKipping"
 APP_DISPLAY_NAME = "USB Monitor"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.0.0"
 CONFIG_VERSION = 3
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LOG = logging.getLogger("usb_monitor")
@@ -335,7 +335,7 @@ def default_log_dir() -> Path:
     return app_data_dir() / "logs"
 
 
-# hash_id, as_bool, as_int, normalize_drive_path, display_name_for_path,
+# stable_fingerprint, as_bool, as_int, normalize_drive_path, display_name_for_path,
 # normalize_recent_records live in core.py.
 
 

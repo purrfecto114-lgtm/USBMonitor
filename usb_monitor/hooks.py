@@ -137,18 +137,34 @@ class HookRunner:
             return
 
         def run() -> None:
-            # Do not log the full argv because hook arguments may contain paths or
-            # secrets.  Output is discarded to keep a noisy child process from
-            # consuming unbounded memory.  shell=False is explicit by design.
+            # SECURITY: never enable shell parsing for hook commands.
+            #
+            # Why shell=False is mandatory:
+            #   * Hook argv contains user-supplied {path} / {label}, which can
+            #     include spaces, quotes, and shell metacharacters.  Even though
+            #     we reject unknown braces, the path/label themselves are
+            #     attacker-controllable (e.g. a USB volume labeled
+            #     "foo; rm -rf /").  With shell=True these would be passed
+            #     through cmd.exe and executed.
+            #   * Disabling the shell does NOT sandbox the spawned process —
+            #     it only prevents command-interpreter parsing.  The hooked
+            #     program still runs with the full token of the current user.
+            #     See README "Security" for the trust boundary.
+            #
+            # We also explicitly redirect all three standard streams to
+            # DEVNULL so a malicious or buggy hook cannot block on stdin,
+            # flood the parent's pipe buffers, or leak output into the
+            # GUI process.
             LOG.info("hook_fired", extra={"rule": rule.name, "executable": cmd[0]})
             try:
                 subprocess.run(
                     cmd,
                     check=False,
                     timeout=60,
+                    shell=False,  # SECURITY: see block comment above.
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    shell=False,
                 )
             except subprocess.TimeoutExpired:
                 LOG.warning("hook_timeout", extra={"rule": rule.name})
