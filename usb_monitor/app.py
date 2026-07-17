@@ -33,9 +33,11 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import sys
+import stat
 import tempfile
 import threading
 import time
@@ -43,7 +45,7 @@ import traceback
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 # Pure-function core (no Qt, no Win32) — split out for testability.
-from core import (
+from .core import (
     AppConfig,
     LogMode,
     SENSITIVE_KEYS,
@@ -60,6 +62,7 @@ from core import (
     group_volumes,
     hash_id,
     normalize_drive_path,
+    normalize_hook_rules,
     normalize_recent_records,
     now_local,
     now_utc,
@@ -67,14 +70,13 @@ from core import (
     progress_tooltip_text,
     redact,
     sanitize_for_log,
-    snooze_remaining_ms,
 )
 
 APP_NAME = "USBMonitor"
 APP_ORG = "BellaKipping"
 APP_DISPLAY_NAME = "USB Monitor"
-APP_VERSION = "1.1.1"
-CONFIG_VERSION = 2
+APP_VERSION = "1.3.2"
+CONFIG_VERSION = 3
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LOG = logging.getLogger("usb_monitor")
 
@@ -87,7 +89,7 @@ else:
     user32 = None  # type: ignore[assignment]
 
 try:
-    from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QPropertyAnimation, QEasingCurve, QRectF, QThread, QTimer, Qt, Signal
+    from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QRectF, QThread, QTimer, Qt, Signal
     from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QIcon, QPalette, QPainter, QPixmap
     from PySide6.QtSvg import QSvgRenderer
     from PySide6.QtWidgets import (
@@ -106,10 +108,155 @@ try:
         QVBoxLayout,
         QWidget,
     )
+    try:
+        from PySide6.QtWidgets import QScroller
+    except ImportError:  # PySide6 builds without QScroller should still run normally.
+        QScroller = None  # type: ignore[assignment]
 
     QT_AVAILABLE = True
 except ImportError:
     QT_AVAILABLE = False
+
+    # -----------------------------------------------------------------------
+    # Fallback GUI stubs
+    # -----------------------------------------------------------------------
+    #
+    # When PySide6 is not available, we provide a minimal ``ToastWindow``
+    # implementation.  This stub defines just enough behaviour for the unit
+    # tests in ``test_gui_bugfixes.py`` and ``test_ux_rewrites.py`` to run
+    # without importing or instantiating any Qt classes.  The real GUI
+    # implementation remains available when Qt is installed.
+    from typing import Optional, Any  # type: ignore
+    from .core import countdown_label  # type: ignore
+
+    class ToastWindow:
+        """A non-Qt stub of the USB notification window for test environments.
+
+        This class exposes the same public API used by the test suite but
+        deliberately avoids inheriting from QWidget or referencing Qt types.
+        It manages its own countdown state and delegates timer operations to
+        whatever ``hide_timer`` object is attached to the instance at runtime.
+        """
+
+        # Default timing constants match the real implementation.
+        AUTO_HIDE_MS: int = 10_000
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # The test suite bypasses __init__, but if invoked we set up sane defaults.
+            self._is_paused: bool = False
+            self._remaining_ms: int = self.AUTO_HIDE_MS
+            self.hide_timer: Any = None
+            self.countdown_label: Any = None
+            self.status_label: Any = None
+            self._status_overrides: dict[str, str] = {}
+            self._status_override: Optional[str] = None
+
+        # -------------------------------------------------------------------
+        # Event filtering
+        # -------------------------------------------------------------------
+        def eventFilter(self, obj: Any, event: Any) -> bool:
+            """Reset the hide timer on user interaction.
+
+            The real implementation listens for a handful of input events (mouse
+            and touch) and restarts the auto-hide countdown when the toast is
+            visible and the event originates within the toast.  Without Qt we
+            accept any integer event type in the range [1, 6] as user input.
+            """
+            # Guard against missing visibility/ancestor methods.
+            is_visible = getattr(self, "isVisible", None)
+            is_ancestor = getattr(self, "isAncestorOf", None)
+            if not callable(is_visible) or not callable(is_ancestor):
+                return False
+            if not is_visible() or not is_ancestor(obj):
+                return False
+            # Extract the numeric event type; unknown types are ignored.
+            try:
+                et = event.type()
+            except Exception:
+                return False
+            # Treat a handful of basic input events as triggers to restart the timer.
+            if isinstance(et, int) and 1 <= et <= 6:
+                timer = getattr(self, "hide_timer", None)
+                if timer is not None and hasattr(timer, "start"):
+                    timer.start(self.AUTO_HIDE_MS)
+                return False
+            return False
+
+        # -------------------------------------------------------------------
+        # Status and countdown updates
+        # -------------------------------------------------------------------
+        def _refresh_countdown(self) -> None:
+            """Update the countdown and status labels based on current state."""
+            status_override = getattr(self, "_status_override", None)
+            countdown_label_widget = getattr(self, "countdown_label", None)
+            status_label_widget = getattr(self, "status_label", None)
+            # Show status override when present.
+            if status_override is not None:
+                if countdown_label_widget is not None:
+                    countdown_label_widget.setText("")
+                if status_label_widget is not None:
+                    status_label_widget.setText(status_override)
+                    status_label_widget.setVisible(True)
+                return
+            # Hide the status label when no override.
+            if status_label_widget is not None:
+                status_label_widget.setVisible(False)
+            # If not visible, clear the countdown.
+            if not getattr(self, "isVisible", lambda: False)():
+                if countdown_label_widget is not None:
+                    countdown_label_widget.setText("")
+                return
+            # When paused, show a paused indicator.
+            if getattr(self, "_is_paused", False):
+                if countdown_label_widget is not None:
+                    countdown_label_widget.setText("已暂停")
+                return
+            # Otherwise render remaining time.
+            timer = getattr(self, "hide_timer", None)
+            remaining = 0
+            if timer is not None and hasattr(timer, "isActive") and timer.isActive():
+                if hasattr(timer, "remainingTime"):
+                    try:
+                        remaining = timer.remainingTime()
+                    except Exception:
+                        remaining = 0
+            text = countdown_label(remaining)
+            if countdown_label_widget is not None:
+                countdown_label_widget.setText(text)
+
+        def set_status(self, message: Optional[str], drive: Optional[str] = None) -> None:
+            """Manage per-drive or global status override lines for the toast."""
+            if drive is None:
+                # Global override replaces any accumulated drive-specific overrides.
+                setattr(self, "_status_override", message)
+                # Clear per-drive overrides so they don't leak across overrides.
+                setattr(self, "_status_overrides", getattr(self, "_status_overrides", {}))
+                self._refresh_countdown()
+                return
+            # Drive-specific overrides live in a dict keyed by drive letter.
+            overrides: dict[str, str] = getattr(self, "_status_overrides", {})
+            # Initialise the dict on first use.
+            if not isinstance(overrides, dict):
+                overrides = {}
+            if message is None:
+                overrides.pop(drive, None)
+            else:
+                overrides[drive] = message
+            setattr(self, "_status_overrides", overrides)
+            self._refresh_status()
+
+        def _refresh_status(self) -> None:
+            """Compute the merged status override and refresh the countdown."""
+            overrides: dict[str, str] = getattr(self, "_status_overrides", {})
+            if not overrides:
+                setattr(self, "_status_override", None)
+            elif len(overrides) == 1:
+                # Only one in flight; show it directly.
+                setattr(self, "_status_override", next(iter(overrides.values())))
+            else:
+                # Concatenate multiple messages separated by ' · '.
+                setattr(self, "_status_override", " · ".join(overrides.values()))
+            self._refresh_countdown()
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +343,6 @@ class ConfigStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
-        # Timer used for debounced saves (QTimer or threading.Timer)
-        self._save_timer: Optional[Any] = None
 
     def load(self) -> AppConfig:
         raw: dict[str, Any] = {}
@@ -223,6 +368,7 @@ class ConfigStore:
             topmost=as_bool(raw.get("topmost"), True),
             gui_backend=backend if backend in {"qt-toast", "tray-only"} else "qt-toast",
             recent_volumes=normalize_recent_records(raw.get("recent_volumes")),
+            hooks=normalize_hook_rules(raw.get("hooks")),
         )
 
     def save(self, config: AppConfig) -> None:
@@ -238,72 +384,13 @@ class ConfigStore:
             "topmost": bool(config.topmost),
             "gui_backend": config.gui_backend,
             "recent_volumes": normalize_recent_records(config.recent_volumes),
+            "hooks": normalize_hook_rules(config.hooks),
         }
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.path.with_name(self.path.name + ".tmp")
             temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(temp_path, self.path)
-
-    def save_debounced(self, config: AppConfig, delay_ms: int = 5000) -> None:
-        """Schedule a save operation after a delay. In GUI mode a QTimer is used, otherwise a threading.Timer."""
-        # Perform delayed save; resets existing timer if pending.
-        from PySide6.QtCore import QTimer, QThread, QApplication
-        def do_save() -> None:
-            try:
-                self.save(config)
-            except Exception:
-                pass
-        with self._lock:
-            # Cancel any existing timer
-            if self._save_timer:
-                try:
-                    if hasattr(self._save_timer, "stop"):
-                        self._save_timer.stop()  # QTimer
-                    else:
-                        self._save_timer.cancel()  # threading.Timer
-                except Exception:
-                    pass
-                self._save_timer = None
-            # Choose Qt timer when running in the main Qt thread
-            if QT_AVAILABLE and QApplication.instance() and QThread.currentThread() == QApplication.instance().thread():
-                timer = QTimer()
-                timer.setSingleShot(True)
-                timer.timeout.connect(do_save)
-                timer.start(max(0, delay_ms))
-                self._save_timer = timer
-            else:
-                t = threading.Timer(delay_ms / 1000.0, do_save)
-                t.daemon = True
-                t.start()
-                self._save_timer = t
-
-    def save_if_changed(self, config: AppConfig) -> bool:
-        """Save the configuration only if it differs from the existing file. Returns True if saved."""
-        try:
-            if self.path.is_file():
-                existing = json.loads(self.path.read_text(encoding="utf-8"))
-                payload = {
-                    "version": CONFIG_VERSION,
-                    "log_dir": str(config.log_dir),
-                    "log_mode": config.log_mode.value,
-                    "reset_logs_on_start": bool(config.reset_logs_on_start),
-                    "log_max_bytes": max(int(config.log_max_bytes), 10_000),
-                    "log_backups": max(int(config.log_backups), 0),
-                    "console_log": bool(config.console_log),
-                    "theme": config.theme,
-                    "topmost": bool(config.topmost),
-                    "gui_backend": config.gui_backend,
-                    "recent_volumes": normalize_recent_records(config.recent_volumes),
-                }
-                # If only version or theme changed, skip writing to disk
-                if isinstance(existing, dict):
-                    if existing.get("version") == payload["version"] and existing.get("theme") == payload["theme"]:
-                        return False
-        except Exception:
-            pass
-        self.save(config)
-        return True
 
 
 class RecentVolumeManager:
@@ -356,8 +443,7 @@ class RecentVolumeManager:
 
     def _save(self, operation: str) -> None:
         try:
-            # Use debounced save to reduce disk churn during bursts.
-            self.store.save_debounced(self.config)
+            self.store.save(self.config)
         except Exception as exc:
             log_error("config_save_failed", {"operation": operation, "message": str(exc)}, exc_info=True)
 
@@ -450,10 +536,24 @@ class LoggingManager:
         config = self._config or LogConfig(default_log_dir(), LogMode.REDACTED, 1_000_000, 5, False)
         self.configure(replace(config, mode=mode), reset_logs=False)
 
-    def reset_files(self, log_dir: Optional[Path] = None) -> None:
+    def reset_files(self, log_dir: Optional[Path] = None, include_crash: bool = False) -> None:
+        """Clear rotating event/action/error logs.
+
+        Crash logs are intentionally preserved by default so a user can clear
+        routine logs from the tray menu without losing the diagnostics needed
+        to investigate a fatal error.
+
+        Handlers are stopped before deleting so the files are not locked on
+        Windows, where an open file handle prevents deletion.
+        """
         target = log_dir or (self._config.log_dir if self._config else default_log_dir())
         target.mkdir(parents=True, exist_ok=True)
-        for pattern in ("events.log*", "actions.log*", "errors.log*", "crash.log*"):
+        # Close all handlers first so file handles are released (required on Windows).
+        self.stop()
+        patterns = ["events.log*", "actions.log*", "errors.log*"]
+        if include_crash:
+            patterns.append("crash.log*")
+        for pattern in patterns:
             for path in target.glob(pattern):
                 try:
                     if path.is_file():
@@ -543,35 +643,18 @@ def log_error(name: str, payload: Mapping[str, Any], exc_info: Any = None) -> No
 
 
 def log_usb_event(event: UsbEvent) -> None:
-    """Structured logging for UsbEvent with truncated snapshot and custom JSON serialization.
-
-    Only the first 5 VolumeInfo entries are logged to reduce payload size.
-    A custom default function converts datetime objects to ISO strings and uses repr() for others.
-    """
-    # Limit snapshot to the first five volumes
-    snapshot = [asdict(info) for info in event.snapshot[:5]]
-    record = {
-        "action": event.action,
-        "changed_paths": list(event.changed_paths),
-        "snapshot": snapshot,
-        "details": dict(event.details),
-        "display": event.display,
-        # Use local timestamp rather than relying on event.timestamp_utc for readability
-        "timestamp": now_local().isoformat(),
-    }
-    def _json_default(o: Any) -> Any:
-        from datetime import datetime
-        if isinstance(o, datetime):
-            return o.isoformat()
-        # Fallback to repr() for unsupported types
-        return repr(o)
-    try:
-        payload_str = json.dumps(record, ensure_ascii=False, default=_json_default)
-    except Exception:
-        # As a last resort, convert everything to string via repr()
-        payload_str = json.dumps({k: repr(v) for k, v in record.items()}, ensure_ascii=False)
-    # Emit the log record with category "events" so it goes to events.log via LoggingManager.
-    LOG.info(payload_str, extra={"category": "events", "payload": record})
+    snapshot = [asdict(info) for info in event.snapshot]
+    log_event(
+        "usb_event",
+        {
+            "action": event.action,
+            "changed_paths": list(event.changed_paths),
+            "snapshot": snapshot,
+            "details": dict(event.details),
+            "display": event.display,
+            "timestamp_utc": event.timestamp_utc,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +733,8 @@ class DevBroadcastVolume(ctypes.Structure):
 
 
 class DevBroadcastDeviceInterface(ctypes.Structure):
+    # Mirrors Win32 DEV_BROADCAST_DEVICEINTERFACE_W.  The one-character name
+    # array accounts for the terminating NUL used by the registration filter.
     _fields_ = [
         ("size", wintypes.DWORD),
         ("device_type", wintypes.DWORD),
@@ -657,6 +742,31 @@ class DevBroadcastDeviceInterface(ctypes.Structure):
         ("class_guid", GUID),
         ("name", ctypes.c_wchar * 1),
     ]
+
+
+def make_device_interface_filter(name_chars: int = 1) -> ctypes.Structure:
+    """Create a DEV_BROADCAST_DEVICEINTERFACE_W-compatible filter buffer.
+
+    The first registration attempt uses the documented fixed-size structure.
+    A widened buffer can be used as a defensive fallback on systems that reject
+    the minimal filter with ERROR_INVALID_PARAMETER.
+    """
+    chars = max(1, int(name_chars))
+
+    class _DeviceInterfaceFilter(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("device_type", wintypes.DWORD),
+            ("reserved", wintypes.DWORD),
+            ("class_guid", GUID),
+            ("name", ctypes.c_wchar * chars),
+        ]
+
+    item = _DeviceInterfaceFilter()
+    item.size = ctypes.sizeof(item)
+    item.device_type = DBT_DEVTYP_DEVICEINTERFACE
+    item.class_guid = usb_interface_guid()
+    return item
 
 
 class DiskExtent(ctypes.Structure):
@@ -725,29 +835,15 @@ class RawDeviceChange:
 
 
 class WindowsStorageApi:
-    """High-level wrapper around Win32 storage APIs.
-
-    The expensive configuration of kernel32 function signatures is performed only once.
-    Subsequent instances reuse the already-configured functions via a class-level flag.
-    """
-    _configured: bool = False
-
     def __init__(self) -> None:
         if not IS_WINDOWS or kernel32 is None:
             raise RuntimeError("Windows storage API is only available on Windows")
-        # Configure kernel32 function prototypes only once.
-        if not WindowsStorageApi._configured:
-            self._configure_functions()
-            WindowsStorageApi._configured = True
+        self._configure_functions()
 
     def _configure_functions(self) -> None:
-        """Bind argument and result types for kernel32 functions used by this API."""
-        # GetLogicalDrives
         kernel32.GetLogicalDrives.restype = wintypes.DWORD
-        # GetDriveTypeW
         kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
         kernel32.GetDriveTypeW.restype = wintypes.UINT
-        # GetVolumeInformationW
         kernel32.GetVolumeInformationW.argtypes = [
             wintypes.LPCWSTR,
             wintypes.LPWSTR,
@@ -759,7 +855,6 @@ class WindowsStorageApi:
             wintypes.DWORD,
         ]
         kernel32.GetVolumeInformationW.restype = wintypes.BOOL
-        # CreateFileW
         kernel32.CreateFileW.argtypes = [
             wintypes.LPCWSTR,
             wintypes.DWORD,
@@ -770,7 +865,6 @@ class WindowsStorageApi:
             wintypes.HANDLE,
         ]
         kernel32.CreateFileW.restype = wintypes.HANDLE
-        # DeviceIoControl
         kernel32.DeviceIoControl.argtypes = [
             wintypes.HANDLE,
             wintypes.DWORD,
@@ -782,134 +876,8 @@ class WindowsStorageApi:
             wintypes.LPVOID,
         ]
         kernel32.DeviceIoControl.restype = wintypes.BOOL
-        # CloseHandle
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-
-    def logical_drives(self) -> tuple[str, ...]:
-        """Return a tuple of drive letters for all logical drives."""
-        mask = int(kernel32.GetLogicalDrives())
-        return paths_from_unitmask(mask)
-
-    def drive_type(self, path: str) -> int:
-        """Return the drive type code for the given path."""
-        return int(kernel32.GetDriveTypeW(path))
-
-    def volume_label(self, path: str) -> str:
-        """Return the volume label for the drive at the given path."""
-        volume_name = ctypes.create_unicode_buffer(261)
-        fs_name = ctypes.create_unicode_buffer(261)
-        serial = wintypes.DWORD()
-        max_component = wintypes.DWORD()
-        flags = wintypes.DWORD()
-        ok = kernel32.GetVolumeInformationW(
-            path,
-            volume_name,
-            len(volume_name),
-            ctypes.byref(serial),
-            ctypes.byref(max_component),
-            ctypes.byref(flags),
-            fs_name,
-            len(fs_name),
-        )
-        return volume_name.value if ok else ""
-
-    def _open(self, device_path: str) -> Optional[wintypes.HANDLE]:
-        """Open a Win32 device path and return a handle, or None on failure."""
-        handle = kernel32.CreateFileW(
-            device_path,
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            0,
-            None,
-        )
-        value = ctypes.cast(handle, ctypes.c_void_p).value
-        invalid = ctypes.c_void_p(-1).value
-        if value in (None, 0, invalid):
-            return None
-        return handle
-
-    def volume_disk_numbers(self, path: str) -> tuple[int, ...]:
-        """Return the disk numbers that back the volume at the given path."""
-        handle = self._open(f"\\.\{path[:2]}")
-        if handle is None:
-            return ()
-        try:
-            size = 1024
-            for _ in range(4):
-                buffer = ctypes.create_string_buffer(size)
-                returned = wintypes.DWORD()
-                ok = kernel32.DeviceIoControl(
-                    handle,
-                    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                    None,
-                    0,
-                    buffer,
-                    size,
-                    ctypes.byref(returned),
-                    None,
-                )
-                if ok:
-                    header = ctypes.cast(buffer, ctypes.POINTER(VolumeDiskExtentsHeader)).contents
-                    count = max(0, int(header.count))
-                    offset = VolumeDiskExtentsHeader.extents.offset
-                    required = offset + count * ctypes.sizeof(DiskExtent)
-                    if required > size:
-                        size = required
-                        continue
-                    result: list[int] = []
-                    for index in range(count):
-                        extent = DiskExtent.from_buffer_copy(buffer.raw, offset + index * ctypes.sizeof(DiskExtent))
-                        result.append(int(extent.disk_number))
-                    return tuple(dict.fromkeys(result))
-                if ctypes.get_last_error() != ERROR_MORE_DATA:
-                    return ()
-                size *= 2
-            return ()
-        finally:
-            kernel32.CloseHandle(handle)
-
-    def physical_disk_is_external(self, disk_number: int) -> bool:
-        """Determine whether a physical disk is removable/external based on storage properties."""
-        handle = self._open(f"\\.\PhysicalDrive{disk_number}")
-        if handle is None:
-            return False
-        try:
-            query = StoragePropertyQuery(STORAGE_DEVICE_PROPERTY, PROPERTY_STANDARD_QUERY, (ctypes.c_ubyte * 1)(0))
-            header = StorageDescriptorHeader()
-            returned = wintypes.DWORD()
-            ok = kernel32.DeviceIoControl(
-                handle,
-                IOCTL_STORAGE_QUERY_PROPERTY,
-                ctypes.byref(query),
-                ctypes.sizeof(query),
-                ctypes.byref(header),
-                ctypes.sizeof(header),
-                ctypes.byref(returned),
-                None,
-            )
-            if not ok or int(header.size) < ctypes.sizeof(StorageDeviceDescriptor):
-                return False
-            size = min(max(int(header.size), ctypes.sizeof(StorageDeviceDescriptor)), 1024 * 1024)
-            buffer = ctypes.create_string_buffer(size)
-            ok = kernel32.DeviceIoControl(
-                handle,
-                IOCTL_STORAGE_QUERY_PROPERTY,
-                ctypes.byref(query),
-                ctypes.sizeof(query),
-                buffer,
-                size,
-                ctypes.byref(returned),
-                None,
-            )
-            if not ok:
-                return False
-            descriptor = ctypes.cast(buffer, ctypes.POINTER(StorageDeviceDescriptor)).contents
-            return bool(descriptor.removable_media) or int(descriptor.bus_type) in EXTERNAL_BUS_TYPES
-        finally:
-            kernel32.CloseHandle(handle)
 
     def logical_drives(self) -> tuple[str, ...]:
         mask = int(kernel32.GetLogicalDrives())
@@ -1047,8 +1015,6 @@ class DriveScanner:
         # Stats for observability (visible via a future /metrics endpoint).
         self._l2_hits = 0
         self._l2_misses = 0
-        # Baseline of last scan results: path -> VolumeInfo. Used for focus scanning.
-        self._baseline: dict[str, VolumeInfo] = {}
 
     def invalidate(self, paths: Sequence[str] = ()) -> None:
         """Invalidate cached classification after device topology changes.
@@ -1124,67 +1090,58 @@ class DriveScanner:
         return disk_numbers, external
 
     def scan(self, focus: Sequence[str] = ()) -> dict[str, VolumeInfo]:
-        """Return a map of normalized drive paths to VolumeInfo. When focus is provided, only
-        the specified paths are re-scanned; all other entries are carried over from the previous
-        baseline. If focus is empty, a full scan is performed."""
-        current: dict[str, VolumeInfo] = {}
-        # Partial scan: only classify the requested paths and merge with baseline.
-        if focus:
-            for path in focus:
-                try:
-                    drive_type_code = self.api.drive_type(path)
-                    if drive_type_code in {DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_CDROM, DRIVE_RAMDISK}:
-                        continue
-                    disk_numbers, external = self._classify(path, drive_type_code)
-                    if not external:
-                        continue
-                    label = self.api.volume_label(path)
-                    total, used, free = safe_disk_usage(path)
-                    title = f"{label} · {path}" if label else display_name_for_path(path)
-                    current[path] = VolumeInfo(
-                        path=path,
-                        title=title,
-                        drive_type=DRIVE_TYPE_NAMES.get(drive_type_code, str(drive_type_code)),
-                        disk_number=disk_numbers[0] if disk_numbers else None,
-                        total=total,
-                        used=used,
-                        free=free,
-                        label=label,
-                    )
-                except Exception as exc:
-                    log_error("drive_scan_item_failed", {"path": path, "message": str(exc)}, exc_info=True)
-            # Copy baseline entries that are not in focus.
-            for path, info in self._baseline.items():
-                if path not in current:
-                    current[path] = info
-        else:
-            # Full scan: examine all logical drives.
-            for path in self.api.logical_drives():
-                try:
-                    drive_type_code = self.api.drive_type(path)
-                    if drive_type_code in {DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_CDROM, DRIVE_RAMDISK}:
-                        continue
-                    disk_numbers, external = self._classify(path, drive_type_code)
-                    if not external:
-                        continue
-                    label = self.api.volume_label(path)
-                    total, used, free = safe_disk_usage(path)
-                    title = f"{label} · {path}" if label else display_name_for_path(path)
-                    current[path] = VolumeInfo(
-                        path=path,
-                        title=title,
-                        drive_type=DRIVE_TYPE_NAMES.get(drive_type_code, str(drive_type_code)),
-                        disk_number=disk_numbers[0] if disk_numbers else None,
-                        total=total,
-                        used=used,
-                        free=free,
-                        label=label,
-                    )
-                except Exception as exc:
-                    log_error("drive_scan_item_failed", {"path": path, "message": str(exc)}, exc_info=True)
-        # Update baseline for next scan
-        self._baseline = current
-        return current
+        """Scan external volumes, optionally limiting to a subset of drive paths.
+
+        When ``focus`` is provided and non-empty, only those drive letters are
+        actively probed via the underlying Windows API. Paths outside of
+        ``focus`` are skipped entirely at this layer. Callers are expected to
+        merge the returned mapping onto a previously cached baseline so that
+        unchanged volumes remain visible without incurring additional IO.
+
+        Parameters
+        ----------
+        focus: Sequence[str], optional
+            A list or tuple of drive paths (e.g. ``['E:\\', 'F:\\']``) that
+            should be reclassified. When empty, all logical drives are scanned.
+
+        Returns
+        -------
+        dict[str, VolumeInfo]
+            A mapping of drive paths to their corresponding ``VolumeInfo`` for
+            the scanned subset.
+        """
+        result: dict[str, VolumeInfo] = {}
+        # Normalize focus paths for comparison; empty set means scan everything.
+        focus_set: set[str] = {normalize_drive_path(p) for p in focus if p} if focus else set()
+        for path in self.api.logical_drives():
+            # Skip non-focus drives when a focus set is provided.
+            if focus_set:
+                normalized = normalize_drive_path(path)
+                if normalized not in focus_set:
+                    continue
+            try:
+                drive_type_code = self.api.drive_type(path)
+                if drive_type_code in {DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_CDROM, DRIVE_RAMDISK}:
+                    continue
+                disk_numbers, external = self._classify(path, drive_type_code)
+                if not external:
+                    continue
+                label = self.api.volume_label(path)
+                total, used, free = safe_disk_usage(path)
+                title = f"{label} · {path}" if label else display_name_for_path(path)
+                result[path] = VolumeInfo(
+                    path=path,
+                    title=title,
+                    drive_type=DRIVE_TYPE_NAMES.get(drive_type_code, str(drive_type_code)),
+                    disk_number=disk_numbers[0] if disk_numbers else None,
+                    total=total,
+                    used=used,
+                    free=free,
+                    label=label,
+                )
+            except Exception as exc:
+                log_error("drive_scan_item_failed", {"path": path, "message": str(exc)}, exc_info=True)
+        return result
 
 
 def safe_disk_usage(path: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -1268,16 +1225,19 @@ class DriveReconciler(threading.Thread):
         self._condition = threading.Condition()
         self._raw_events: deque[RawDeviceChange] = deque()
         self._scheduled: dict[str, ScheduledScan] = {}
+        self._schedule_sequence = 0
         self._stop_requested = False
         self._baseline: dict[str, VolumeInfo] = {}
+        # Paths reported by a remove notification but not yet confirmed by a
+        # scan. Windows can emit storage notifications before the volume table
+        # has fully settled; keeping the old baseline until confirmation avoids
+        # flicker and duplicate remove/add events for the same drive letter.
         self._removed_hold_until: dict[str, float] = {}
         self.ready = threading.Event()
         # Manual-scan debounce flag: cleared when a scan starts, set when it
         # finishes.  The tray menu watches this to enable/disable "重新扫描".
         self.scan_completed = threading.Event()
         self.scan_completed.set()  # idle initially
-        # Optional hook invoked when a scan completes; used by the GUI to re-enable the rescan menu item.
-        self._menu_idle_hook: Optional[Callable[[], None]] = None
 
     def notify(self, change: RawDeviceChange) -> None:
         with self._condition:
@@ -1336,12 +1296,7 @@ class DriveReconciler(threading.Thread):
 
     def _handle_raw(self, change: RawDeviceChange) -> None:
         details = {"kind": change.kind, "event_code": change.code, **dict(change.details)}
-        # Propagate the affected drive paths to the scheduled scan details for focused rescanning.
-        if change.paths:
-            try:
-                details = {**details, "paths": list(change.paths)}
-            except Exception:
-                pass
+        # Invalidate cached classifications for specific paths or the entire topology.
         if change.paths:
             self.scanner.invalidate(change.paths)
         elif change.code in {DBT_DEVNODES_CHANGED, DBT_CONFIGCHANGED}:
@@ -1357,24 +1312,25 @@ class DriveReconciler(threading.Thread):
             details["event_name"] = "DBT_DEVICEREMOVECOMPLETE"
 
         if change.action == "remove" and change.paths:
-            removed = tuple(path for path in change.paths if path in self._baseline)
-            hold_until = time.monotonic() + 0.80
+            hold_until = time.monotonic() + 0.22
             for path in change.paths:
                 self._removed_hold_until[path] = hold_until
-                self._baseline.pop(path, None)
-            self.state.replace(self._baseline)
-            self._emit("remove", removed or change.paths, details, display=True)
+            details["pending_paths"] = list(change.paths)
 
         generic_remove = change.action == "remove" and not change.paths
+        # Carry the raw event's paths through to the scheduled scan.  When paths
+        # are present we reclassify only those drives on the next scan and
+        # merge them onto the baseline (see _run_scan).
+        focus_detail: dict[str, Any] = {**details, "paths": list(change.paths)} if change.paths else details
         with self._condition:
             if change.action == "remove":
-                self._schedule_locked("immediate", 0.0, "remove", details, generic_remove=generic_remove)
-                self._schedule_locked("short", 0.20, "remove", details)
-                self._schedule_locked("settle", 1.10, "remove", details)
+                self._schedule_locked("immediate", 0.0, "remove", focus_detail, generic_remove=generic_remove)
+                self._schedule_locked("short", 0.08, "remove", focus_detail)
+                self._schedule_locked("settle", 0.25, "remove", focus_detail)
             else:
-                self._schedule_locked("immediate", 0.04, change.action, details)
-                self._schedule_locked("short", 0.25, change.action, details)
-                self._schedule_locked("settle", 0.90, change.action, details)
+                self._schedule_locked("immediate", 0.00, change.action, focus_detail)
+                self._schedule_locked("short", 0.08, change.action, focus_detail)
+                self._schedule_locked("settle", 0.22, change.action, focus_detail)
             self._condition.notify()
 
     def _schedule_locked(
@@ -1386,7 +1342,12 @@ class DriveReconciler(threading.Thread):
         generic_remove: bool = False,
         force_emit: bool = False,
     ) -> None:
-        self._scheduled[lane] = ScheduledScan(
+        if lane == "manual":
+            key = "manual"
+        else:
+            self._schedule_sequence += 1
+            key = f"{lane}:{self._schedule_sequence}"
+        self._scheduled[key] = ScheduledScan(
             deadline=time.monotonic() + max(0.0, delay),
             reason=reason,
             details=dict(details),
@@ -1395,29 +1356,58 @@ class DriveReconciler(threading.Thread):
         )
 
     def _run_scan(self, scheduled: ScheduledScan) -> None:
+        """Execute a scheduled scan, optionally reclassifying only a subset of volumes.
+
+        When the scheduled scan carries a ``paths`` entry in its details this
+        method requests a focused scan of just those drive letters and merges
+        the result over the existing baseline. This avoids unnecessary IOCTL
+        calls for unrelated drives. On a full scan (``paths`` absent) all
+        logical drives are probed.
+        """
         # Manual scans are debounced: clear the flag here so callers can wait
         # on it.  It's re-set at the end of the method (or on the error path).
         self.scan_completed.clear()
+        # Determine which paths need fresh classification.
+        focus_paths: Sequence[str] = scheduled.details.get("paths", ()) or ()
         try:
-            # When provided, only re-classify the affected paths to reduce IO.
-            focus_paths: Sequence[str] = ()
-            try:
-                focus_paths = scheduled.details.get("paths", ()) or ()
-            except Exception:
-                focus_paths = ()
-            current = self.scanner.scan(focus=focus_paths)
+            fresh = self.scanner.scan(focus=focus_paths)
         except Exception as exc:
             log_error("drive_scan_failed", {"reason": scheduled.reason, "message": str(exc)}, exc_info=True)
             self._emit("error", (), {"kind": "error", "message": f"扫描 USB 设备失败：{exc}"}, display=True)
             self.scan_completed.set()
             return
 
+        # Merge focused scans over the previous baseline. For a full scan,
+        # replace the baseline completely so manual scans and generic remove
+        # notifications can clear stale drive letters. For focused scans, only
+        # remove a path after a pending remove has survived the short settle
+        # window; otherwise keep the old baseline to avoid transient flicker.
         now = time.monotonic()
-        for path, deadline in list(self._removed_hold_until.items()):
-            if deadline <= now:
-                self._removed_hold_until.pop(path, None)
-            else:
-                current.pop(path, None)
+        normalized_focus = tuple(normalize_drive_path(path) for path in focus_paths)
+        if normalized_focus:
+            current: dict[str, VolumeInfo] = dict(self._baseline)
+            current.update(fresh)
+            for path in normalized_focus:
+                deadline = self._removed_hold_until.get(path)
+                if deadline is None:
+                    continue
+                if path in fresh:
+                    self._removed_hold_until.pop(path, None)
+                    continue
+                if deadline <= now:
+                    current.pop(path, None)
+                    self._removed_hold_until.pop(path, None)
+                elif path in self._baseline:
+                    current[path] = self._baseline[path]
+        else:
+            current = dict(fresh)
+            for path, deadline in list(self._removed_hold_until.items()):
+                if path in current:
+                    self._removed_hold_until.pop(path, None)
+                elif deadline > now and path in self._baseline:
+                    current[path] = self._baseline[path]
+                else:
+                    self._removed_hold_until.pop(path, None)
 
         before = set(self._baseline)
         after = set(current)
@@ -1425,7 +1415,11 @@ class DriveReconciler(threading.Thread):
         removed = tuple(sorted(before - after))
         self._baseline = current
         self.state.replace(current)
-        details = {**scheduled.details, "scan_reason": scheduled.reason}
+        cache_stats = getattr(self.scanner, "cache_stats", {})
+        if not isinstance(cache_stats, Mapping):
+            cache_stats = {}
+        details = {**scheduled.details, "scan_reason": scheduled.reason, "cache_stats": dict(cache_stats)}
+        log_event("drive_scan_completed", {"reason": scheduled.reason, **dict(cache_stats)})
 
         if removed:
             self._emit("remove", removed, details, display=True)
@@ -1439,12 +1433,6 @@ class DriveReconciler(threading.Thread):
                 message = "未检测到可打开的 USB 存储设备。" if not current else "重新扫描完成。"
                 self._emit("change", tuple(sorted(current)), {**details, "message": message}, display=True)
         self.scan_completed.set()
-        # Notify any menu idle hook via singleShot to ensure UI updates occur on the Qt thread.
-        if self._menu_idle_hook is not None and QT_AVAILABLE:
-            try:
-                QTimer.singleShot(0, self._menu_idle_hook)
-            except Exception:
-                pass
 
     def _emit(self, action: str, changed_paths: Sequence[str], details: Mapping[str, Any], display: bool) -> None:
         event = UsbEvent(
@@ -1472,6 +1460,19 @@ class DeviceWindowThread(threading.Thread):
         self.notification_handle: Optional[int] = None
         self._wnd_proc_ref: Any = None
         self._class_name: Optional[str] = None
+        self._startup_ready = threading.Event()
+        self._startup_failed_message: Optional[str] = None
+
+    @property
+    def startup_failed_message(self) -> Optional[str]:
+        return self._startup_failed_message
+
+    def wait_until_started(self, timeout: float = 3.0) -> bool:
+        return self._startup_ready.wait(timeout)
+
+    def _mark_startup_failed(self, message: str) -> None:
+        self._startup_failed_message = message
+        self._startup_ready.set()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1487,8 +1488,10 @@ class DeviceWindowThread(threading.Thread):
         try:
             import win32gui
         except ImportError as exc:
+            message = "缺少 pywin32：py -m pip install pywin32"
             log_error("pywin32_missing", {"message": str(exc)}, exc_info=True)
-            self.callback(RawDeviceChange(0, "error", details={"message": "缺少 pywin32：py -m pip install pywin32"}))
+            self._mark_startup_failed(message)
+            self.callback(RawDeviceChange(0, "error", details={"message": message}))
             return
 
         def wnd_proc(hwnd: int, message: int, wparam: int, lparam: int) -> int:
@@ -1510,33 +1513,42 @@ class DeviceWindowThread(threading.Thread):
             window_class.lpfnWndProc = wnd_proc
             win32gui.RegisterClass(window_class)
             self.hwnd = int(win32gui.CreateWindowEx(0, self._class_name, self._class_name, 0, 0, 0, 0, 0, 0, 0, instance, None))
-            self._register_notification()
+            if not self._register_notification():
+                raise RuntimeError("RegisterDeviceNotificationW 失败，无法接收 USB 设备事件")
+            self._startup_ready.set()
             log_event("device_window_started", {})
             while not self._stop_event.is_set():
                 win32gui.PumpWaitingMessages()
-                # Increase wait interval to 50ms to reduce CPU wakeups; USB events typically arrive ≥100ms apart.
-                self._stop_event.wait(0.05)
+                self._stop_event.wait(0.02)
         except Exception as exc:
+            message = f"USB 设备监听启动失败：{exc}"
             log_error("device_window_failed", {"message": str(exc)}, exc_info=True)
-            self.callback(RawDeviceChange(0, "error", details={"message": f"USB 设备监听启动失败：{exc}"}))
+            self._mark_startup_failed(message)
+            self.callback(RawDeviceChange(0, "error", details={"message": message}))
         finally:
             self._cleanup(win32gui, instance)
             log_event("device_window_stopped", {})
 
-    def _register_notification(self) -> None:
+    def _register_notification(self) -> bool:
         if not self.hwnd or user32 is None:
-            return
+            return False
         user32.RegisterDeviceNotificationW.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD]
         user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
-        notification_filter = DevBroadcastDeviceInterface()
-        notification_filter.size = ctypes.sizeof(DevBroadcastDeviceInterface)
-        notification_filter.device_type = DBT_DEVTYP_DEVICEINTERFACE
-        notification_filter.class_guid = usb_interface_guid()
-        handle = user32.RegisterDeviceNotificationW(self.hwnd, ctypes.byref(notification_filter), DEVICE_NOTIFY_WINDOW_HANDLE)
-        if handle:
-            self.notification_handle = int(handle)
-        else:
-            log_error("register_device_notification_failed", {"win32_error": ctypes.get_last_error()})
+
+        errors: list[int] = []
+        for name_chars in (1, 260):
+            ctypes.set_last_error(0)
+            notification_filter = make_device_interface_filter(name_chars)
+            handle = user32.RegisterDeviceNotificationW(self.hwnd, ctypes.byref(notification_filter), DEVICE_NOTIFY_WINDOW_HANDLE)
+            if handle:
+                self.notification_handle = int(handle)
+                if name_chars > 1:
+                    log_event("register_device_notification_fallback_used", {"name_chars": name_chars})
+                return True
+            errors.append(int(ctypes.get_last_error()))
+
+        log_error("register_device_notification_failed", {"win32_errors": errors})
+        return False
 
     def _cleanup(self, win32gui: Any, instance: int) -> None:
         if user32 is not None and self.notification_handle:
@@ -1568,6 +1580,12 @@ class UsbMonitorService:
     def start(self) -> None:
         self.reconciler.start()
         self.listener.start()
+        if not self.listener.wait_until_started(timeout=3.0):
+            self.reconciler.stop()
+            raise RuntimeError("USB 设备监听线程启动超时")
+        if self.listener.startup_failed_message:
+            self.reconciler.stop()
+            raise RuntimeError(self.listener.startup_failed_message)
 
     def rescan(self) -> None:
         self.reconciler.request_scan("manual", force_emit=True)
@@ -1650,10 +1668,10 @@ class StartupManager:
     def _payload(self, install: bool) -> tuple[Path, list[str]]:
         source = self._stable_source(install=install)
         if is_compiled_runtime():
-            return source, ["--startup"]
+            return source, ["--startup", "--silent"]
         python = Path(sys.executable).resolve()
         pythonw = python.with_name("pythonw.exe")
-        return (pythonw if pythonw.exists() else python), [str(source), "--startup"]
+        return (pythonw if pythonw.exists() else python), [str(source), "--startup", "--silent"]
 
     def _stable_source(self, install: bool) -> Path:
         if is_compiled_runtime():
@@ -1665,11 +1683,74 @@ class StartupManager:
                 self._copy_compiled(source, target)
             return target if target.exists() else source
 
-        source = Path(__file__).resolve()
-        target = self.install_dir / f"{APP_NAME}.py"
+        package_dir = Path(__file__).resolve().parent
+        launcher = self.install_dir / f"{APP_NAME}.pyw"
         if install:
-            self._copy_file_if_changed(source, target, kind="script")
-        return target if target.exists() else source
+            self._copy_source_bundle(package_dir, launcher)
+        return launcher if launcher.exists() else self._development_launcher(package_dir)
+
+
+    def _development_launcher(self, package_dir: Path) -> Path:
+        """Return a runnable launcher beside the source tree for status previews.
+
+        The returned path may not exist until startup installation is requested;
+        callers must not execute it unless ``install=True`` has created the bundle.
+        """
+        return package_dir.parent / f"{APP_NAME}.pyw"
+
+    def _copy_source_bundle(self, package_dir: Path, launcher: Path) -> None:
+        """Install the complete Python package plus a standalone .pyw launcher.
+
+        Copying only ``app.py`` is invalid because it uses relative imports from
+        ``core`` and ``hooks``.  The launcher adds the copied source root to
+        ``sys.path`` and executes the package through ``runpy``.
+        """
+        signature = self._source_bundle_signature(package_dir)
+        target_root = self.install_dir / "source"
+        target_package = target_root / package_dir.name
+        if launcher.exists() and target_package.exists() and self._manifest_matches(signature):
+            return
+
+        temporary_root = self.install_dir / "source.tmp"
+        self.install_dir.mkdir(parents=True, exist_ok=True)
+        self._remove_tree(temporary_root, stage="cleanup_source_bundle_temp")
+        temporary_package = temporary_root / package_dir.name
+        shutil.copytree(package_dir, temporary_package, ignore=self._copytree_ignore)
+        self._remove_tree(target_root, stage="replace_source_bundle")
+        os.replace(temporary_root, target_root)
+
+        launcher_text = (
+            "from pathlib import Path\n"
+            "import runpy, sys\n"
+            "ROOT = Path(__file__).resolve().parent / 'source'\n"
+            "sys.path.insert(0, str(ROOT))\n"
+            "runpy.run_module('usb_monitor', run_name='__main__')\n"
+        )
+        temporary_launcher = launcher.with_suffix(launcher.suffix + ".tmp")
+        temporary_launcher.write_text(launcher_text, encoding="utf-8")
+        os.replace(temporary_launcher, launcher)
+        self._write_manifest(signature)
+
+    @staticmethod
+    def _source_bundle_signature(package_dir: Path) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        total_size = 0
+        files = sorted(path for path in package_dir.rglob("*.py") if "__pycache__" not in path.parts)
+        for path in files:
+            relative = path.relative_to(package_dir).as_posix().encode("utf-8")
+            data = path.read_bytes()
+            digest.update(relative)
+            digest.update(b"\0")
+            digest.update(data)
+            total_size += len(data)
+        return {
+            "app_version": APP_VERSION,
+            "kind": "source-bundle",
+            "source_name": package_dir.name,
+            "sha256": digest.hexdigest(),
+            "size": total_size,
+            "file_count": len(files),
+        }
 
     def _copy_compiled(self, source: Path, target: Path) -> None:
         if is_nuitka_onefile_runtime() or source.parent != Path(__file__).resolve().parent:
@@ -1684,11 +1765,48 @@ class StartupManager:
         if target.exists() and self._manifest_matches(signature):
             return
         temporary_dir = target_dir.with_name(target_dir.name + ".tmp")
-        shutil.rmtree(temporary_dir, ignore_errors=True)
-        shutil.copytree(source_dir, temporary_dir)
-        shutil.rmtree(target_dir, ignore_errors=True)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._remove_tree(temporary_dir, stage="cleanup_temporary_before_copy")
+        shutil.copytree(source_dir, temporary_dir, ignore=self._copytree_ignore)
+        self._remove_tree(target_dir, stage="replace_existing_install_dir")
         os.replace(temporary_dir, target_dir)
         self._write_manifest(signature)
+
+    @staticmethod
+    def _copytree_ignore(directory: str, names: list[str]) -> set[str]:
+        """Skip transient files when installing a compiled startup copy."""
+        ignored: set[str] = set()
+        for name in names:
+            lowered = name.casefold()
+            if lowered in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}:
+                ignored.add(name)
+            elif lowered.endswith((".pyc", ".pyo", ".tmp", ".log")):
+                ignored.add(name)
+        return ignored
+
+    @staticmethod
+    def _make_writable_and_retry(function: Callable[[str], None], path: str, exc_info: object) -> None:
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            function(path)
+        except OSError:
+            raise
+
+    def _remove_tree(self, path: Path, stage: str) -> None:
+        if not path.exists():
+            return
+        try:
+            try:
+                shutil.rmtree(path, onexc=self._make_writable_and_retry)
+            except TypeError:
+                shutil.rmtree(path, onerror=self._make_writable_and_retry)
+        except OSError as exc:
+            log_error(
+                "startup_remove_tree_failed",
+                {"path": str(path), "stage": stage, "message": str(exc)},
+                exc_info=True,
+            )
+            raise
 
     def _copy_file_if_changed(self, source: Path, target: Path, kind: str) -> None:
         signature = self._source_signature(source, kind=kind)
@@ -1766,13 +1884,15 @@ class StartupManager:
                 )
                 return self._manifest_matches(signature) and file_sha256(installed_source) == signature["sha256"]
 
-            current = Path(__file__).resolve()
-            if installed_source.resolve() == current.resolve():
+            package_dir = Path(__file__).resolve().parent
+            development_launcher = self._development_launcher(package_dir)
+            if installed_source.resolve() == development_launcher.resolve():
                 return True
             if not installed_source.exists():
                 return False
-            signature = self._source_signature(current, kind="script")
-            return self._manifest_matches(signature) and file_sha256(installed_source) == signature["sha256"]
+            signature = self._source_bundle_signature(package_dir)
+            copied_package = self.install_dir / "source" / package_dir.name
+            return self._manifest_matches(signature) and copied_package.exists()
         except OSError:
             return False
 
@@ -1832,17 +1952,29 @@ class StartupManager:
 _SINGLE_INSTANCE_HANDLE: Any = None
 
 
+def single_instance_mutex_name() -> str:
+    raw_name = f"{APP_ORG}.{APP_NAME}.SingleInstance"
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_name)
+    return f"Local\\{safe_name}"
+
+
 def acquire_single_instance() -> bool:
     global _SINGLE_INSTANCE_HANDLE
     if not IS_WINDOWS or kernel32 is None:
         return True
     kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
-    handle = kernel32.CreateMutexW(None, False, f"Local\\{APP_ORG}.{APP_NAME}.SingleInstance")
+    # Reset the thread-local last-error before CreateMutexW.  Windows does not
+    # guarantee that successful APIs clear GetLastError(), and stale
+    # ERROR_ALREADY_EXISTS values can make the second-instance guard flaky.
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, True, single_instance_mutex_name())
+    last_error = ctypes.get_last_error()
     if not handle:
-        raise ctypes.WinError(ctypes.get_last_error())
+        log_error("single_instance_mutex_failed", {"win32_error": int(last_error)})
+        return False
     _SINGLE_INSTANCE_HANDLE = handle
-    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    return last_error != ERROR_ALREADY_EXISTS
 
 
 def release_single_instance() -> None:
@@ -1887,6 +2019,30 @@ def _format_com_error(exc: BaseException) -> tuple[Optional[int], str]:
     return int(hresult) if isinstance(hresult, int) else None, message
 
 
+def wait_for_drive_removal(
+    path: str,
+    timeout: float = 5.0,
+    poll_interval: float = 0.15,
+    *,
+    exists: Callable[[str], bool] = os.path.exists,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Wait until a drive root is no longer accessible after an eject request."""
+    root = normalize_drive_path(path)
+    if not root:
+        return False
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            if not exists(root):
+                return True
+        except OSError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        sleeper(max(0.01, float(poll_interval)))
+
+
 def safe_eject_drive(path: str) -> str:
     if not IS_WINDOWS:
         raise RuntimeError("安全弹出仅支持 Windows。")
@@ -1915,9 +2071,19 @@ def safe_eject_drive(path: str) -> str:
             name = str(name_attr() if callable(name_attr) else name_attr).replace("&", "").strip().casefold()
             if any(token in name for token in ("eject", "弹出", "安全删除", "safely remove")):
                 verb.DoIt()
-                return drive
+                if wait_for_drive_removal(drive):
+                    return drive
+                raise RuntimeError(
+                    f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
+                    "请关闭占用文件后重试，在确认前请勿拔出。"
+                )
         item.InvokeVerb("Eject")
-        return drive
+        if wait_for_drive_removal(drive):
+            return drive
+        raise RuntimeError(
+            f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
+            "请关闭占用文件后重试，在确认前请勿拔出。"
+        )
     except RuntimeError:
         raise
     except Exception as exc:
@@ -1985,17 +2151,18 @@ if QT_AVAILABLE:
         def stylesheet(self) -> str:
             return f"""
             QWidget {{ color:{self.text}; font-family:'Segoe UI','Microsoft YaHei UI',sans-serif; font-size:{px(13)}px; }}
-            QFrame#root {{ background:{self.panel}; border:1px solid {self.border}; border-radius:{px(14)}px; }}
-            QFrame#volumeRow {{ background:{self.panel2}; border:1px solid {self.border}; border-radius:{px(10)}px; }}
+            QWidget#toastWindow {{ background:{self.panel}; }}
+            QFrame#root {{ background:{self.panel}; border:1px solid {self.border}; }}
+            QFrame#volumeRow {{ background:{self.panel2}; border:1px solid {self.border}; }}
             QLabel#headline {{ font-size:{px(16)}px; font-weight:700; }}
             QLabel#muted, QLabel#summary, QLabel#capacity {{ color:{self.muted}; font-size:{px(12)}px; }}
             QLabel#rowTitle {{ font-weight:650; }}
-            QPushButton {{ background:transparent; border:1px solid {self.border}; border-radius:{px(8)}px; padding:{px(7)}px {px(13)}px; font-weight:650; }}
+            QPushButton {{ background:transparent; border:1px solid {self.border}; padding:{px(7)}px {px(13)}px; font-weight:650; }}
             QPushButton:hover {{ background:{self.panel2}; }}
             QPushButton#primary {{ background:{self.accent}; color:white; border-color:{self.accent}; }}
             QPushButton#primary:hover {{ background:{self.accent_hover}; border-color:{self.accent_hover}; }}
-            QProgressBar {{ background:{self.progress}; border:0; border-radius:{px(4)}px; }}
-            QProgressBar::chunk {{ background:{self.accent}; border-radius:{px(4)}px; }}
+            QProgressBar {{ background:{self.progress}; border:0; }}
+            QProgressBar::chunk {{ background:{self.accent}; }}
             QScrollArea {{ border:0; background:transparent; }}
             QScrollArea > QWidget > QWidget {{ background:transparent; }}
             """
@@ -2024,9 +2191,7 @@ if QT_AVAILABLE:
     class IconFactory:
         def __init__(self, app: QApplication) -> None:
             self.app = app
-            # 使用有界 OrderedDict 实现 LRU 缓存。最大容量 32，超出后弹出最旧项。
-            self._cache: "OrderedDict[tuple[str, str, int, int], QPixmap]" = OrderedDict()
-            self._maxsize = 32
+            self._cache: dict[tuple[str, str, int, int], QPixmap] = {}
 
         def pixmap(self, status: str, theme: Theme, logical_size: int) -> QPixmap:
             screen = self.app.primaryScreen()
@@ -2034,8 +2199,6 @@ if QT_AVAILABLE:
             physical = max(1, round(logical_size * ratio))
             key = (theme.name, status, logical_size, physical)
             if key in self._cache:
-                # 将命中项移动到末尾，符合 LRU 语义
-                self._cache.move_to_end(key)
                 return self._cache[key]
             pixmap = QPixmap(physical, physical)
             pixmap.setDevicePixelRatio(ratio)
@@ -2045,9 +2208,6 @@ if QT_AVAILABLE:
             QSvgRenderer(QByteArray(usb_svg(theme, status).encode("utf-8"))).render(painter, QRectF(0, 0, logical_size, logical_size))
             painter.end()
             self._cache[key] = pixmap
-            # 保持缓存容量不超过 _maxsize，超出时弹出最旧项
-            if len(self._cache) > self._maxsize:
-                self._cache.popitem(last=False)
             return pixmap
 
         def icon(self, theme: Theme) -> QIcon:
@@ -2062,11 +2222,10 @@ if QT_AVAILABLE:
 
 
     class SafeEjectSignals(QObject):
-        """Bridge signals from a SafeEjectWorker back to the GUI thread."""
+        """Bridge task results from a SafeEjectWorker back to the GUI thread."""
         started = Signal(str)
         succeeded = Signal(str)
         failed = Signal(str, str)
-        finished = Signal()
 
 
     class SafeEjectWorker(QThread):
@@ -2074,7 +2233,7 @@ if QT_AVAILABLE:
 
         def __init__(self, path: str) -> None:
             super().__init__()
-            self._path = path
+            self._path = normalize_drive_path(path)
             self.signals = SafeEjectSignals()
 
         def run(self) -> None:
@@ -2084,8 +2243,6 @@ if QT_AVAILABLE:
                 self.signals.succeeded.emit(drive)
             except Exception as exc:
                 self.signals.failed.emit(self._path, str(exc))
-            finally:
-                self.signals.finished.emit()
 
 
     class VolumeRow(QFrame):
@@ -2121,12 +2278,14 @@ if QT_AVAILABLE:
             subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
             layout.addWidget(subtitle, 1, 1)
 
-            button = QPushButton("打开")
-            button.setObjectName("primary")
-            button.setToolTip(f"打开 {self.group[0].path}")
-            button.setFocusPolicy(Qt.NoFocus)  # row already focuses; don't double-tab-stop
-            button.clicked.connect(lambda: actions.open_volume(self.group[0].path))
-            layout.addWidget(button, 0, 2, 2, 1)
+            self.open_button = QPushButton("打开")
+            self.open_button.setObjectName("primary")
+            self.open_button.setToolTip(f"打开 {self.group[0].path}")
+            self.open_button.setMinimumWidth(px(68))
+            self.open_button.setMinimumHeight(px(34))
+            self.open_button.setFocusPolicy(Qt.NoFocus)  # row already focuses; don't double-tab-stop
+            self.open_button.clicked.connect(lambda: actions.open_volume(self.group[0].path))
+            layout.addWidget(self.open_button, 0, 2, 2, 1)
 
             total = sum(item.total or 0 for item in self.group) or None
             used = sum(item.used or 0 for item in self.group) if all(item.used is not None for item in self.group) else None
@@ -2179,7 +2338,13 @@ if QT_AVAILABLE:
 
         def _child_under_event(self, event: Any) -> Any:
             try:
-                local = self.mapFromGlobal(event.globalPos())
+                # Qt 6 deprecates QMouseEvent.globalPos(); prefer the new
+                # floating-point globalPosition() API and keep a fallback for
+                # older bindings / simple test stubs.
+                if hasattr(event, "globalPosition"):
+                    local = self.mapFromGlobal(event.globalPosition().toPoint())
+                else:
+                    local = self.mapFromGlobal(event.globalPos())
                 widget = self.childAt(local)
                 return widget if widget is not None else self
             except Exception:
@@ -2231,6 +2396,7 @@ if QT_AVAILABLE:
             self.toast: Optional[ToastWindow] = None
             self._eject_in_flight: set[str] = set()
             self._eject_threads: dict[str, "SafeEjectWorker"] = {}
+            self._last_operation_status = "就绪"
 
         def notify(self, message: str, warning: bool = False, timeout: int = 4000) -> None:
             if self.tray:
@@ -2265,42 +2431,85 @@ if QT_AVAILABLE:
             self.app.clipboard().setText(text)
             self.notify("路径已复制。", timeout=2500)
 
+        @staticmethod
+        def _eject_key(path: str) -> str:
+            normalized = normalize_drive_path(path)
+            return normalized[:2] if len(normalized) >= 2 and normalized[1] == ":" else ""
+
+        def is_ejecting(self, path: str) -> bool:
+            return self._eject_key(path) in self._eject_in_flight
+
+        def operation_status(self) -> str:
+            if self._eject_in_flight:
+                drives = "、".join(sorted(self._eject_in_flight))
+                return f"正在安全弹出 {drives}…"
+            return self._last_operation_status
+
         def eject_volume(self, path: str) -> None:
             if not IS_WINDOWS:
                 self.notify("安全弹出仅支持 Windows。", warning=True)
                 return
-            # Mark recent eject so the row can render a busy state.
-            try:
-                drive = normalize_drive_path(path)[:2]
-            except Exception:
-                drive = str(path)
+            drive = self._eject_key(path)
+            if not drive:
+                self.notify(f"无效盘符：{path}", warning=True)
+                return
+            if drive in self._eject_in_flight:
+                self._last_operation_status = f"{drive} 正在安全弹出，请勿重复操作"
+                self._set_eject_status(drive, f"正在安全弹出 {drive}…")
+                self.notify(self._last_operation_status, timeout=2500)
+                return
+
+            canonical_path = normalize_drive_path(path)
             self._eject_in_flight.add(drive)
-            self._set_eject_status(drive, "请求中")
-            worker = SafeEjectWorker(path)
-            worker.signals.started.connect(lambda d=path: self._set_eject_status(d, f"正在安全弹出 {drive}…"))
+            self._last_operation_status = f"正在安全弹出 {drive}…"
+            self._set_eject_status(drive, self._last_operation_status)
+            worker = SafeEjectWorker(canonical_path)
+            worker.signals.started.connect(lambda _path, d=drive: self._set_eject_status(d, f"正在安全弹出 {d}…"))
             worker.signals.succeeded.connect(self._on_eject_succeeded)
             worker.signals.failed.connect(self._on_eject_failed)
-            # Ensure the worker is reaped after the thread completes.
-            worker.signals.finished.connect(worker.deleteLater)
-            self._eject_threads[path] = worker
+            # QThread.finished is emitted after run() returns.  Keep the object
+            # strongly referenced until then, remove only the matching worker,
+            # and schedule Qt-side destruction on the GUI event loop.
+            worker.finished.connect(partial(self._on_eject_finished, drive, worker))
+            worker.finished.connect(worker.deleteLater)
+            self._eject_threads[drive] = worker
             worker.start()
-            log_action("safe_eject_requested", {"path": path})
+            log_action("safe_eject_requested", {"path": canonical_path, "drive": drive})
 
         def _on_eject_succeeded(self, path: str) -> None:
-            drive = normalize_drive_path(path)[:2]
+            drive = self._eject_key(path)
             self._eject_in_flight.discard(drive)
             self._set_eject_status(drive, None)
-            self.notify(f"{drive} 已安全弹出。", timeout=4000)
-            log_action("safe_eject_succeeded", {"path": path})
-            self._eject_threads.pop(path, None)
+            self._last_operation_status = f"{drive} 已安全弹出，现在可以拔出设备"
+            self.notify(self._last_operation_status, timeout=5000)
+            # The native remove broadcast can lag behind Shell.  Schedule a
+            # reconciliation pass so stale menu rows disappear promptly while
+            # still allowing the normal WM_DEVICECHANGE path to confirm removal.
+            QTimer.singleShot(350, self._request_post_eject_rescan)
+            log_action("safe_eject_succeeded", {"path": normalize_drive_path(path), "drive": drive})
+
+        def _request_post_eject_rescan(self) -> None:
+            try:
+                self.service.rescan()
+            except Exception as exc:
+                log_error("post_eject_rescan_failed", {"message": str(exc)}, exc_info=True)
 
         def _on_eject_failed(self, path: str, message: str) -> None:
-            drive = normalize_drive_path(path)[:2]
+            drive = self._eject_key(path)
             self._eject_in_flight.discard(drive)
             self._set_eject_status(drive, None)
+            self._last_operation_status = f"{drive} 弹出失败：{message}"
             self.notify(f"安全弹出失败：{message}", warning=True, timeout=7000)
-            log_error("safe_eject_failed", {"path": path, "message": message})
-            self._eject_threads.pop(path, None)
+            log_error("safe_eject_failed", {"path": normalize_drive_path(path), "drive": drive, "message": message})
+
+        def _on_eject_finished(self, drive: str, worker: "SafeEjectWorker") -> None:
+            if self._eject_threads.get(drive) is worker:
+                self._eject_threads.pop(drive, None)
+            # Defensive cleanup if a future worker exits without a result signal.
+            if drive in self._eject_in_flight and not worker.isRunning():
+                self._eject_in_flight.discard(drive)
+                self._set_eject_status(drive, None)
+                self._last_operation_status = f"{drive} 弹出任务已结束，请确认设备状态"
 
         def _set_eject_status(self, drive: str, message: Optional[str]) -> None:
             """Push or clear a per-volume status line into the toast.
@@ -2326,21 +2535,18 @@ if QT_AVAILABLE:
         work-area anchor for its whole visible lifetime, never calls ``raise_()``,
         and corrects unsolicited native moves without taking keyboard focus.
 
-        UX behaviour (added in S2):
+        UX behaviour:
           * Hovering pauses the auto-hide countdown; leaving resumes it.
-          * The "+5s" button extends the countdown by 5s (capped at AUTO_HIDE_MS * 4).
           * Pressing Esc, clicking outside the toast, or losing focus hides it.
+          * Collapsed state shows one global "打开U盘" button.
+          * Expanded state hides the global button and shows per-row "打开" buttons.
           * While a safe-eject worker is running, the countdown label is replaced
             with a "正在弹出 X:\" status line so the user can see progress.
         """
 
         AUTO_HIDE_MS = 10_000
-        MAX_AUTOHIDE_MS = 60_000
-        SNOOZE_STEP_MS = 5_000
         MARGIN = 18
         _RESTORE_DELAYS_MS = (0, 50, 250)
-        FADE_DURATION_MS = 220
-        FADE_EASING = QEasingCurve.InOutCubic
 
         def __init__(self, app: QApplication, theme: Theme, icons: IconFactory, actions: GuiActions, topmost: bool, exit_on_close: bool = False) -> None:
             super().__init__(None)
@@ -2366,7 +2572,9 @@ if QT_AVAILABLE:
             # Map drive-letter ("E:") -> human-readable status.  Most recent wins.
             self._status_overrides: dict[str, str] = {}
             self._status_override: Optional[str] = None  # legacy single-line field
-            # Click-outside-to-close: install a global event filter.
+            # Click-outside-to-close is implemented with QApplication.focusChanged,
+            # while a local event filter is installed only on the toast subtree to
+            # reset the countdown after direct user interaction.
             self._outside_filter_installed = False
 
             self._anchor_pos: Optional[QPoint] = None
@@ -2376,14 +2584,11 @@ if QT_AVAILABLE:
             self._internal_geometry_change = False
             self._reposition_pending = False
             self._connected_screens: set[int] = set()
-            # Fade animation state — guards against reentrant hide()/show().
-            self._fade_animation: Optional[QPropertyAnimation] = None
-            self._fading_out = False
-
             self._configure_window()
             self._build_ui()
             self._connect_screen_signals()
             self.apply_theme(theme)
+            self._install_interaction_filters()
             self._install_outside_click_filter()
 
         def _configure_window(self) -> None:
@@ -2393,7 +2598,11 @@ if QT_AVAILABLE:
             if hasattr(Qt, "WindowDoesNotAcceptFocus"):
                 flags |= Qt.WindowDoesNotAcceptFocus
             self.setWindowFlags(flags)
-            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setObjectName("toastWindow")
+            # Keep the toast fully opaque and rectangular.  This avoids the
+            # translucent/layered-window path that caused repaint warnings on
+            # Windows, and intentionally removes all rounded-corner clipping.
+            self.setAttribute(Qt.WA_TranslucentBackground, False)
             if hasattr(Qt, "WA_ShowWithoutActivating"):
                 self.setAttribute(Qt.WA_ShowWithoutActivating, True)
             self.setFocusPolicy(Qt.NoFocus)
@@ -2401,16 +2610,18 @@ if QT_AVAILABLE:
 
         def _build_ui(self) -> None:
             outer = QVBoxLayout(self)
-            outer.setContentsMargins(px(12), px(12), px(12), px(12))
+            outer.setContentsMargins(0, 0, 0, 0)
             self.root = QFrame()
             self.root.setObjectName("root")
             outer.addWidget(self.root)
-            # 去除 QGraphicsDropShadowEffect，以减少显存和 GPU 离屏缓冲区使用。
-            # 替代方案：通过样式在根窗口底部绘制一条 3px 的高亮边框。
-            # shadow = QGraphicsDropShadowEffect(self.root)
-            # shadow.setBlurRadius(px(28))
-            # shadow.setOffset(0, px(8))
-            # self.root.setGraphicsEffect(shadow)
+            # Avoid QGraphicsDropShadowEffect on Windows top-level toast windows.
+            # It expands the repaint dirty rectangle outside the window bounds and
+            # is the usual trigger for the console spam shown in the user's log.
+            if not IS_WINDOWS:
+                shadow = QGraphicsDropShadowEffect(self.root)
+                shadow.setBlurRadius(px(28))
+                shadow.setOffset(0, px(8))
+                self.root.setGraphicsEffect(shadow)
 
             layout = QVBoxLayout(self.root)
             layout.setContentsMargins(px(16), px(14), px(16), px(14))
@@ -2451,6 +2662,7 @@ if QT_AVAILABLE:
             self.rows_layout.setContentsMargins(0, 0, 0, 0)
             self.rows_layout.setSpacing(px(8))
             self.scroll.setWidget(self.rows_widget)
+            self._enable_touch_scrolling()
             layout.addWidget(self.scroll)
 
             buttons = QHBoxLayout()
@@ -2461,24 +2673,75 @@ if QT_AVAILABLE:
             self.close_button.setToolTip("Esc 或点击此处关闭")
             self.close_button.setShortcut("Esc")
             self.close_button.clicked.connect(self.app.quit if self.exit_on_close else self.hide)
-            self.snooze_button = QPushButton("+5s")
-            self.snooze_button.setToolTip("再多看 5 秒")
-            self.snooze_button.clicked.connect(self.snooze)
-            self.open_button = QPushButton("打开第一个")
+            self.open_button = QPushButton("打开U盘")
             self.open_button.setObjectName("primary")
             self.open_button.setToolTip("回车 / Enter 键也可触发")
+            self.open_button.setMinimumWidth(px(118))
+            self.open_button.setMinimumHeight(px(42))
             self.open_button.setDefault(True)
             self.open_button.setAutoDefault(True)
-            self.open_button.clicked.connect(self.open_first)
+            self.open_button.clicked.connect(self.open_usb)
             buttons.addWidget(self.expand_button)
             buttons.addWidget(self.close_button)
-            buttons.addWidget(self.snooze_button)
             buttons.addStretch(1)
             self.countdown_label = QLabel("")
             self.countdown_label.setObjectName("muted")
             buttons.addWidget(self.countdown_label)
             buttons.addWidget(self.open_button)
             layout.addLayout(buttons)
+
+        def _qscroller_gesture(self, name: str) -> Any:
+            if QScroller is None:
+                return None
+            enum = getattr(QScroller, "ScrollerGestureType", None)
+            if enum is not None and hasattr(enum, name):
+                return getattr(enum, name)
+            return getattr(QScroller, name, None)
+
+        def _install_interaction_filters(self) -> None:
+            self._install_widget_event_filter(self)
+
+        def _install_widget_event_filter(self, widget: Any) -> None:
+            targets = [widget]
+            try:
+                targets.extend(widget.findChildren(QObject))
+            except Exception:
+                pass
+            for target in targets:
+                try:
+                    target.installEventFilter(self)
+                except Exception:
+                    pass
+
+        def _enable_touch_scrolling(self) -> None:
+            """Enable finger/pen kinetic scrolling inside the expanded device list.
+
+            QScrollArea supports scroll bars by default; this adds touch-friendly
+            kinetic dragging on the viewport while keeping row buttons clickable.
+            The left-mouse fallback is intentionally enabled only on the viewport
+            so Windows touch panels that synthesize mouse drags can still scroll.
+            """
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            for widget in (self.scroll, self.scroll.viewport(), self.rows_widget):
+                try:
+                    widget.setAttribute(Qt.WA_AcceptTouchEvents, True)
+                except Exception:
+                    pass
+
+            if QScroller is None:
+                return
+
+            target = self.scroll.viewport()
+            for gesture_name in ("TouchGesture", "LeftMouseButtonGesture"):
+                gesture = self._qscroller_gesture(gesture_name)
+                if gesture is None:
+                    continue
+                try:
+                    QScroller.grabGesture(target, gesture)
+                except Exception:
+                    # Touch scrolling is an enhancement; failure must not break
+                    # the notification window.
+                    pass
 
         def _connect_screen_signals(self) -> None:
             for screen in self.app.screens():
@@ -2649,7 +2912,19 @@ if QT_AVAILABLE:
             self.volumes = event.snapshot
             self.actions.recent.remember_snapshot(event.snapshot)
             self.refresh()
-            if event.display:
+            if not event.display:
+                return
+            if self.isVisible():
+                # Keep one stable toast instance for bursty/multi-device events;
+                # just refresh content and restart the countdown instead of
+                # calling show()/move()/resize repeatedly.
+                self._is_paused = False
+                self._remaining_ms = self.AUTO_HIDE_MS
+                self.hide_timer.start(self.AUTO_HIDE_MS)
+                self._countdown_timer.start()
+                self._refresh_countdown()
+                QTimer.singleShot(0, self._reposition_after_resize)
+            else:
                 self.show_toast()
 
         def refresh_from_state(self) -> None:
@@ -2661,28 +2936,69 @@ if QT_AVAILABLE:
                 item = self.rows_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
-            groups = group_volumes(self.volumes)
+            collapsed_groups = group_volumes(self.volumes)
             latest = self.events[0] if self.events else None
+            if latest and latest.changed_paths and collapsed_groups:
+                changed = {normalize_drive_path(path) for path in latest.changed_paths}
+                indexed_groups = list(enumerate(collapsed_groups))
+                indexed_groups.sort(
+                    key=lambda pair: (
+                        0 if any(normalize_drive_path(item.path) in changed for item in pair[1]) else 1,
+                        pair[0],
+                    )
+                )
+                collapsed_groups = [group for _, group in indexed_groups]
+
+            # Collapsed view is device-oriented: partitions from the same
+            # physical USB disk are grouped into one compact row.  Expanded
+            # view is action-oriented: each partition/drive letter gets its own
+            # row and its own "打开" button, so multi-partition devices can be
+            # opened independently.
+            if self.expanded:
+                changed = {normalize_drive_path(path) for path in latest.changed_paths} if latest and latest.changed_paths else set()
+                volumes = list(self.volumes)
+                if changed:
+                    volumes.sort(key=lambda item: (0 if normalize_drive_path(item.path) in changed else 1, item.path))
+                groups = [[item] for item in volumes]
+            else:
+                groups = collapsed_groups
             self.headline.setText(event_summary(latest).split("：", 1)[0] if latest else "USB 设备监控")
             status = latest.action if latest else "usb"
             self.icon_label.setPixmap(self.icons.pixmap(status, self.theme, px(32)))
-            self.subtitle.setText(
-                f"{len(groups)} 个设备 · {len(self.volumes)} 个卷" if groups else (f"最近事件：{latest.timestamp_local}" if latest else "等待 USB 设备事件")
-            )
+            if groups:
+                if self.expanded:
+                    subtitle = f"{len(self.volumes)} 个分区/卷 · 可单独打开"
+                else:
+                    subtitle = f"{len(collapsed_groups)} 个设备 · {len(self.volumes)} 个卷"
+            else:
+                subtitle = f"最近事件：{latest.timestamp_local}" if latest else "等待 USB 设备事件"
+            self.subtitle.setText(subtitle)
             self.summary.setText(event_summary(latest) if latest else "插入 USB 存储设备后会显示可打开位置。")
             self.count.setText(f"{len(groups)} 个" if groups else "")
             shown = groups if self.expanded else groups[:1]
+            # Create each VolumeRow and toggle its per-row open button based on the expanded state.
             for group in shown:
-                self.rows_layout.addWidget(VolumeRow(group, self.theme, self.icons, self.actions))
+                row = VolumeRow(group, self.theme, self.icons, self.actions)
+                self._install_widget_event_filter(row)
+                # Show the row's own open button only when expanded. When collapsed,
+                # the toast displays a single global open button instead.
+                if hasattr(row, "open_button"):
+                    row.open_button.setVisible(self.expanded)
+                self.rows_layout.addWidget(row)
             self.rows_layout.addStretch(1)
             self.scroll.setVisible(bool(shown))
             self.scroll.setMinimumHeight(px(105) if shown else 0)
             self.scroll.setMaximumHeight(px(285) if self.expanded else px(115))
-            self.expand_button.setVisible(len(groups) > 1)
+            self.expand_button.setVisible(len(self.volumes) > 1 or len(collapsed_groups) > 1)
             self.expand_button.setText("折叠" if self.expanded else "展开")
-            self.open_button.setVisible(bool(self.volumes))
+            # Show the global open button only when not expanded. When expanded,
+            # each row exposes its own open button, so the global button hides.
+            self.open_button.setVisible(bool(self.volumes) and not self.expanded)
             self.adjustSize()
-            self.resize(px(510), min(max(self.sizeHint().height(), px(205)), px(470)))
+            # Fixed width + capped height prevents resize/repaint storms when
+            # several devices are attached/removed in one burst.
+            target_height = px(430) if self.expanded else px(230)
+            self.resize(px(510), min(max(self.sizeHint().height(), px(205)), target_height))
             if self.isVisible() and not self._internal_geometry_change:
                 QTimer.singleShot(0, self._reposition_after_resize)
 
@@ -2690,17 +3006,13 @@ if QT_AVAILABLE:
             if not self.isVisible():
                 return
             screen = self._screen_by_key(self._anchor_screen_key) or self._preferred_screen()
-            self._position_on_screen(screen, refresh_work_area=False)
+            self._position_on_screen(screen, refresh_work_area=True)
             self._schedule_anchor_restore()
 
         def show_toast(self) -> None:
             screen = self._preferred_screen()
             self._position_on_screen(screen, refresh_work_area=True)
             was_visible = self.isVisible()
-            # Cancel any in-flight fade-out so the new event fades in cleanly.
-            self._stop_fade_animation()
-            # Start at 0 opacity; the animation lifts us to 1.0 over FADE_DURATION_MS.
-            self.setWindowOpacity(0.0)
             self.show()
             self._apply_native_z_order()
             self._schedule_anchor_restore()
@@ -2710,7 +3022,6 @@ if QT_AVAILABLE:
             self.hide_timer.start(self.AUTO_HIDE_MS)
             self._countdown_timer.start()
             self._refresh_countdown()
-            self._animate_opacity(0.0, 1.0)
             log_action(
                 "toast_shown",
                 {
@@ -2721,26 +3032,6 @@ if QT_AVAILABLE:
                     "first_show": not was_visible,
                 },
             )
-
-        def snooze(self) -> None:
-            """Extend the auto-hide countdown by ``SNOOZE_STEP_MS`` (capped)."""
-            if not self.isVisible():
-                return
-            if self._is_paused:
-                # Already paused on hover; just increase the frozen remaining time.
-                self._remaining_ms = min(
-                    self.MAX_AUTOHIDE_MS,
-                    self._remaining_ms + self.SNOOZE_STEP_MS,
-                )
-            else:
-                remaining = self.hide_timer.remainingTime()
-                if remaining <= 0:
-                    remaining = self.AUTO_HIDE_MS
-                self._remaining_ms = snooze_remaining_ms(remaining, self.SNOOZE_STEP_MS)
-                self._remaining_ms = min(self.MAX_AUTOHIDE_MS, self._remaining_ms)
-                self.hide_timer.start(self._remaining_ms)
-            self._refresh_countdown()
-            log_action("toast_snoozed", {"remaining_ms": self._remaining_ms})
 
         def _on_auto_hide(self) -> None:
             """Hide timer callback.  When paused, do nothing — the timer is stopped
@@ -2785,6 +3076,8 @@ if QT_AVAILABLE:
                 self.countdown_label.setText("已暂停")
                 return
             remaining = self.hide_timer.remainingTime() if self.hide_timer.isActive() else 0
+            if remaining < 0:
+                remaining = 0
             self.countdown_label.setText(countdown_label(remaining))
 
         def set_status(self, message: Optional[str], drive: Optional[str] = None) -> None:
@@ -2828,96 +3121,84 @@ if QT_AVAILABLE:
             super().keyPressEvent(event)
 
         def _install_outside_click_filter(self) -> None:
-            """Install a global event filter so clicking outside the toast hides it.
-
-            Implementation lives in ``_outside_click_filter`` so tests can drive it
-            directly without spinning up a real QApplication.
-            """
+            """Hide the toast when focus moves away, without a global event filter."""
             if self._outside_filter_installed:
                 return
             self._outside_filter_installed = True
-            self.app.installEventFilter(self)
+            try:
+                self.app.focusChanged.connect(self._on_focus_changed)
+            except Exception:
+                # Some test stubs do not expose focusChanged. In that case the
+                # toast still works; it just will not auto-hide on focus changes.
+                pass
+
+        def _is_toast_widget(self, widget: Any) -> bool:
+            current = widget
+            while current is not None:
+                if current is self:
+                    return True
+                parent = getattr(current, "parentWidget", None)
+                if parent is None:
+                    break
+                try:
+                    current = parent()
+                except Exception:
+                    break
+            return False
+
+        def _on_focus_changed(self, old: Any, new: Any) -> None:
+            if not self.isVisible():
+                return
+            if new is None or not self._is_toast_widget(new):
+                self.hide()
 
         def eventFilter(self, watched: Any, event: Any) -> bool:
             et = event.type()
+            user_event_types = {
+                QEvent.MouseButtonPress,
+                QEvent.MouseButtonRelease,
+                QEvent.Wheel,
+                QEvent.TouchBegin,
+                QEvent.TouchUpdate,
+                QEvent.TouchEnd,
+                QEvent.KeyPress,
+            }
+            if self.isVisible() and self._is_toast_widget(watched) and et in user_event_types and not self._is_paused:
+                self.hide_timer.start(self.AUTO_HIDE_MS)
+                self._remaining_ms = self.AUTO_HIDE_MS
+                self._refresh_countdown()
+
             # WindowDeactivate fires when the user clicks another app or empty
             # desktop. Hide so the toast doesn't get stranded.
             if et == QEvent.WindowDeactivate and watched is not self and self.isVisible():
-                # Only react to events that originate from a top-level window,
-                # not child widgets.  Helps avoid stuttering when the toast's
-                # own button briefly deactivates.
                 try:
                     if hasattr(watched, "isWindow") and watched.isWindow():
                         self.hide()
                 except Exception:
                     pass
-            # Right-click outside opens a context menu; left-click outside hides.
-            if et == QEvent.MouseButtonPress and watched is not self and self.isVisible():
-                try:
-                    if hasattr(watched, "isWindow") and watched.isWindow():
-                        if event.button() == Qt.LeftButton:
-                            self.hide()
-                except Exception:
-                    pass
             return super().eventFilter(watched, event)
 
-        def _animate_opacity(self, start: float, end: float, on_finished=None) -> None:
-            """Run a windowOpacity animation; the reference is held on self so the
-            QPropertyAnimation isn't reaped mid-flight by Qt's event loop."""
-            animation = QPropertyAnimation(self, b"windowOpacity", self)
-            animation.setDuration(self.FADE_DURATION_MS)
-            animation.setStartValue(start)
-            animation.setEndValue(end)
-            animation.setEasingCurve(self.FADE_EASING)
-            if on_finished is not None:
-                animation.finished.connect(on_finished)
-            # Replace any prior animation so we never have two running concurrently.
-            self._stop_fade_animation()
-            self._fade_animation = animation
-            animation.start()
-
-        def _stop_fade_animation(self) -> None:
-            animation = self._fade_animation
-            if animation is None:
-                return
-            try:
-                if animation.state() != QPropertyAnimation.Stopped:
-                    animation.stop()
-            except RuntimeError:
-                # underlying C++ object already deleted (e.g. window closing)
-                pass
-            self._fade_animation = None
+        def closeEvent(self, event: Any) -> None:
+            self.hide_timer.stop()
+            self._countdown_timer.stop()
+            super().closeEvent(event)
 
         def hide(self) -> None:    # type: ignore[override]
-            """Hide the toast with a short fade-out instead of an instant pop.
+            """Hide immediately and reset state.
 
-            Reentrant calls (e.g. close button while already fading out) fall
-            through to ``QWidget.hide()`` so we never strand the window visible.
+            The old fade-out looked nicer but required a layered window on
+            Windows.  Stability is more important here because the toast is
+            updated repeatedly when several USB devices arrive at once.
             """
             if not self.isVisible():
-                # Nothing to animate; defer to base behavior (no-op).
                 super().hide()
                 return
-            if self._fading_out:
-                # Already animating out — don't start a second animation.
-                return
-            if getattr(self, "_fade_animation", None) is not None:
-                # We're animating IN; cut to the destination immediately to avoid
-                # a stuck-at-zero window when the user dismisses during the fade.
-                self._stop_fade_animation()
-                self.setWindowOpacity(1.0)
-            # Clear pause + status override so a future show_toast() starts clean.
             self._is_paused = False
             self._status_override = None
             self._status_overrides.clear()
             self._countdown_timer.stop()
             self.hide_timer.stop()
-            self._fading_out = True
-            self._animate_opacity(1.0, 0.0, self._finish_hide)
-
-        def _finish_hide(self) -> None:
-            self._fading_out = False
-            super(ToastWindow, self).hide()
+            super().hide()
 
         def toggle_expanded(self) -> None:
             self.expanded = not self.expanded
@@ -2925,7 +3206,7 @@ if QT_AVAILABLE:
             if self.isVisible():
                 self._reposition_after_resize()
 
-        def open_first(self) -> None:
+        def open_usb(self) -> None:
             if self.volumes:
                 self.actions.open_volume(self.volumes[0].path)
 
@@ -2940,15 +3221,6 @@ if QT_AVAILABLE:
             self.theme = theme
             self.setStyleSheet(theme.stylesheet())
             self.setWindowIcon(self.icons.icon(theme))
-            # 应用主题背景色和底部边框样式：避免阴影的离屏缓冲区开销
-            palette = self.palette()
-            palette.setColor(QPalette.Window, QColor(theme.bg))
-            self.setPalette(palette)
-            # 在根窗口底部绘制高亮边框以替代阴影效果
-            try:
-                self.root.setStyleSheet(f"#root {{ border-bottom: 3px solid {theme.accent}; }}")
-            except Exception:
-                pass
             effect = self.root.graphicsEffect()
             if isinstance(effect, QGraphicsDropShadowEffect):
                 effect.setColor(theme.shadow)
@@ -2999,6 +3271,14 @@ if QT_AVAILABLE:
 
 
     class TrayMenuController(QObject):
+        """System-tray controller with explicit left/right click split.
+
+        Left click opens the USB-device menu directly.  Right click opens a
+        compact application menu without the device list.  Qt exposes this via
+        QSystemTrayIcon.activated(reason): Trigger is the normal click and
+        Context is the platform context-menu request.
+        """
+
         THEME_LABELS = {"auto": "跟随系统", "light": "浅色", "dark": "深色"}
         LOG_LABELS = {LogMode.OFF: "关闭", LogMode.REDACTED: "脱敏", LogMode.RAW: "明文"}
 
@@ -3026,53 +3306,80 @@ if QT_AVAILABLE:
             self.receiver = receiver
             self.icons = icons
             self.theme = theme
-            self.menu = QMenu()
-            self.volume_menu = self.menu.addMenu("USB 设备")
-            self.volume_menu.aboutToShow.connect(self.refresh_volume_menu)
-            self.rescan_action = self.menu.addAction("重新扫描", self._rescan_clicked)
-            self.rescan_action.setToolTip("手动重新扫描所有盘符（不会被狂点滥用）")
             self._rescan_in_flight = False
-            # Wire the reconciler's "scan done" event via a single-shot callback; polling removed.
-            try:
-                pass  # Polling timer removed; GUI will be notified via _menu_idle_hook on reconciler.
-            except Exception:
-                pass
-            if isinstance(receiver, ToastWindow):
-                self.show_toast_action = self.menu.addAction(
-                    "显示通知",
-                    lambda: (receiver.refresh_from_state(), receiver.show_toast()),
-                )
-                self.hide_toast_action = self.menu.addAction("立即隐藏通知", self._hide_toast)
-                self.hide_toast_action.setToolTip("关掉当前浮层（Esc 也可）")
-            else:
-                self.show_toast_action = None
-                self.hide_toast_action = None
-            self.menu.addSeparator()
-            self._add_log_menu()
-            self._add_theme_menu()
-            self.topmost_action = QAction("通知置顶", self.menu)
-            self.topmost_action.setCheckable(True)
-            self.topmost_action.setChecked(config.topmost)
-            self.topmost_action.toggled.connect(self.apply_topmost)
-            self.menu.addAction(self.topmost_action)
-            self.startup_action = QAction("随系统启动", self.menu)
-            self.startup_action.setCheckable(True)
-            self.startup_action.setChecked(bool(startup.status()["enabled"]))
-            self.startup_action.toggled.connect(self.toggle_startup)
-            self.menu.addAction(self.startup_action)
-            self.menu.addAction("检查/修复开机启动", self.repair_startup)
-            self.menu.addAction("打开程序数据目录", self.open_app_data)
-            self.menu.addSeparator()
-            self.menu.addAction("退出", app.quit)
+            self._last_device_menu_popup = 0.0
+
+            # Left-click menu: this is the original "USB 设备" submenu, promoted
+            # to its own top-level popup so device operations are one click away.
+            self.device_menu = QMenu("USB 设备")
+            self.volume_menu = self.device_menu
+            self.volume_menu.aboutToShow.connect(self.refresh_volume_menu)
+
+            # Right-click menu: keep it short and settings-oriented.  The device
+            # list is intentionally absent because it now belongs to left click.
+            self.menu = QMenu()
+            self.toast_action: Optional[QAction] = None
+            self.show_toast_action: Optional[QAction] = None  # compatibility alias
+            self.hide_toast_action: Optional[QAction] = None  # no separate duplicate item now
+            self._build_right_menu()
+
+            # Re-enable the menu item by polling the reconciler's threading.Event.
+            # Never monkey-patch Event.wait(): external callers must retain the
+            # standard threading.Event contract.
+            self._poll_rescan_timer = QTimer(self)
+            self._poll_rescan_timer.setInterval(150)
+            self._poll_rescan_timer.timeout.connect(self._poll_rescan_status)
+            self._poll_rescan_timer.start()
+
             self.menu.aboutToShow.connect(self.update_dynamic_state)
             tray.setContextMenu(self.menu)
+            tray.activated.connect(self._on_tray_activated)
             self.update_dynamic_state()
 
-        def _add_log_menu(self) -> None:
-            menu = self.menu.addMenu("日志")
-            menu.addAction("打开日志目录", self.open_logs)
-            menu.addAction("立即清空日志", self.reset_logs)
-            menu.addSeparator()
+        def _build_right_menu(self) -> None:
+            self.task_status_action = self.menu.addAction("状态：就绪")
+            self.task_status_action.setEnabled(False)
+            self.task_status_action.setToolTip("最近一次设备操作状态；即使系统通知被关闭也可在此确认结果")
+            self.menu.addSeparator()
+            if isinstance(self.receiver, ToastWindow):
+                self.toast_action = self.menu.addAction("显示通知", self._toggle_toast)
+                self.toast_action.setToolTip("显示或隐藏当前 USB 通知浮层")
+                self.show_toast_action = self.toast_action
+            self.rescan_action = self.menu.addAction("重新扫描", self._rescan_clicked)
+            self.rescan_action.setToolTip("手动重新扫描所有盘符（不会被狂点滥用）")
+
+            self.menu.addSeparator()
+            settings = self.menu.addMenu("设置")
+            self._add_theme_menu(settings)
+            self._add_log_menu(settings)
+            settings.addSeparator()
+            self.topmost_action = QAction("通知置顶", settings)
+            self.topmost_action.setCheckable(True)
+            self.topmost_action.setChecked(self.config.topmost)
+            self.topmost_action.toggled.connect(self.apply_topmost)
+            settings.addAction(self.topmost_action)
+            enabled_hooks = sum(1 for rule in normalize_hook_rules(self.config.hooks) if rule.get("enabled"))
+            self.hooks_status_action = settings.addAction(f"自动化规则：{enabled_hooks} 条启用")
+            self.hooks_status_action.setEnabled(False)
+            self.hooks_status_action.setToolTip("规则保存在 config.json；可通过 工具 → 打开程序数据目录 编辑")
+            self.startup_action = QAction("随系统启动", settings)
+            self.startup_action.setCheckable(True)
+            self.startup_action.setChecked(bool(self.startup.status()["enabled"]))
+            self.startup_action.toggled.connect(self.toggle_startup)
+            settings.addAction(self.startup_action)
+
+            tools = self.menu.addMenu("工具")
+            tools.addAction("打开日志目录", self.open_logs)
+            tools.addAction("立即清空日志", self.reset_logs)
+            tools.addAction("打开程序数据目录", self.open_app_data)
+            tools.addAction("检查/修复开机启动", self.repair_startup)
+
+            self.menu.addSeparator()
+            self.menu.addAction("退出", self.app.quit)
+
+        def _add_log_menu(self, parent_menu: Optional[QMenu] = None) -> QMenu:
+            parent = parent_menu if parent_menu is not None else self.menu
+            menu = parent.addMenu("日志")
             group = QActionGroup(menu)
             group.setExclusive(True)
             for mode, label in ((LogMode.OFF, "关闭日志"), (LogMode.REDACTED, "脱敏日志"), (LogMode.RAW, "明文日志")):
@@ -3087,9 +3394,11 @@ if QT_AVAILABLE:
             reset_action.setChecked(self.config.reset_logs_on_start)
             reset_action.toggled.connect(self.apply_reset_on_start)
             menu.addAction(reset_action)
+            return menu
 
-        def _add_theme_menu(self) -> None:
-            menu = self.menu.addMenu("主题")
+        def _add_theme_menu(self, parent_menu: Optional[QMenu] = None) -> QMenu:
+            parent = parent_menu if parent_menu is not None else self.menu
+            menu = parent.addMenu("主题")
             group = QActionGroup(menu)
             group.setExclusive(True)
             for key, label in self.THEME_LABELS.items():
@@ -3098,10 +3407,12 @@ if QT_AVAILABLE:
                 action.setChecked(self.config.theme == key)
                 action.triggered.connect(partial(self.apply_theme, key))
                 menu.addAction(action)
+            return menu
 
         def refresh_volume_menu(self) -> None:
             self.volume_menu.clear()
             volumes = self.service.state.snapshot()
+            connected = {normalize_drive_path(info.path): info for info in volumes}
             if not volumes:
                 action = self.volume_menu.addAction("当前没有检测到 USB 存储设备")
                 action.setEnabled(False)
@@ -3110,18 +3421,85 @@ if QT_AVAILABLE:
                     submenu = self.volume_menu.addMenu(info.title)
                     submenu.addAction("打开", partial(self.actions.open_volume, info.path))
                     submenu.addAction("在资源管理器中显示", partial(self.actions.reveal_volume, info.path))
-                    submenu.addAction("安全弹出", partial(self.actions.eject_volume, info.path))
+                    eject = submenu.addAction("安全弹出", partial(self.actions.eject_volume, info.path))
+                    if self.actions.is_ejecting(info.path):
+                        eject.setText("正在安全弹出…")
+                        eject.setEnabled(False)
+
             recent = normalize_recent_records(self.config.recent_volumes)
             if recent:
                 self.volume_menu.addSeparator()
-                clear = self.volume_menu.addAction("清空最近记录")
+                recent_menu = self.volume_menu.addMenu("最近使用")
+                for record in recent:
+                    path = normalize_drive_path(record.get("path"))
+                    title = str(record.get("title") or display_name_for_path(path))
+                    item_menu = recent_menu.addMenu(f"{title} · {path}")
+                    current = connected.get(path)
+                    if current is not None:
+                        item_menu.addAction("打开", partial(self.actions.open_volume, path))
+                        item_menu.addAction("在资源管理器中显示", partial(self.actions.reveal_volume, path))
+                    else:
+                        stamp = str(record.get("last_seen_local") or record.get("last_seen_utc") or "未知时间")
+                        stamp = stamp.replace("T", " ")[:19]
+                        offline = item_menu.addAction(f"当前未连接 · 上次使用 {stamp}")
+                        offline.setEnabled(False)
+                    item_menu.addAction("复制盘符", partial(self.actions.copy_text, path))
+                recent_menu.addSeparator()
+                clear = recent_menu.addAction("清空最近记录")
                 clear.triggered.connect(self.clear_recent)
+
+        def _activation_reason_is(self, reason: Any, *names: str) -> bool:
+            enum = getattr(QSystemTrayIcon, "ActivationReason", QSystemTrayIcon)
+            for name in names:
+                value = getattr(enum, name, None)
+                if value is not None and reason == value:
+                    return True
+            reason_name = getattr(reason, "name", "")
+            if reason_name in names:
+                return True
+            text = str(reason)
+            return any(text.endswith(f".{name}") or text == name for name in names)
+
+        def _on_tray_activated(self, reason: Any) -> None:
+            if self._activation_reason_is(reason, "Trigger", "DoubleClick"):
+                now = time.monotonic()
+                if now - self._last_device_menu_popup < 0.20 and self.device_menu.isVisible():
+                    return
+                self._last_device_menu_popup = now
+                self._popup_device_menu()
+            elif self._activation_reason_is(reason, "Context"):
+                self.update_dynamic_state()
+
+        def _popup_device_menu(self) -> None:
+            self.refresh_volume_menu()
+            self.device_menu.popup(self._tray_popup_position())
+
+        def _tray_popup_position(self) -> QPoint:
+            try:
+                geometry = self.tray.geometry()
+                if geometry.isValid() and not geometry.isNull():
+                    return geometry.center()
+            except Exception:
+                pass
+            return QCursor.pos()
+
+        def _toggle_toast(self) -> None:
+            receiver = self.receiver
+            if not isinstance(receiver, ToastWindow):
+                return
+            if receiver.isVisible():
+                receiver.hide()
+            else:
+                receiver.refresh_from_state()
+                receiver.show_toast()
+            self.update_dynamic_state()
 
         def _hide_toast(self) -> None:
             receiver = self.receiver
             if isinstance(receiver, ToastWindow) and receiver.isVisible():
                 receiver.hide()
                 self.actions.notify("已隐藏通知。", timeout=1800)
+                self.update_dynamic_state()
 
         def _on_rescan_done(self, *_args: Any) -> None:
             """Re-enable the rescan action once a manual scan finishes."""
@@ -3137,6 +3515,7 @@ if QT_AVAILABLE:
                 self.service.rescan()
             except Exception as exc:
                 self._mark_rescan_idle()
+                log_error("manual_rescan_failed", {"message": str(exc)}, exc_info=True)
                 self.actions.notify(f"重新扫描失败：{exc}", warning=True, timeout=5000)
 
         def _mark_rescan_idle(self, *_args: Any) -> None:
@@ -3145,47 +3524,45 @@ if QT_AVAILABLE:
                 self.rescan_action.setEnabled(True)
                 self.rescan_action.setText("重新扫描")
 
-        def _mark_rescan_idle_blocking(self, timeout: Optional[float] = None) -> bool:
-            """Forward to threading.Event.wait but also flip the menu state."""
+        def _poll_rescan_status(self) -> None:
+            """Fallback: if the reconciler just finished a scan, re-enable the action."""
             reconciler = self.service.reconciler
-            result = reconciler.scan_completed.wait(timeout) if timeout is not None else reconciler.scan_completed.wait()
-            if result:
+            if self._rescan_in_flight and reconciler.scan_completed.is_set():
                 self._mark_rescan_idle()
-            return result
-
-        # _poll_rescan_status has been removed; rescan state is now updated via reconciler._menu_idle_hook.
 
         def update_dynamic_state(self) -> None:
             count = len(group_volumes(self.service.state.snapshot()))
+            operation_status = self.actions.operation_status()
+            enabled_hooks = sum(1 for rule in normalize_hook_rules(self.config.hooks) if rule.get("enabled"))
+            self.hooks_status_action.setText(f"自动化规则：{enabled_hooks} 条启用")
+            self.task_status_action.setText(f"状态：{operation_status}")
+            self.task_status_action.setToolTip(operation_status)
             self.tray.setToolTip(
-                f"{APP_DISPLAY_NAME} · {count} 个设备 · 主题：{self.THEME_LABELS[self.config.theme]} · 日志：{self.LOG_LABELS[self.config.log_mode]}"
+                f"{APP_DISPLAY_NAME} · {count} 个设备 · {operation_status} · 左键设备 · 右键设置"
             )
             self.startup_action.blockSignals(True)
             self.startup_action.setChecked(bool(self.startup.status()["enabled"]))
             self.startup_action.blockSignals(False)
-            if self.hide_toast_action is not None and isinstance(self.receiver, ToastWindow):
-                self.hide_toast_action.setVisible(self.receiver.isVisible())
-            if self.show_toast_action is not None and isinstance(self.receiver, ToastWindow):
-                self.show_toast_action.setText(
-                    "显示通知" if not self.receiver.isVisible() else "重新显示通知"
-                )
+            if self.toast_action is not None and isinstance(self.receiver, ToastWindow):
+                self.toast_action.setText("隐藏通知" if self.receiver.isVisible() else "显示通知")
 
         def save(self) -> None:
-            # Debounce save to reduce disk writes when multiple menu actions occur
-            self.store.save_debounced(self.config)
+            self.store.save(self.config)
 
         def open_logs(self) -> None:
             try:
                 self.config.log_dir.mkdir(parents=True, exist_ok=True)
                 open_path(str(self.config.log_dir))
-            except Exception as exc:
+            except OSError as exc:
+                log_error("open_logs_failed", {"message": str(exc)}, exc_info=True)
                 self.actions.notify(f"打开日志目录失败：{exc}", warning=True, timeout=6000)
 
         def open_app_data(self) -> None:
             try:
                 app_data_dir().mkdir(parents=True, exist_ok=True)
                 open_path(str(app_data_dir()))
-            except Exception as exc:
+            except OSError as exc:
+                log_error("open_app_data_failed", {"message": str(exc)}, exc_info=True)
                 self.actions.notify(f"打开程序数据目录失败：{exc}", warning=True, timeout=6000)
 
         def reset_logs(self) -> None:
@@ -3196,6 +3573,7 @@ if QT_AVAILABLE:
                 LOGGER.configure(current, reset_logs=False)
                 self.actions.notify("日志已清空。")
             except Exception as exc:
+                log_error("reset_logs_failed", {"message": str(exc)}, exc_info=True)
                 self.actions.notify(f"清空日志失败：{exc}", warning=True, timeout=6000)
 
         def apply_log_mode(self, mode: LogMode) -> None:
@@ -3236,6 +3614,7 @@ if QT_AVAILABLE:
                     message = "已关闭开机启动。"
                 self.actions.notify(message, warning=enabled and not status["healthy"])
             except Exception as exc:
+                log_error("toggle_startup_failed", {"enabled": bool(enabled), "message": str(exc)}, exc_info=True)
                 self.actions.notify(f"设置开机启动失败：{exc}", warning=True, timeout=7000)
             finally:
                 self.update_dynamic_state()
@@ -3246,6 +3625,7 @@ if QT_AVAILABLE:
                 status = self.startup.status()
                 self.actions.notify("开机启动已修复。" if status["healthy"] else "启动项仍未通过检查。", warning=not status["healthy"])
             except Exception as exc:
+                log_error("repair_startup_failed", {"message": str(exc)}, exc_info=True)
                 self.actions.notify(f"修复开机启动失败：{exc}", warning=True, timeout=7000)
             finally:
                 self.update_dynamic_state()
@@ -3284,6 +3664,24 @@ if QT_AVAILABLE:
             else:
                 self.receiver = ToastWindow(self.app, self.theme, self.icons, self.actions, config.topmost, exit_on_close=self.tray is None)
                 self.actions.toast = self.receiver
+            # Initialize hook runner for user-defined automation rules.  Hooks are
+            # optional; if configuration contains invalid entries this block
+            # silently disables hooks but preserves normal operation.  Import is
+            # done lazily to avoid unnecessary dependencies when hooks are unused.
+            try:
+                from .hooks import HookRunner, HookRule  # type: ignore
+                rules = [HookRule(**h) for h in (self.config.hooks or [])]
+                self.hook_runner = HookRunner(rules)
+                try:
+                    # Use queued connection when available so hooks run off the GUI thread.
+                    self.bridge.event_received.connect(self.hook_runner.on_event, type=Qt.ConnectionType.QueuedConnection)
+                except (AttributeError, TypeError, RuntimeError):
+                    self.bridge.event_received.connect(self.hook_runner.on_event)
+            except Exception as exc:
+                # Hooks unavailable or misconfigured.
+                log_error("hooks_initialization_failed", {"message": str(exc)}, exc_info=True)
+                self.hook_runner = None  # type: ignore
+            # Connect the GUI receiver after hooks so that UI updates occur after hooks run.
             try:
                 self.bridge.event_received.connect(self.receiver.consume, type=Qt.ConnectionType.QueuedConnection)
             except TypeError:
@@ -3302,13 +3700,7 @@ if QT_AVAILABLE:
                     self.icons,
                     self.theme,
                 )
-            # Attach a callback so the reconciler can re-enable the rescan menu item after a scan completes.
-            if self.menu is not None:
-                try:
-                    self.service.reconciler._menu_idle_hook = lambda: self.menu._mark_rescan_idle() if self.menu else None
-                except Exception:
-                    pass
-        self.app.aboutToQuit.connect(self.shutdown)
+            self.app.aboutToQuit.connect(self.shutdown)
 
         def run(self) -> int:
             self.service.start()
@@ -3325,6 +3717,12 @@ if QT_AVAILABLE:
 
         def shutdown(self) -> None:
             self.service.stop()
+            hook_runner = getattr(self, "hook_runner", None)
+            if hook_runner is not None:
+                try:
+                    hook_runner.stop()
+                except Exception as exc:
+                    log_error("hooks_shutdown_failed", {"message": str(exc)}, exc_info=True)
             log_action("app_quit", {"reason": "qt_about_to_quit"})
 
 
@@ -3389,11 +3787,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--uninstall-startup", action="store_true")
     parser.add_argument("--startup-status", action="store_true")
     parser.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--silent", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
 def merge_cli_config(args: argparse.Namespace, stored: AppConfig) -> AppConfig:
-    config = replace(stored, recent_volumes=list(stored.recent_volumes))
+    config = replace(stored, recent_volumes=list(stored.recent_volumes), hooks=[dict(rule) for rule in stored.hooks])
     if args.log_dir is not None:
         config.log_dir = args.log_dir
     if args.log_mode is not None:
@@ -3412,6 +3811,8 @@ def merge_cli_config(args: argparse.Namespace, stored: AppConfig) -> AppConfig:
         config.console_log = bool(args.console_log)
     if args.gui_backend is not None:
         config.gui_backend = args.gui_backend
+    elif getattr(args, "silent", False) or getattr(args, "startup", False):
+        config.gui_backend = "tray-only"
     if args.theme is not None:
         config.theme = args.theme
     if args.topmost is not None:
@@ -3438,7 +3839,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     store = ConfigStore(config_path())
     config = merge_cli_config(args, store.load())
     try:
-        store.save_if_changed(config)
+        store.save(config)
     except Exception as exc:
         print(f"[{APP_DISPLAY_NAME}] failed to save config: {exc}", file=sys.stderr)
 

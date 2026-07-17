@@ -17,7 +17,8 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +94,7 @@ class UsbEvent:
 class AppConfig:
     # fields with non-core defaults are filled by ConfigStore.load — we
     # declare them here so core stays self-contained.
-    log_dir: Any            # Path, kept loose to avoid pulling pathlib types
+    log_dir: Path
     log_mode: LogMode = LogMode.REDACTED
     reset_logs_on_start: bool = False
     log_max_bytes: int = 1_000_000
@@ -157,6 +158,57 @@ def normalize_drive_path(value: Any) -> str:
 def display_name_for_path(path: str) -> str:
     return f"移动磁盘 {path}" if path.endswith(":\\") else path
 
+
+
+
+def normalize_hook_rules(value: Any, limit: int = 20) -> list[dict[str, Any]]:
+    """Return a JSON-safe, bounded set of opt-in automation hook rules.
+
+    Invalid or incomplete rules are ignored rather than breaking application
+    startup.  Commands remain argv arrays so callers can execute them with
+    ``shell=False`` semantics.
+    """
+    if not isinstance(value, list) or int(limit) <= 0:
+        return []
+    result: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:80]
+        if not name or name.casefold() in seen_names:
+            continue
+        command_raw = item.get("command")
+        if not isinstance(command_raw, (list, tuple)):
+            continue
+        command = [str(token).strip() for token in command_raw if str(token).strip()]
+        if not command or len(command) > 32 or any(len(token) > 2048 for token in command):
+            continue
+
+        def patterns(key: str) -> list[str]:
+            raw = item.get(key)
+            if not isinstance(raw, (list, tuple)):
+                return []
+            return [str(pattern).strip()[:260] for pattern in raw if str(pattern).strip()][:20]
+
+        try:
+            debounce = float(item.get("debounce_seconds", 2.0))
+        except (TypeError, ValueError):
+            debounce = 2.0
+        debounce = min(max(debounce, 0.1), 3600.0)
+        normalized = {
+            "name": name,
+            "match_paths": patterns("match_paths"),
+            "match_labels": patterns("match_labels"),
+            "command": command,
+            "debounce_seconds": debounce,
+            "enabled": as_bool(item.get("enabled"), True),
+        }
+        result.append(normalized)
+        seen_names.add(name.casefold())
+        if len(result) >= max(0, int(limit)):
+            break
+    return result
 
 def normalize_recent_records(value: Any, limit: int = 10) -> list[dict[str, Any]]:
     if not isinstance(value, list):
@@ -331,18 +383,6 @@ def progress_tooltip_text(total: Optional[int], used: Optional[int], free: Optio
     )
 
 
-def snooze_remaining_ms(remaining_ms: int, extra_ms: int) -> int:
-    """Combine an in-flight remaining time with a user snooze click.
-
-    The result is rounded up to the nearest 500ms so the visible countdown
-    doesn't drift to a sub-second value that flashes in the UI.
-    """
-    base = max(0, int(remaining_ms)) + max(0, int(extra_ms))
-    if base <= 0:
-        return 0
-    return ((base + 499) // 500) * 500
-
-
 def countdown_label(remaining_ms: int) -> str:
     """Render remaining milliseconds as a short 'Ns 后关闭' label.
 
@@ -400,13 +440,13 @@ __all__ = [
     "normalize_drive_path",
     "display_name_for_path",
     "normalize_recent_records",
+    "normalize_hook_rules",
     "format_bytes",
     "group_volumes",
     "group_title",
     "event_summary",
     "precise_percent",
     "progress_tooltip_text",
-    "snooze_remaining_ms",
     "countdown_label",
     "SENSITIVE_KEYS",
     "redact",

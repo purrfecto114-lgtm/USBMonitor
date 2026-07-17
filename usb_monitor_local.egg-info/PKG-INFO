@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: usb-monitor-local
+Version: 1.3.2
+Summary: Windows USB storage tray monitor
+Requires-Python: >=3.11
+Requires-Dist: PySide6>=6.5
+Requires-Dist: pywin32>=306; platform_system == "Windows"
