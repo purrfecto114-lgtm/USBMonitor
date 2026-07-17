@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usb-monitor-local"
+version = "1.3.2"
+description = "Windows USB storage tray monitor"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.5",
+  "pywin32>=306; platform_system == 'Windows'",
+]
+
+[project.scripts]
+usb-monitor = "usb_monitor.app:main"
+
+[tool.setuptools]
+packages = ["usb_monitor"]

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+*.spec
+*.exe
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Nuitka
+*.build/
+*.dist/
+*.onefile-build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local
+*.log
+*.local.json
+.env
