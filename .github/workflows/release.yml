@@ -130,9 +130,25 @@ jobs:
       - name: Smoke-test packaged executable
         shell: pwsh
         run: |
-          & .\dist\USBMonitor.exe --startup-status
-          if ($LASTEXITCODE -ne 0) {
-            throw "Packaged executable smoke test failed with exit code $LASTEXITCODE"
+          # The Nuitka onefile EXE is built with --windows-console-mode=disable
+          # (GUI subsystem). PowerShell's & operator does not wait for GUI apps
+          # to complete, so $LASTEXITCODE is $null immediately after launch.
+          # Start-Process -Wait blocks until the process tree exits and gives
+          # us a reliable ExitCode.
+          $outputFile = [System.IO.Path]::GetTempFileName()
+          try {
+            $proc = Start-Process `
+              -FilePath ".\dist\USBMonitor.exe" `
+              -ArgumentList "--startup-status" `
+              -Wait -NoNewWindow -PassThru `
+              -RedirectStandardOutput $outputFile
+            $output = Get-Content $outputFile -Raw
+            if ($output) { Write-Host $output }
+            if ($proc.ExitCode -ne 0) {
+              throw "Packaged executable smoke test failed with exit code $($proc.ExitCode)"
+            }
+          } finally {
+            Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
           }
 
       - name: Create release assets and checksums
