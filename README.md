@@ -124,6 +124,8 @@ Nuitka 做压缩；设置 `USBMONITOR_NO_UPX=1` 可跳过。
 详见 [`build/windows_nuitka.bat`](build/windows_nuitka.bat) 和
 [`docs/BUILD.md`](docs/BUILD.md)（如果存在）。
 
+自动打 Tag 与发布 GitHub Release 的流程见 [`docs/RELEASE.md`](docs/RELEASE.md)。
+
 ## 🧱 架构
 
 ```

@@ -30,15 +30,24 @@ if not exist "%ENTRY%" (
   exit /b 3
 )
 
-rem Prefer the `py` launcher pinned to 3.11; fall back to `python` on PATH.
-set "PY_LAUNCHER=py -3.11"
-py -3.11 -c "import sys; print(sys.executable)" >nul 2>nul
-if errorlevel 1 (
-  set "PY_LAUNCHER=python"
-  python -c "import sys; assert sys.version_info[:2] >= (3,11)" >nul 2>nul
+rem CI may pin an interpreter explicitly; local builds prefer the `py` launcher.
+if defined USBMONITOR_PYTHON (
+  set "PY_LAUNCHER=%USBMONITOR_PYTHON%"
+  %USBMONITOR_PYTHON% -c "import sys; assert sys.version_info[:2] >= (3,11)" >nul 2>nul
   if errorlevel 1 (
-    echo [ERROR] Python 3.11+ not found. Install from https://www.python.org/
+    echo [ERROR] USBMONITOR_PYTHON does not point to Python 3.11+.
     exit /b 4
+  )
+) else (
+  set "PY_LAUNCHER=py -3.11"
+  py -3.11 -c "import sys; print(sys.executable)" >nul 2>nul
+  if errorlevel 1 (
+    set "PY_LAUNCHER=python"
+    python -c "import sys; assert sys.version_info[:2] >= (3,11)" >nul 2>nul
+    if errorlevel 1 (
+      echo [ERROR] Python 3.11+ not found. Install from https://www.python.org/
+      exit /b 4
+    )
   )
 )
 

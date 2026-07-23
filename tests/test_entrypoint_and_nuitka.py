@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,9 +49,24 @@ def test_nuitka_script_targets_stable_root_entrypoint() -> None:
 
 
 def test_versions_are_consistent() -> None:
-    init_source = (ROOT / "usb_monitor" / "__init__.py").read_text(encoding="utf-8")
-    app_source = (ROOT / "usb_monitor" / "app.py").read_text(encoding="utf-8")
-    build_source = (ROOT / "build" / "windows_nuitka.bat").read_text(encoding="utf-8")
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    for source in (init_source, app_source, build_source, pyproject):
-        assert "1.0.0" in source
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        expected = tomllib.load(handle)["project"]["version"]
+
+    declarations = {
+        "package": (
+            ROOT / "usb_monitor" / "__init__.py",
+            r'^__version__\s*=\s*["\']([^"\']+)["\']',
+        ),
+        "application": (
+            ROOT / "usb_monitor" / "app.py",
+            r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
+        ),
+        "Nuitka build": (
+            ROOT / "build" / "windows_nuitka.bat",
+            r'^set\s+"APP_VERSION=([^"]+)"',
+        ),
+    }
+    for label, (path, pattern) in declarations.items():
+        match = re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE)
+        assert match, f"missing version declaration for {label}"
+        assert match.group(1) == expected

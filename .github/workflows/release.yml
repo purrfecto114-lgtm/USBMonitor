@@ -1,0 +1,239 @@
+name: Build, tag and release
+
+on:
+  push:
+    paths:
+      - "pyproject.toml"
+      - "usb_monitor/__init__.py"
+      - "usb_monitor/app.py"
+      - "build/windows_nuitka.bat"
+      - "CHANGELOG.md"
+      - "requirements-build.txt"
+      - "scripts/release_meta.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Validate release metadata
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      release_name: ${{ steps.metadata.outputs.release_name }}
+      release_needed: ${{ steps.inspect.outputs.release_needed }}
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Validate versions and changelog
+        id: metadata
+        run: python scripts/release_meta.py prepare --output-dir .release
+
+      - name: Check tag and release state
+        id: inspect
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+
+          if git show-ref --verify --quiet "refs/tags/${TAG}"; then
+            tag_sha="$(git rev-list -n 1 "${TAG}")"
+            if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::${TAG} already points to ${tag_sha}, not ${GITHUB_SHA}. Bump the project version before publishing another commit."
+              exit 1
+            fi
+          fi
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release_needed=false" >> "${GITHUB_OUTPUT}"
+            echo "Release ${TAG} already exists; nothing to publish."
+          else
+            echo "release_needed=true" >> "${GITHUB_OUTPUT}"
+            echo "Release ${TAG} does not exist and will be built."
+          fi
+
+      - name: Install test dependencies
+        if: steps.inspect.outputs.release_needed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Run Linux test suite
+        if: steps.inspect.outputs.release_needed == 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+  build-windows:
+    name: Build Windows x64 release
+    needs: preflight
+    if: needs.preflight.outputs.release_needed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11 x64
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Run Windows test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build one-file executable with Nuitka
+        shell: cmd
+        env:
+          USBMONITOR_PYTHON: python
+          USBMONITOR_NO_UPX: "1"
+        run: call build\windows_nuitka.bat onefile
+
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          & .\dist\USBMonitor.exe --startup-status
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable smoke test failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Create release assets and checksums
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseDir = Join-Path $PWD "release-assets"
+          $bundleDir = Join-Path $PWD "release-bundle"
+          New-Item -ItemType Directory -Force -Path $releaseDir, $bundleDir | Out-Null
+
+          $exeName = "USBMonitor-v$env:VERSION-windows-x64.exe"
+          $zipName = "USBMonitor-v$env:VERSION-windows-x64.zip"
+          Copy-Item ".\dist\USBMonitor.exe" (Join-Path $releaseDir $exeName)
+
+          Copy-Item (Join-Path $releaseDir $exeName) (Join-Path $bundleDir "USBMonitor.exe")
+          Copy-Item ".\README.md", ".\CHANGELOG.md", ".\MANIFEST.md" $bundleDir
+          Copy-Item ".\docs\BUILD.md" (Join-Path $bundleDir "BUILD.md")
+          Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath (Join-Path $releaseDir $zipName) -CompressionLevel Optimal
+
+          $checksumTargets = Get-ChildItem $releaseDir -File | Sort-Object Name
+          $checksumLines = foreach ($file in $checksumTargets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $checksumLines | Set-Content -Path (Join-Path $releaseDir "SHA256SUMS.txt") -Encoding ascii
+
+          Get-ChildItem $releaseDir | Format-Table Name, Length
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets-${{ needs.preflight.outputs.tag }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload Nuitka dependency report
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuitka-report-${{ needs.preflight.outputs.tag }}
+          path: build/nuitka/nuitka-report.xml
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Create tag and GitHub Release
+    needs: [preflight, build-windows]
+    if: needs.preflight.outputs.release_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets-${{ needs.preflight.outputs.tag }}
+          path: release-assets
+
+      - name: Recreate and verify release notes
+        run: python scripts/release_meta.py prepare --output-dir .release
+
+      - name: Create tag and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_NAME: ${{ needs.preflight.outputs.release_name }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${RELEASE_NAME}" \
+            --notes-file .release/release-notes.md \
+            --latest
+
+      - name: Verify published release
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_url="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json url --jq .url)"
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json tagName,targetCommitish,isDraft,isPrerelease,url
+          echo "url=${release_url}" >> "${GITHUB_OUTPUT}"
+          echo "### Published [${TAG}](${release_url})" >> "${GITHUB_STEP_SUMMARY}"

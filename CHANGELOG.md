@@ -33,6 +33,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - `pyproject.toml` — editable-install metadata and `usb-monitor` console
   script.
 - `MANIFEST.md` — per-file change manifest for this release.
+- `.github/workflows/release.yml` — validates versions and changelog, runs Linux/Windows tests, builds the Windows x64 Nuitka executable, generates SHA-256 checksums, creates the `vX.Y.Z` tag, and publishes the GitHub Release.
+- `scripts/release_meta.py` — standard-library-only release metadata validator and changelog-section extractor.
+- `docs/RELEASE.md` — maintainer guide for the automated release flow.
+- `tests/test_release_automation.py` — regression tests for release metadata and workflow safety guards.
 
 ### Changed
 - Version bumped from 1.2.7 to 1.0.0 (project reset; semantic versioning
@@ -49,6 +53,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - `CONFIG_VERSION` bumped from 2 to 3 (new `hooks` field).
 - `usb_monitor/__init__.py` re-exports `stable_fingerprint` and the new
   hooks API surface.
+- Version consistency tests now derive the expected version from `pyproject.toml` instead of hard-coding `1.0.0`, so future releases only need to update the actual version declarations.
+- `build/windows_nuitka.bat` accepts `USBMONITOR_PYTHON` so CI can pin the interpreter supplied by `actions/setup-python`; automated releases disable UPX to reduce antivirus false positives.
 
 ### Removed
 - `build/windows_nuitka_upx.bat` — superseded by `windows_nuitka.bat`.
@@ -63,8 +69,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - `tests/test_entrypoint_and_nuitka.py` — version assertions updated to
   `1.0.0`; new test verifies `USBMonitor.pyw` is syntax-valid and calls
   `usb_monitor.app.main`.
-- `151 passed, 1 failed` on Linux (the 1 failure is a Qt real-GUI smoke
-  test that only passes on Windows).
+- Local verification after adding release automation: `154 passed, 1 skipped`; the skipped case is the real-PySide6 subprocess smoke test because PySide6 is not installed in the Linux sandbox.
 
 ---
 

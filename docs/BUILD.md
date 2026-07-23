@@ -66,6 +66,7 @@ build\windows_nuitka.bat onefile
 - onefile 可选本地 UPX，目录版不执行 UPX；
 - 可通过 `USBMONITOR_NO_UPX=1` 禁用 UPX；
 - 可通过 `NUITKA_EXTRA_ARGS` 注入额外参数；
+- CI 可通过 `USBMONITOR_PYTHON=python` 固定使用当前 Python 解释器；
 - 构建前检查 Python 3.11、PySide6、pywin32 和 Nuitka；
 - 构建后检查目标 EXE 是否实际存在。
 
