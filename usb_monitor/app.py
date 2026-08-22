@@ -4030,7 +4030,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     # defense-in-depth(bug3): 旧版 --silent 会强制 gui_backend="tray-only"(降级为不可靠的
     # showMessage)。现已移除该覆盖，--silent 仅作"开机启动兼容标记"保留，不再影响通知通道。
     # 取消 SUPPRESS 让用户能从 --help 看到它，避免"为何降级"的困惑。
-    parser.add_argument("--silent", action="store_true", help="开机启动兼容标记（不再降级通知通道）")
+    parser.add_argument("--silent", action="store_true", help="startup compatibility flag (no longer downgrades notification channel)")
     return parser.parse_args(argv)
 
 
