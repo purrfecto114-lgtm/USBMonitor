@@ -1,0 +1,14 @@
+# Build-time dependencies for USB Monitor (Windows)
+# Install with: py -3.11 -m pip install -r requirements-build.txt
+
+# Compiler
+nuitka>=1.8
+zstandard>=0.22
+ordered-set>=4
+
+# Runtime
+PySide6>=6.5
+pywin32>=306
+
+# Test (optional, for CI)
+pytest>=8
