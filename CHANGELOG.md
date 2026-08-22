@@ -3,6 +3,55 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.0] — 2026-08-22
+
+### Fixed — 8 项恶性bug修复
+
+- **智能笔/HID设备误识别为未分配U盘**（bug1）。
+  `usb_interface_guid()` 从 `GUID_DEVINTERFACE_USB_DEVICE`（覆盖所有USB含HID）
+  改为 `GUID_DEVINTERFACE_VOLUME`（仅卷接口）。`DriveScanner._classify` 在
+  `volume_disk_numbers` 返回空时，不再退化为"DRIVE_REMOVABLE 且非系统盘即外部"
+  的弱启发，改为对卷句柄直接做 `IOCTL_STORAGE_QUERY_PROPERTY` 查询 `bus_type`
+  / `removable_media`。新增 `WindowsStorageApi.volume_storage_is_external()`。
+  新增诊断日志 `removable_drive_classified_non_external`（defense-in-depth）。
+- **Toast动画卡顿**（bug2）。`ToastWindow.refresh()` 实现行复用缓存
+  （按盘符key diff，仅增删变化行），不再每次全量销毁重建VolumeRow；
+  移除冗余 `adjustSize()`；`_RESTORE_DELAYS_MS` 从 `(0,50,250)` 压缩为
+  `(0,200)`，减少1/3重定位开销。
+- **PySide6通知莫名降级为纯toast**（bug3）。`merge_cli_config` 移除
+  `--startup/--silent` 强制 `gui_backend="tray-only"` 的覆盖。后端始终
+  尊重用户 config / `--gui-backend`。`--silent` 取消 `SUPPRESS` 隐藏并
+  文档化为"开机启动兼容标记（不再降级通知通道）"。
+- **托盘右键菜单"最近操作"过长超出屏幕**（bug4）。`refresh_volume_menu`
+  最近记录分页：前5条直接展示，其余收入"更多（N 项）"子菜单，
+  避免主菜单30+项超出屏幕高度（Qt `menu-scrollable` 样式不可靠的业界共识）。
+- **托盘菜单难以点击**（bug5）。`_on_tray_activated` 抑制从200ms降到50ms
+  （不拒绝正常连击）；`_tray_popup_position` 改用 `availableGeometry().bottom()`
+  让 Qt 自动向上展开菜单，避免与任务栏重叠。
+- **日志清理功能失效**（bug6）。`LoggingManager.stop()` 显式 `join` listener
+  线程（timeout=2s）释放Windows文件句柄；`reset_files` 的 `unlink` 失败时
+  回退截断（`write_bytes(b"")`）而非静默 `continue`。
+- **日志容易过大**（bug7）。`write_crash` 加手动轮转
+  （`CRASH_LOG_MAX_BYTES=512KB`×`CRASH_LOG_BACKUPS=2`）；`reset_files`
+  默认 `include_crash=True`（原False导致crash.log越界增长）；
+  日志默认 `256KB×3`（原`1MB×5`，3类合计从15MB+降到≈2.3MB）。
+- **程序体积过大**（bug8）。`safe_eject_drive` 主路径改用
+  `IOCTL_STORAGE_EJECT_MEDIA`（纯ctypes，无需pywin32），Shell.Application
+  降为惰性回退；Nuitka构建脚本新增 `--nofollow-import-to` 排除30+未用Qt模块
+  （QtNetwork/QtSql/QtQml/QtQuick/QtWebEngine等）+ `--no-docstrings` + `--lto=yes`。
+
+### Added — 合理拓展
+- `tests/test_stage2_bugfixes.py` — 20个TDD回归测试，覆盖8个bug的
+  红-绿循环验证（原版19失败/修复版20通过）。
+- bug1 诊断日志层：DRIVE_REMOVABLE 被判为非外部存储时记录
+  `removable_drive_classified_non_external`，帮助用户理解智能笔为何不显示。
+
+### Architecture — 辩证结论
+- **不引入Rust/C++**。三方交叉验证（根因分析/业界对比/YAGNI检查）一致：
+  性能瓶颈在Qt widget重建（业务层Python）非IOCTL调用；同类项目
+  Eric-Canas/USBMonitor纯Python跨三平台运行良好；Nuitka已自动C转译。
+  走"纯Python + ctypes替代pywin32 + Nuitka显式排除未用Qt模块"路线。
+
 ## [1.0.0] — 2026-07-17
 
 ### Security

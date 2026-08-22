@@ -75,7 +75,7 @@ from .core import (
 APP_NAME = "USBMonitor"
 APP_ORG = "BellaKipping"
 APP_DISPLAY_NAME = "USB Monitor"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CONFIG_VERSION = 3
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LOG = logging.getLogger("usb_monitor")
@@ -536,30 +536,39 @@ class LoggingManager:
         config = self._config or LogConfig(default_log_dir(), LogMode.REDACTED, 1_000_000, 5, False)
         self.configure(replace(config, mode=mode), reset_logs=False)
 
-    def reset_files(self, log_dir: Optional[Path] = None, include_crash: bool = False) -> None:
-        """Clear rotating event/action/error logs.
+    def reset_files(self, log_dir: Optional[Path] = None, include_crash: bool = True) -> None:
+        """Clear rotating event/action/error/crash logs.
 
-        Crash logs are intentionally preserved by default so a user can clear
-        routine logs from the tray menu without losing the diagnostics needed
-        to investigate a fatal error.
+        ``include_crash`` 默认改为 True：旧默认 False 会留下越界增长的 crash.log，
+        是日志过大的根因之一。菜单"立即清空日志"现在也清 crash.log。
 
-        Handlers are stopped before deleting so the files are not locked on
-        Windows, where an open file handle prevents deletion.
+        Handlers 先 stop 并 join listener 线程以释放 Windows 文件句柄；
+        unlink 失败时回退为截断（写入空字节），不再静默 continue ——
+        旧逻辑静默吞错是日志清理失效的根因。
         """
         target = log_dir or (self._config.log_dir if self._config else default_log_dir())
         target.mkdir(parents=True, exist_ok=True)
-        # Close all handlers first so file handles are released (required on Windows).
+        # Close all handlers first and JOIN the listener thread so file
+        # handles are fully released (required on Windows; stop() alone only
+        # enqueues a sentinel and returns without joining).
         self.stop()
         patterns = ["events.log*", "actions.log*", "errors.log*"]
         if include_crash:
             patterns.append("crash.log*")
         for pattern in patterns:
             for path in target.glob(pattern):
-                try:
-                    if path.is_file():
-                        path.unlink()
-                except OSError:
+                if not path.is_file():
                     continue
+                try:
+                    path.unlink()
+                except OSError:
+                    # Windows 上句柄可能仍被占用（例如另一进程或刚释放的 listener）；
+                    # 回退为截断而不是静默跳过，确保用户"清空日志"真的生效。
+                    try:
+                        path.write_bytes(b"")
+                    except OSError:
+                        # 日志系统本身的兜底，直接写 stderr 避免循环依赖
+                        print(f"[USBMonitor] reset_files_truncate_failed: {path.name}", file=sys.stderr)
 
     def stop(self) -> None:
         with self._lock:
@@ -568,6 +577,12 @@ class LoggingManager:
                     self._listener.stop()
                 except Exception:
                     pass
+                # stdlib QueueListener.stop() 只投递 sentinel 不 join 线程，
+                # 在 Windows 上 listener 仍持文件句柄导致 reset_files 的
+                # unlink 失败。显式 join（带超时防死锁）。
+                thread = getattr(self._listener, "_thread", None)
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(timeout=2.0)
                 self._listener = None
             for handler in list(LOG.handlers):
                 try:
@@ -602,6 +617,12 @@ class LoggingManager:
         threading.excepthook = thread_hook
         self._hooks_installed = True
 
+    # crash.log 的独立轮转上限：crash 记录走 sys.excepthook 直接写文件（不经过
+    # QueueListener，因为崩溃时 listener 可能已死），旧实现 open("a") 无上限，
+    # 是 crash.log 越界增长的根因。这里用手动轮转（与 RotatingFileHandler 等价）。
+    CRASH_LOG_MAX_BYTES = 512 * 1024  # 512KB
+    CRASH_LOG_BACKUPS = 2
+
     def write_crash(self, exc_type: type[BaseException], exc: BaseException, tb: Any, thread_name: Optional[str] = None) -> None:
         target = self._config.log_dir if self._config else default_log_dir()
         try:
@@ -614,10 +635,41 @@ class LoggingManager:
                 "message": str(exc),
                 "traceback": "".join(traceback.format_exception(exc_type, exc, tb)),
             }
-            with (target / "crash.log").open("a", encoding="utf-8") as file:
+            crash_path = target / "crash.log"
+            # 写入前检查大小并轮转，避免 crash.log 无限增长。
+            try:
+                if crash_path.exists() and crash_path.stat().st_size >= self.CRASH_LOG_MAX_BYTES:
+                    self._rotate_crash_log(crash_path)
+            except OSError:
+                pass
+            with crash_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         except OSError:
             pass
+
+    def _rotate_crash_log(self, crash_path: Path) -> None:
+        """手动轮转 crash.log -> crash.log.1 -> crash.log.2 (与 RotatingFileHandler 等价)。"""
+        base = crash_path.parent
+        # 删除最旧备份 crash.log.{BACKUPS}，逐级前移
+        oldest = base / f"crash.log.{self.CRASH_LOG_BACKUPS}"
+        if oldest.exists():
+            try:
+                oldest.unlink()
+            except OSError:
+                pass
+        for index in range(self.CRASH_LOG_BACKUPS - 1, 0, -1):
+            src = base / f"crash.log.{index}"
+            dst = base / f"crash.log.{index + 1}"
+            if src.exists():
+                try:
+                    src.replace(dst)
+                except OSError:
+                    pass
+        try:
+            crash_path.replace(base / "crash.log.1")
+        except OSError:
+            pass
+
 
 
 LOGGER = LoggingManager()
@@ -694,6 +746,9 @@ DRIVE_TYPE_NAMES = {
 
 IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+# 用于安全弹出：直接向卷句柄发送弹出命令，无需 pywin32 / Shell.Application（locale-dependent）。
+IOCTL_STORAGE_EJECT_MEDIA = 0x002D1084
+GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
@@ -811,7 +866,11 @@ class StorageDeviceDescriptor(ctypes.Structure):
 
 
 def usb_interface_guid() -> GUID:
-    return GUID(0xA5DCBF10, 0x6530, 0x11D2, (ctypes.c_ubyte * 8)(0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED))
+    # GUID_DEVINTERFACE_VOLUME {53F5630D-B6BF-11D0-94F2-00A0C91EFB8B}
+    # 只监听卷接口变更，避免把 HID 设备(智能笔/手写笔/键盘)误纳入通知。
+    # 旧值 GUID_DEVINTERFACE_USB_DEVICE(0xA5DCBF10...) 覆盖所有 USB 设备含 HID，
+    # 是智能笔被误识别为未分配 U 盘的根因之一。
+    return GUID(0x53F5630D, 0xB6BF, 0x11D0, (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B))
 
 
 def paths_from_unitmask(unitmask: int) -> tuple[str, ...]:
@@ -998,6 +1057,94 @@ class WindowsStorageApi:
         finally:
             kernel32.CloseHandle(handle)
 
+    def volume_storage_is_external(self, path: str) -> bool:
+        """Query a *volume* handle (not physical disk) for STORAGE_DEVICE_DESCRIPTOR.
+
+        Used as the fallback when ``volume_disk_numbers`` returns empty — which
+        happens for smart-pen emulated LFB / HID interfaces that expose a drive
+        letter but have no disk extent. Opening the volume and querying its
+        storage descriptor lets us check ``bus_type`` / ``removable_media``
+        directly, instead of the old weak heuristic
+        ("DRIVE_REMOVABLE and not system drive" -> external).
+
+        Returns ``False`` when the query fails or bus_type is not in the
+        external set, so that smart pens / HID devices are no longer
+        misclassified as unallocated USB drives.
+        """
+        handle = self._open(f"\\\\.\\{path[:2]}")
+        if handle is None:
+            return False
+        try:
+            query = StoragePropertyQuery(STORAGE_DEVICE_PROPERTY, PROPERTY_STANDARD_QUERY, (ctypes.c_ubyte * 1)(0))
+            header = StorageDescriptorHeader()
+            returned = wintypes.DWORD()
+            ok = kernel32.DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                ctypes.byref(header),
+                ctypes.sizeof(header),
+                ctypes.byref(returned),
+                None,
+            )
+            if not ok or int(header.size) < ctypes.sizeof(StorageDeviceDescriptor):
+                return False
+            size = min(max(int(header.size), ctypes.sizeof(StorageDeviceDescriptor)), 1024 * 1024)
+            buffer = ctypes.create_string_buffer(size)
+            ok = kernel32.DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                buffer,
+                size,
+                ctypes.byref(returned),
+                None,
+            )
+            if not ok:
+                return False
+            descriptor = ctypes.cast(buffer, ctypes.POINTER(StorageDeviceDescriptor)).contents
+            return bool(descriptor.removable_media) or int(descriptor.bus_type) in EXTERNAL_BUS_TYPES
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def eject_volume(self, path: str) -> bool:
+        """向卷设备发送 IOCTL_STORAGE_EJECT_MEDIA 弹出命令（纯 ctypes，无需 pywin32）。
+
+        返回 True 表示 DeviceIoControl 调用成功；调用方仍需 wait_for_drive_removal
+        确认设备真正离线。这是 safe_eject_drive 的主路径，比旧 Shell.Application
+        InvokeVerb("Eject") 更可靠（不依赖 locale 的 verb 名称）且更轻量。
+        """
+        handle = kernel32.CreateFileW(
+            f"\\\\.\\{path[:2]}",
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        value = ctypes.cast(handle, ctypes.c_void_p).value
+        invalid = ctypes.c_void_p(-1).value
+        if value in (None, 0, invalid):
+            return False
+        try:
+            returned = wintypes.DWORD()
+            ok = kernel32.DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_EJECT_MEDIA,
+                None,
+                0,
+                None,
+                0,
+                ctypes.byref(returned),
+                None,
+            )
+            return bool(ok)
+        finally:
+            kernel32.CloseHandle(handle)
+
 
 class DriveScanner:
     CACHE_TTL_SECONDS = 2.0
@@ -1079,8 +1226,24 @@ class DriveScanner:
         if disk_numbers:
             external = any(self._bus_type_for(number) for number in disk_numbers)
         else:
-            system_drive = normalize_drive_path(os.environ.get("SystemDrive") or "C:")
-            external = drive_type_code == DRIVE_REMOVABLE and key != system_drive
+            # disk_numbers 为空通常意味着该路径不是真正的存储卷(可能是智能笔的
+            # emulated LFB / HID 接口)。旧逻辑退化为 "DRIVE_REMOVABLE 且非系统盘
+            # 即视为外部存储"的弱启发，会把智能笔误识别为未分配 U 盘。
+            # 改为对卷句柄直接做 IOCTL_STORAGE_QUERY_PROPERTY，只有当 bus_type
+            # 属于 USB/SD/MMC 或 removable_media==True 时才认定为外部存储；
+            # 查询失败一律视为非外部(避免误报)。
+            external = self.api.volume_storage_is_external(path)
+            # defense-in-depth(bug1) 诊断层：当系统报告 DRIVE_REMOVABLE 但 IOCTL 判定
+            # 非外部存储时，记录诊断日志，帮助用户理解为何"可移动设备"未被识别为USB存储
+            # (典型场景：智能笔/HID设备暴露盘符但非存储介质)。
+            if not external and drive_type_code == DRIVE_REMOVABLE:
+                try:
+                    log_event("removable_drive_classified_non_external", {
+                        "path": key,
+                        "reason": "no_disk_extent_and_non_usb_bus_type",
+                    })
+                except Exception:
+                    pass  # 诊断日志不应影响主流程
 
         with self._cache_lock:
             self._classification_cache[key] = (disk_numbers, external, now + self.CACHE_TTL_SECONDS)
@@ -2049,19 +2212,49 @@ def safe_eject_drive(path: str) -> str:
     drive = normalize_drive_path(path)[:2]
     if len(drive) != 2 or drive[1] != ":":
         raise ValueError(f"无效盘符：{path}")
+
+    # 主路径：IOCTL_STORAGE_EJECT_MEDIA（纯 ctypes，无需 pywin32，不依赖 locale）。
+    # 这是体积优化的关键：旧路径用 win32com.client.Dispatch("Shell.Application")
+    # 会拖入 pywin32（~10MB）且 InvokeVerb("Eject") 依赖系统语言 verb 名称。
+    try:
+        api = WindowsStorageApi()
+        if api.eject_volume(drive):
+            if wait_for_drive_removal(drive):
+                return drive
+            raise RuntimeError(
+                f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
+                "请关闭占用文件后重试，在确认前请勿拔出。"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # IOCTL 失败（某些设备不支持），回退到 Shell.Application（如果 pywin32 可用）
+        fallback_msg = _eject_via_shell_application(drive)
+        if fallback_msg is None:
+            if wait_for_drive_removal(drive):
+                return drive
+            raise RuntimeError(
+                f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
+                "请关闭占用文件后重试，在确认前请勿拔出。"
+            ) from exc
+        raise RuntimeError(fallback_msg) from exc
+    raise RuntimeError(f"安全弹出 {drive} 失败：IOCTL 与回退路径均未成功。")
+
+
+def _eject_via_shell_application(drive: str) -> Optional[str]:
+    """回退路径：用 Shell.Application InvokeVerb。返回 None 表示成功，否则返回错误消息。"""
     try:
         import win32com.client  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("缺少 pywin32，无法调用 Windows Shell 安全弹出。") from exc
-
+    except ImportError:
+        return "缺少 pywin32，且 IOCTL 弹出失败，无法回退到 Shell.Application。"
     try:
         shell = win32com.client.Dispatch("Shell.Application")
         namespace = shell.NameSpace(17)
         if namespace is None:
-            raise RuntimeError("无法访问“此电脑”。")
+            return "无法访问“此电脑”。"
         item = namespace.ParseName(drive)
         if item is None:
-            raise RuntimeError(f"未找到驱动器 {drive}。")
+            return f"未找到驱动器 {drive}。"
         verbs = item.Verbs()
         count_attr = getattr(verbs, "Count", 0)
         count = int(count_attr() if callable(count_attr) else count_attr)
@@ -2071,30 +2264,18 @@ def safe_eject_drive(path: str) -> str:
             name = str(name_attr() if callable(name_attr) else name_attr).replace("&", "").strip().casefold()
             if any(token in name for token in ("eject", "弹出", "安全删除", "safely remove")):
                 verb.DoIt()
-                if wait_for_drive_removal(drive):
-                    return drive
-                raise RuntimeError(
-                    f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
-                    "请关闭占用文件后重试，在确认前请勿拔出。"
-                )
+                return None
         item.InvokeVerb("Eject")
-        if wait_for_drive_removal(drive):
-            return drive
-        raise RuntimeError(
-            f"已向 Windows 发送 {drive} 的安全弹出请求，但设备仍可访问。"
-            "请关闭占用文件后重试，在确认前请勿拔出。"
-        )
-    except RuntimeError:
-        raise
+        return None
     except Exception as exc:
         hresult, message = _format_com_error(exc)
         unsigned_hresult = hresult & 0xFFFFFFFF if hresult is not None else None
         busy_hresult = {0x80070020, 0x80070021, 0x800700AA}
         lowered = message.casefold()
         if unsigned_hresult in busy_hresult or any(token in lowered for token in ("in use", "busy", "sharing violation", "正在使用", "占用")):
-            raise RuntimeError(f"驱动器 {drive} 正在被程序使用，请关闭相关文件或窗口后重试。") from exc
+            return f"驱动器 {drive} 正在被程序使用，请关闭相关文件或窗口后重试。"
         code_text = f"（HRESULT 0x{unsigned_hresult:08X}）" if unsigned_hresult is not None else ""
-        raise RuntimeError(f"安全弹出 {drive} 失败{code_text}：{message}") from exc
+        return f"安全弹出 {drive} 失败{code_text}：{message}"
 
 
 # format_bytes, group_volumes, group_title, event_summary,
@@ -2546,7 +2727,9 @@ if QT_AVAILABLE:
 
         AUTO_HIDE_MS = 10_000
         MARGIN = 18
-        _RESTORE_DELAYS_MS = (0, 50, 250)
+        # 旧值 (0, 50, 250) 会连发 3 个 singleShot 重定位，与行重建叠加造成动画卡顿。
+        # 压缩为 (0, 200)：0ms 立即对齐 + 200ms 最终沉降，减少 1/3 的重定位开销。
+        _RESTORE_DELAYS_MS = (0, 200)
 
         def __init__(self, app: QApplication, theme: Theme, icons: IconFactory, actions: GuiActions, topmost: bool, exit_on_close: bool = False) -> None:
             super().__init__(None)
@@ -2572,6 +2755,10 @@ if QT_AVAILABLE:
             # Map drive-letter ("E:") -> human-readable status.  Most recent wins.
             self._status_overrides: dict[str, str] = {}
             self._status_override: Optional[str] = None  # legacy single-line field
+            # 行复用缓存：避免每次 refresh 全量销毁重建 VolumeRow（旧逻辑是动画卡顿
+            # 的根因之一）。key = 组内盘符拼接，value = 已创建且已装事件过滤器的行。
+            self._row_cache: dict[str, Any] = {}
+            self._filter_installed_ids: set[int] = set()
             # Click-outside-to-close is implemented with QApplication.focusChanged,
             # while a local event filter is installed only on the toast subtree to
             # reset the countdown after direct user interaction.
@@ -2932,10 +3119,9 @@ if QT_AVAILABLE:
             self.refresh()
 
         def refresh(self) -> None:
-            while self.rows_layout.count():
-                item = self.rows_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+            # 行复用：旧逻辑每次全量 takeAt+deleteLater 重建所有 VolumeRow，再对每个
+            # 新行 findChildren + installEventFilter，是 burst 事件下动画卡顿的根因。
+            # 改为按组 key（盘符集合）diff，仅增删变化的行，已存在的行不重建不重装过滤器。
             collapsed_groups = group_volumes(self.volumes)
             latest = self.events[0] if self.events else None
             if latest and latest.changed_paths and collapsed_groups:
@@ -2976,12 +3162,34 @@ if QT_AVAILABLE:
             self.summary.setText(event_summary(latest) if latest else "插入 USB 存储设备后会显示可打开位置。")
             self.count.setText(f"{len(groups)} 个" if groups else "")
             shown = groups if self.expanded else groups[:1]
-            # Create each VolumeRow and toggle its per-row open button based on the expanded state.
+            # 行复用 diff：按组内盘符集合做 key，仅对新增/删除的行做创建/销毁，
+            # 已存在的行直接复用，避免 findChildren + installEventFilter 重复开销。
+            def _group_key(group: Sequence[VolumeInfo]) -> str:
+                return "|".join(sorted(normalize_drive_path(item.path) for item in group))
+
+            needed_keys = {_group_key(group) for group in shown}
+            # 先从布局移除全部（不销毁 widget，让缓存接管）
+            while self.rows_layout.count():
+                self.rows_layout.takeAt(0)
+            # 删除不再需要的缓存行
+            stale_keys = [key for key in self._row_cache if key not in needed_keys]
+            for key in stale_keys:
+                row = self._row_cache.pop(key, None)
+                if row is not None:
+                    self._filter_installed_ids.discard(id(row))
+                    row.setParent(None)
+                    row.deleteLater()
+            # 按 shown 顺序复用或新建行
             for group in shown:
-                row = VolumeRow(group, self.theme, self.icons, self.actions)
-                self._install_widget_event_filter(row)
-                # Show the row's own open button only when expanded. When collapsed,
-                # the toast displays a single global open button instead.
+                key = _group_key(group)
+                row = self._row_cache.get(key)
+                if row is None:
+                    row = VolumeRow(group, self.theme, self.icons, self.actions)
+                    self._row_cache[key] = row
+                    self._install_widget_event_filter(row)
+                    self._filter_installed_ids.add(id(row))
+                else:
+                    row.group = list(group)
                 if hasattr(row, "open_button"):
                     row.open_button.setVisible(self.expanded)
                 self.rows_layout.addWidget(row)
@@ -2994,7 +3202,8 @@ if QT_AVAILABLE:
             # Show the global open button only when not expanded. When expanded,
             # each row exposes its own open button, so the global button hides.
             self.open_button.setVisible(bool(self.volumes) and not self.expanded)
-            self.adjustSize()
+            # 移除 adjustSize()：它会触发一次完整布局失效，而紧接着的 resize()
+            # 已经设定最终尺寸，adjustSize 是冗余的额外开销（动画卡顿根因之一）。
             # Fixed width + capped height prevents resize/repaint storms when
             # several devices are attached/removed in one burst.
             target_height = px(430) if self.expanded else px(230)
@@ -3430,10 +3639,18 @@ if QT_AVAILABLE:
             if recent:
                 self.volume_menu.addSeparator()
                 recent_menu = self.volume_menu.addMenu("最近使用")
-                for record in recent:
+                # 旧逻辑一次性渲染最多 10 条记录，每条再开 1 个子菜单含 3 action，
+                # 总项数可达 30+，在 1080p 默认 DPI 下超出屏幕高度且 Qt 的
+                # menu-scrollable 样式不可靠（业界共识）。改为分页：前 PREVIEW 条
+                # 直接展示，其余收入"更多…"子菜单，避免主菜单过长。
+                RECENT_PREVIEW = 5
+                preview_records = recent[:RECENT_PREVIEW]
+                overflow_records = recent[RECENT_PREVIEW:]
+
+                def _add_record_item(parent_menu: "QMenu", record: dict) -> None:
                     path = normalize_drive_path(record.get("path"))
                     title = str(record.get("title") or display_name_for_path(path))
-                    item_menu = recent_menu.addMenu(f"{title} · {path}")
+                    item_menu = parent_menu.addMenu(f"{title} · {path}")
                     current = connected.get(path)
                     if current is not None:
                         item_menu.addAction("打开", partial(self.actions.open_volume, path))
@@ -3444,6 +3661,13 @@ if QT_AVAILABLE:
                         offline = item_menu.addAction(f"当前未连接 · 上次使用 {stamp}")
                         offline.setEnabled(False)
                     item_menu.addAction("复制盘符", partial(self.actions.copy_text, path))
+
+                for record in preview_records:
+                    _add_record_item(recent_menu, record)
+                if overflow_records:
+                    more_menu = recent_menu.addMenu(f"更多（{len(overflow_records)} 项）")
+                    for record in overflow_records:
+                        _add_record_item(more_menu, record)
                 recent_menu.addSeparator()
                 clear = recent_menu.addAction("清空最近记录")
                 clear.triggered.connect(self.clear_recent)
@@ -3463,7 +3687,9 @@ if QT_AVAILABLE:
         def _on_tray_activated(self, reason: Any) -> None:
             if self._activation_reason_is(reason, "Trigger", "DoubleClick"):
                 now = time.monotonic()
-                if now - self._last_device_menu_popup < 0.20 and self.device_menu.isVisible():
+                # 旧值 0.20s(200ms) 会拒绝快速二次点击，让用户觉得"菜单难以被点击"。
+                # 降到 0.05s(50ms)：足以去除双击重影，但不拒绝正常连击。
+                if now - self._last_device_menu_popup < 0.05 and self.device_menu.isVisible():
                     return
                 self._last_device_menu_popup = now
                 self._popup_device_menu()
@@ -3475,13 +3701,27 @@ if QT_AVAILABLE:
             self.device_menu.popup(self._tray_popup_position())
 
         def _tray_popup_position(self) -> QPoint:
+            # Windows 下 QSystemTrayIcon.geometry() 不可靠（Qt 源码确认返回 QRect()），
+            # 旧 fallback QCursor.pos() 会让菜单向右下展开，与任务栏重叠导致难以点击。
+            # 改为：定位到可用区域底部（任务栏上方），让 Qt 自动向上展开菜单。
             try:
                 geometry = self.tray.geometry()
                 if geometry.isValid() and not geometry.isNull():
                     return geometry.center()
             except Exception:
                 pass
-            return QCursor.pos()
+            cursor = QCursor.pos()
+            app = QApplication.instance()
+            screen = app.screenAt(cursor) if app is not None else None
+            if screen is None and app is not None:
+                screen = app.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                # x 取游标位置（通常在托盘区），y 取可用区域底部（任务栏顶部）
+                # 这样 QMenu.popup() 会因下方空间不足而自动向上展开。
+                x = max(avail.left(), min(cursor.x(), avail.right()))
+                return QPoint(x, avail.bottom())
+            return cursor
 
         def _toggle_toast(self) -> None:
             receiver = self.receiver
@@ -3787,7 +4027,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--uninstall-startup", action="store_true")
     parser.add_argument("--startup-status", action="store_true")
     parser.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--silent", action="store_true", help=argparse.SUPPRESS)
+    # defense-in-depth(bug3): 旧版 --silent 会强制 gui_backend="tray-only"(降级为不可靠的
+    # showMessage)。现已移除该覆盖，--silent 仅作"开机启动兼容标记"保留，不再影响通知通道。
+    # 取消 SUPPRESS 让用户能从 --help 看到它，避免"为何降级"的困惑。
+    parser.add_argument("--silent", action="store_true", help="开机启动兼容标记（不再降级通知通道）")
     return parser.parse_args(argv)
 
 
@@ -3811,8 +4054,11 @@ def merge_cli_config(args: argparse.Namespace, stored: AppConfig) -> AppConfig:
         config.console_log = bool(args.console_log)
     if args.gui_backend is not None:
         config.gui_backend = args.gui_backend
-    elif getattr(args, "silent", False) or getattr(args, "startup", False):
-        config.gui_backend = "tray-only"
+    # 旧逻辑：--startup/--silent 强制 gui_backend="tray-only"，会使用不可靠的
+    # QSystemTrayIcon.showMessage（Win10 1903+ 已知会"返回成功但不显示"），
+    # 导致 PySide6 ToastWindow 莫名其妙降级为纯 toast 通知。
+    # 现已移除该覆盖：后端始终尊重用户 config / --gui-backend；
+    # --startup 仅为兼容旧 HKCU Run 键保留，不再影响通知通道。
     if args.theme is not None:
         config.theme = args.theme
     if args.topmost is not None:

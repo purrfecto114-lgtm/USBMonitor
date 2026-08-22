@@ -23,16 +23,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_log_reset_preserves_crash_log_by_default(tmp_path: Path) -> None:
+    # 旧逻辑固化：crash.log 默认保留（include_crash=False），导致 crash.log 越界增长。
+    # 修复后（bug7）：reset_files 默认 include_crash=True，crash.log 也被清理。
+    # 保留"显式 include_crash=False 时不清 crash.log"的能力。
     for name in ("events.log", "actions.log", "errors.log", "crash.log"):
         (tmp_path / name).write_text("x", encoding="utf-8")
 
     manager = LoggingManager()
     manager.configure(LogConfig(tmp_path, LogMode.REDACTED, 10_000, 0, False), reset_logs=False)
-    manager.reset_files(tmp_path)
+    manager.reset_files(tmp_path)  # 默认 include_crash=True
 
     assert not (tmp_path / "events.log").exists()
     assert not (tmp_path / "actions.log").exists()
     assert not (tmp_path / "errors.log").exists()
+    assert not (tmp_path / "crash.log").exists()  # 修复后：crash.log 也被清理
+
+    # 验证显式保留 crash.log 的能力仍然可用
+    for name in ("crash.log",):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    manager.reset_files(tmp_path, include_crash=False)
     assert (tmp_path / "crash.log").exists()
 
 
@@ -44,10 +53,13 @@ def test_hooks_match_paths_and_labels_case_insensitively() -> None:
 
 
 def test_startup_implies_silent_tray_backend(tmp_path: Path) -> None:
+    # 旧逻辑固化：--startup 强制 gui_backend="tray-only"。
+    # 修复后：--startup 不再覆盖用户后端选择，ToastWindow 保持 qt-toast。
+    # 参见 app.merge_cli_config 的修复注释。
     args = parse_args(["--startup"])
     config = merge_cli_config(args, AppConfig(log_dir=tmp_path))
 
-    assert config.gui_backend == "tray-only"
+    assert config.gui_backend == "qt-toast"
 
 
 def test_single_instance_mutex_name_is_sanitized() -> None:

@@ -15,7 +15,7 @@ rem   NUITKA_EXTRA_ARGS=...    append extra Nuitka arguments
 cd /d "%~dp0\.." || exit /b 1
 
 set "APP_NAME=USBMonitor"
-set "APP_VERSION=1.0.0"
+set "APP_VERSION=1.1.0"
 set "ENTRY=USBMonitor.pyw"
 set "MODE=%~1"
 if "%MODE%"=="" set "MODE=onefile"
@@ -92,9 +92,43 @@ if /I not "%USBMONITOR_NO_UPX%"=="1" (
   --output-filename=%APP_NAME%.exe ^
   --output-dir=dist ^
   --remove-output ^
+  --no-docstrings ^
+  --lto=yes ^
   --nofollow-import-to=tkinter ^
   --nofollow-import-to=pytest ^
   --nofollow-import-to=unittest ^
+  --nofollow-import-to=PySide6.QtNetwork ^
+  --nofollow-import-to=PySide6.QtSql ^
+  --nofollow-import-to=PySide6.QtPrintSupport ^
+  --nofollow-import-to=PySide6.QtMultimedia ^
+  --nofollow-import-to=PySide6.QtQml ^
+  --nofollow-import-to=PySide6.QtQuick ^
+  --nofollow-import-to=PySide6.QtQuickWidgets ^
+  --nofollow-import-to=PySide6.QtConcurrent ^
+  --nofollow-import-to=PySide6.QtTest ^
+  --nofollow-import-to=PySide6.QtOpenGL ^
+  --nofollow-import-to=PySide6.QtOpenGLWidgets ^
+  --nofollow-import-to=PySide6.QtBluetooth ^
+  --nofollow-import-to=PySide6.QtCharts ^
+  --nofollow-import-to=PySide6.QtDataVisualization ^
+  --nofollow-import-to=PySide6.QtDesigner ^
+  --nofollow-import-to=PySide6.QtHelp ^
+  --nofollow-import-to=PySide6.QtLocation ^
+  --nofollow-import-to=PySide6.QtPositioning ^
+  --nofollow-import-to=PySide6.QtSensors ^
+  --nofollow-import-to=PySide6.QtSerialPort ^
+  --nofollow-import-to=PySide6.QtWebChannel ^
+  --nofollow-import-to=PySide6.QtWebEngine ^
+  --nofollow-import-to=PySide6.QtWebEngineWidgets ^
+  --nofollow-import-to=PySide6.QtWebSockets ^
+  --nofollow-import-to=PySide6.QtXmlPatterns ^
+  --nofollow-import-to=PySide6.Qt3DCore ^
+  --nofollow-import-to=PySide6.Qt3DRender ^
+  --nofollow-import-to=PySide6.Qt3DInput ^
+  --nofollow-import-to=PySide6.Qt3DAnimation ^
+  --nofollow-import-to=PySide6.Qt3DExtras ^
+  --nofollow-import-to=PySide6.QtPdf ^
+  --nofollow-import-to=PySide6.QtPdfWidgets ^
   --report=build\nuitka\nuitka-report.xml ^
   --report-diffable ^
   %UPX_ARGS% ^

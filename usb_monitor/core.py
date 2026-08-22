@@ -97,8 +97,10 @@ class AppConfig:
     log_dir: Path
     log_mode: LogMode = LogMode.REDACTED
     reset_logs_on_start: bool = False
-    log_max_bytes: int = 1_000_000
-    log_backups: int = 5
+    # 旧默认 1MB×5 backups=5MB/类，3 类=15MB+，过大。改为 256KB×3 backups≈768KB/类，
+    # 3 类≈2.3MB，更克制。crash.log 另有独立 512KB×2 轮转上限。
+    log_max_bytes: int = 262_144  # 256KB
+    log_backups: int = 3
     console_log: bool = False
     theme: str = "auto"
     topmost: bool = True

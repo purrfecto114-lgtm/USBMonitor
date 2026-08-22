@@ -52,7 +52,7 @@ from .core import (
 # the explicit names above take precedence and we can safely glob the rest.
 from .app import *  # noqa: E402, F401, F403
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
     # core
     "AppConfig",

@@ -35,3 +35,6 @@ htmlcov/
 
 # Diagnostic / scratch
 optimized-prompt.md
+
+# Release staging
+.release/

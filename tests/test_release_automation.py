@@ -20,7 +20,11 @@ def test_release_metadata_matches_project_and_changelog(tmp_path: Path) -> None:
     assert metadata.version == expected
     assert metadata.tag == f"v{expected}"
     assert metadata.release_name == f"USB Monitor v{expected}"
-    assert "### Security" in metadata.changelog_notes
+    # changelog_notes 必须含至少一个 Keep a Changelog 标准段落标题。
+    # 不强制要求 Security 段——并非每个版本都有安全变更（1.1.0 是bugfix release）。
+    import re
+    assert re.search(r"^### (Security|Fixed|Added|Changed|Deprecated|Removed|Fixed|Architecture)\b", metadata.changelog_notes, re.MULTILINE), \
+        "changelog_notes must contain at least one standard section heading"
 
     write_release_files(metadata, tmp_path)
     payload = json.loads((tmp_path / "release-metadata.json").read_text(encoding="utf-8"))
