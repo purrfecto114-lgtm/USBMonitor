@@ -92,8 +92,6 @@ if /I not "%USBMONITOR_NO_UPX%"=="1" (
   --output-filename=%APP_NAME%.exe ^
   --output-dir=dist ^
   --remove-output ^
-  --no-docstrings ^
-  --lto=yes ^
   --nofollow-import-to=tkinter ^
   --nofollow-import-to=pytest ^
   --nofollow-import-to=unittest ^
