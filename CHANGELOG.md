@@ -3,6 +3,78 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.0] — 2026-09-02
+
+### Added — Windows 成为首要目标平台（发布产物含 Windows 程序）
+
+用户澄清**目标平台是 Windows**，而 2.x 的三版 Release 均只含 Linux
+二进制——对 Windows 用户而言"release 中不包含程序运行时"的根源即此。
+本版把 Windows 纳入一等公民：构建、验证、发布全链路。
+
+- **发布产物新增 `usbmon-<ver>-windows-amd64.zip`**：mingw-w64 交叉编译的
+  `usbmon.exe`，`-static` 完全静态自包含——PE import 表仅
+  `KERNEL32.dll / USER32.dll / GDI32.dll / msvcrt.dll`（全部随 Windows
+  系统自带，msvcrt 自 Win98/NT4 起即为系统组件），**目标机无需安装任何
+  运行时**。strip 后约 89 KB（CI 实测 91,136 字节）。
+- **Windows 真机验证链 `tools/demo.ps1`**（windows-latest runner，15 项
+  断言）：`--version/--help/--list/--once`、未知选项拒绝（退出码 2）、
+  JSONL 逐行合法（start/round/stop 齐全）、hooks 配置解析（start 事件
+  hooks=N）、单实例锁（第二实例退出码 3）、GUI 线程与隐身**顶层**监听窗口
+  创建（按窗口类名+PID 精确匹配）、**模拟系统级 WM_DEVICECHANGE 广播后
+  守护进程即时唤醒、JSONL 出现 `"wake":"hot"`**——该广播与操作系统
+  在卷到达时发送的消息完全一致，message-only 窗口的旧缺陷必挂此项。
+- `ci.yml` 新增两个 job：`build-windows`（mingw-w64 交叉编译 +
+  `-Werror` 零警告 + PE import 自包含断言 + strip）与
+  `verify-windows`（windows-latest 真机跑 demo.ps1）——每次 push 都
+  在真 Windows 上验证。
+- `release.yml` 重构为多 job 门禁链：meta（版本一致性 + 已存在跳过）→
+  build-linux（严格构建 + 双 demo 回归 + musl 静态 + bullseye toast +
+  Xvfb GUI）∖ build-windows（mingw 静态 + import 断言）→
+  verify-windows（真机 15 断言）→ release（双平台打包、tag 冲突
+  拒绝、发布三资产：windows zip + linux tarball + SHA256SUMS）。
+- `Makefile`：`make windows` 升级为 strict（`-Wall -Wextra -pedantic
+  -Werror`）+ `-static`（去掉未使用的 `-lshell32`）；新增
+  `make dist-windows`（strip + zip + 追加 SHA256SUMS，须在 `make dist`
+  之后运行，同一份校验和覆盖双平台）。
+
+### Fixed — Windows 代码地毯式审查发现的缺陷（此前从未编译过，全部实测复现）
+
+- **热路径致命缺陷（监听窗口类型）**：`gui_win32.c` 用 `HWND_MESSAGE`
+  父窗口创建监听窗口——message-only 窗口**收不到任何广播消息**（微软
+  文档《Window Features》明文，Raymond Chen 多次撰文确认），而
+  WM_DEVICECHANGE 设备事件正是广播给所有顶层窗口的。即热路径完全失效、
+  守护进程退化为纯 1h 轮询。改为**不可见顶层窗口**（不 `ShowWindow`）。
+- **第二个热路径致命缺陷（`gui.enabled` 从未置位）**：`gui.c` 的
+  Windows 分支 `um_gui_init` 返回成功却不设置 `g->enabled = 1`——
+  main() 的等待循环因此永远走 `sleep_ms()` 分支（**从不等待唤醒事件**），
+  且 `um_gui_show_add/remove` 一律提前返回（**任何 toast 都弹不出来**）。
+  POSIX 分支有此标志，Windows 分支遗漏。真机 CI 广播测试抓到。
+- **编译错误**：`DBT_DEVTYP_DISK` 常量不存在（dbt.h 仅定义
+  OEM/PORT/VOLUME/DEVICEINTERFACE/HANDLE 五种广播设备类型）；
+  `DEV_BROADCAST_*`/`DBT_*` 实际位于 `<dbt.h>` 而非 `<shellapi.h>`；
+  `main.c` 在不含 `<signal.h>` 的 Windows 分支使用 `sig_atomic_t`；
+  `util.c` 缺 `<direct.h>`（`_mkdir` 声明）。修复后 mingw-w64 13.2
+  `-std=c99 -Wall -Wextra -pedantic -Werror` 零警告（该代码首次被
+  真正编译——此前"零警告"的说法只对 Linux 成立）。
+- **hooks 在 Windows 上几乎不可用**：
+  - 旧实现对 `&|<>()%^` 元字符的拒绝会误杀
+    `C:\Program Files (x86)\...` 等合法路径（Python 原版的 argv 数组
+    语义本就允许这些字符）；BatBadBut（CVE-2024-24576）的真实防线是
+    **拒绝 `.bat/.cmd/.ps1` 可执行文件**（CreateProcess 会为其隐式拉起
+    cmd.exe）+ 直启 `.exe` 不经 shell——两者保留，元字符拒绝移除。
+  - `{path}` 占位符在 Windows 上展开为 `E:\`（尾部反斜杠），旧的
+    trailing-backslash 拒绝使**所有带 `{path}` 的 hook 在 Windows 永不
+    触发**。现按 CRT 参数引号规则实现尾部反斜杠 2n 加倍
+    （`"E:\"` 正确往返为单个 token）。
+- `gui_win32.c` 线程参数传递简化为直接传 `um_gui*`（原栈上 ctx 拷贝
+  存在理论生存期竞态）。
+
+### Removed — 撤回错误的发布
+
+- 删除 v2.0.0 / v2.0.1 / v2.1.0 的 Release 与 tag：三版产物均不含
+  Windows 程序，与"目标平台是 Windows"不符。v1.x（原 Python 版）历史
+  原样保留。v2.2.0 起发布资产包含 Windows 静态自包含 exe。
+
 ## [2.1.0] — 2026-09-02
 
 ### Fixed — 发布产物自包含（release 中此前不含可移植运行时）

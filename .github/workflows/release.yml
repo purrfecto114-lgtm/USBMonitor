@@ -18,25 +18,19 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: "validate, build, tag and publish"
-    if: github.ref_name == github.event.repository.default_branch
+  meta:
+    name: "validate release metadata"
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      skip: ${{ steps.skip.outputs.skip }}
     steps:
-      - name: "Check out (full history, tags included)"
+      - name: Check out
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: "Install build dependencies (X11/Xft, musl for static daemon)"
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev musl-tools
 
       - name: "Validate release metadata (usbmon.h vs CHANGELOG.md)"
+        id: meta
         run: |
           set -eu
           VERSION=$(sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
@@ -45,26 +39,50 @@ jobs:
             || { echo "version '$VERSION' is not plain semver"; exit 1; }
           grep -q "^## \[$VERSION\]" CHANGELOG.md \
             || { echo "CHANGELOG.md has no '## [$VERSION]' section"; exit 1; }
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release version: $VERSION"
 
       - name: "Skip if release already exists (safe no-op)"
+        id: skip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v$VERSION already exists — nothing to do"
-            echo "SKIP=true" >> "$GITHUB_ENV"
+          if gh release view "v${{ steps.meta.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v${{ steps.meta.outputs.version }} already exists — nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "SKIP=false" >> "$GITHUB_ENV"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: "Summary"
+        if: always()
+        run: |
+          if [ "${{ steps.skip.outputs.skip }}" = "true" ]; then
+            echo "### release v${{ steps.meta.outputs.version }} already existed — skipped" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### release v${{ steps.meta.outputs.version }} — building, verifying and publishing" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build-linux:
+    name: "build + regression (Linux)"
+    needs: meta
+    if: needs.meta.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: "Install build dependencies (X11/Xft, musl for static daemon)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools
+
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
-        if: env.SKIP != 'true'
         run: make strict
 
       - name: "Build static daemon (musl, self-contained)"
-        if: env.SKIP != 'true'
         run: |
           make static
           file usbmon-static
@@ -74,22 +92,18 @@ jobs:
           ./usbmon-static --list
 
       - name: "Smoke test (version must match the tag being released)"
-        if: env.SKIP != 'true'
         run: |
-          test "$(./usbmon --version)" = "usbmon $VERSION"
-          test "$(./usbmon-static --version)" = "usbmon $VERSION"
+          test "$(./usbmon --version)" = "usbmon ${{ needs.meta.outputs.version }}"
+          test "$(./usbmon-static --version)" = "usbmon ${{ needs.meta.outputs.version }}"
           ./usbmon --list
 
       - name: "Hooks e2e regression — dynamic build (11 assertions)"
-        if: env.SKIP != 'true'
         run: bash tools/demo.sh
 
       - name: "Hooks e2e regression — musl static build (11 assertions)"
-        if: env.SKIP != 'true'
         run: USBMON=./usbmon-static bash tools/demo.sh
 
       - name: "Build toast helper on a glibc 2.31 baseline (debian:bullseye)"
-        if: env.SKIP != 'true'
         run: |
           set -eu
           docker run --rm -v "$PWD:/src" -w /src debian:bullseye bash -eu -c '
@@ -109,26 +123,139 @@ jobs:
           ./usbmon-toast --help >/dev/null 2>&1 || true
 
       - name: "GUI regression under Xvfb (dynamic daemon + baseline toast)"
-        if: env.SKIP != 'true'
         run: |
           sudo apt-get install -y --no-install-recommends xvfb
           bash tools/demo-gui.sh
 
-      - name: "Package dist artifacts (static daemon + SHA256SUMS)"
-        if: env.SKIP != 'true'
+      - name: "Package Linux dist artifacts (static daemon + SHA256SUMS)"
         run: |
           make dist
           echo "--- packaged daemon linkage ---"
           file dist/*/usbmon
           ldd dist/*/usbmon 2>&1 | head -2
 
+      - name: "Upload Linux dist artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: |
+            dist/usbmon-*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  build-windows:
+    name: "cross-compile Windows (mingw-w64, strict, static)"
+    needs: meta
+    if: needs.meta.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: "Install mingw-w64 cross compiler"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: "Build usbmon.exe (make windows: strict, -static) + strip"
+        run: |
+          make CROSS=x86_64-w64-mingw32- windows
+          x86_64-w64-mingw32-strip usbmon.exe
+          file usbmon.exe
+          ls -la usbmon.exe
+
+      - name: "Assert self-contained PE imports (system DLLs only)"
+        run: |
+          IMPORTS=$(x86_64-w64-mingw32-objdump -p usbmon.exe | grep 'DLL Name:' | sort -u)
+          echo "--- PE import table ---"
+          echo "$IMPORTS"
+          echo "$IMPORTS" | grep -q 'KERNEL32.dll' \
+            || { echo "usbmon.exe does not even import KERNEL32?"; exit 1; }
+          BAD=$(echo "$IMPORTS" | grep -Ei 'libgcc|winpthread|libstdc|mingw' || true)
+          if [ -n "$BAD" ]; then
+            echo "usbmon.exe needs a non-system runtime DLL: $BAD"
+            exit 1
+          fi
+          echo "OK: only Windows system DLLs are imported"
+
+      - name: "Upload Windows exe artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-exe
+          path: usbmon.exe
+          if-no-files-found: error
+
+  verify-windows:
+    name: "Windows runtime verification (windows-latest)"
+    needs: [meta, build-windows]
+    if: needs.meta.outputs.skip != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: "Download usbmon.exe"
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows-exe
+          path: winbin
+
+      - name: "Run demo.ps1 (CLI smoke, JSONL, lock, GUI thread, WM_DEVICECHANGE hot path)"
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/usbmon.h -Pattern '#define UM_VERSION "([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "expected version: $v"
+          pwsh -NoProfile -File tools/demo.ps1 -ExePath (Join-Path $PWD 'winbin/usbmon.exe') -Version $v
+
+  release:
+    name: "package, tag and publish"
+    needs: [meta, build-linux, verify-windows]
+    if: needs.meta.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: "Check out (full history, tags included)"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "Download Linux dist artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-linux
+          path: dist
+
+      - name: "Download Windows exe artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows-exe
+          path: winbin
+
+      - name: "Package Windows zip + extend SHA256SUMS"
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          NAME="usbmon-$VERSION-windows-amd64"
+          mkdir -p "dist/$NAME"
+          cp winbin/usbmon.exe "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/"
+          (cd dist && zip -q -r "$NAME.zip" "$NAME")
+          (cd dist && sha256sum "$NAME.zip" >> SHA256SUMS.txt)
+          echo "--- release checksums ---"
+          cat dist/SHA256SUMS.txt
+          ls -la dist/
+
       - name: "Extract release notes from CHANGELOG.md"
-        if: env.SKIP != 'true'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: python3 tools/release_notes.py CHANGELOG.md "$VERSION" > release-notes.md
 
       - name: "Create tag and publish release with assets"
-        if: env.SKIP != 'true'
         env:
+          VERSION: ${{ needs.meta.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
@@ -148,18 +275,17 @@ jobs:
             --notes-file release-notes.md \
             --latest \
             "dist/usbmon-$VERSION-linux-amd64.tar.gz" \
+            "dist/usbmon-$VERSION-windows-amd64.zip" \
             "dist/SHA256SUMS.txt"
 
       - name: "Summary"
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          if [ "${SKIP:-false}" = "true" ]; then
-            echo "### release v$VERSION already existed — skipped" >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### release v$VERSION published"
-              echo ''
-              echo '```'
-              cat dist/SHA256SUMS.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "### release v$VERSION published"
+            echo ''
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

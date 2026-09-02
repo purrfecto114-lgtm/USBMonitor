@@ -1,14 +1,16 @@
 # usbmon — native USB storage monitor (C99)
 #
 # Linux/macOS:   make            (daemon + usbmon-toast popup helper)
-# Windows:       use MSVC or mingw-w64 (see "windows" target below)
+# Windows:       make CROSS=x86_64-w64-mingw32- windows
+#                (mingw-w64 cross-compile; -static: the exe imports only
+#                 Windows system DLLs — KERNEL32/msvcrt/user32/gdi32 —
+#                 and needs NO runtime installation on the target box)
 #
-# Cross-compile from Linux (if mingw-w64 is installed):
-#   make CROSS=x86_64-w64-mingw32- windows
-#
-# Release artifacts:
-#   make static     (musl, fully self-contained daemon)
-#   make dist       (strict build -> package tarball + SHA256SUMS)
+# Release artifacts (primary target platform: Windows):
+#   make static         (musl, fully self-contained Linux daemon)
+#   make dist           (strict build -> package tarball + SHA256SUMS)
+#   make dist-windows   (mingw exe -> zip; appends to SHA256SUMS —
+#                        run it AFTER `make dist`)
 #
 # The daemon NEVER links X11: popups are rendered by usbmon-toast, a
 # helper binary spawned per event.  When X11/Xft dev files are absent,
@@ -46,7 +48,7 @@ HAVE_X11 := $(shell printf 'int main(void){return 0;}' > /tmp/usbmon-x11probe.c 
 	$(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
 
 # --- targets ----------------------------------------------------------------
-.PHONY: all clean windows strict analyze asan gui dist static
+.PHONY: all clean windows strict analyze asan gui dist dist-windows static
 
 all: usbmon $(if $(HAVE_X11),usbmon-toast,)
 
@@ -136,9 +138,32 @@ dist: usbmon
 	@ls -la dist/
 	@cat dist/SHA256SUMS.txt
 
+# Windows exe: strict, fully static.  Requires mingw-w64:
+#   sudo apt-get install gcc-mingw-w64-x86-64
+#   make CROSS=x86_64-w64-mingw32- windows
 windows: $(SRC_WIN) src/usbmon.h
-	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra $(SRC_WIN) -o usbmon.exe $(LDFLAGS) \
-	    -luser32 -lgdi32 -lshell32
+	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_WIN) \
+	    -o usbmon.exe $(LDFLAGS) -static -luser32 -lgdi32
+
+# Windows packaging: zip + append to dist/SHA256SUMS.txt.
+# Run AFTER `make dist` (which creates dist/ and writes the Linux sums);
+# dist-windows only appends so one checksum file covers both platforms.
+DIST_NAME_WIN := usbmon-$(VERSION)-windows-amd64
+dist-windows: windows
+	@echo ">> packaging $(DIST_NAME_WIN) (version $(VERSION))"
+	@mkdir -p dist/$(DIST_NAME_WIN)
+	@cp usbmon.exe dist/$(DIST_NAME_WIN)/
+	@cp README.md LICENSE dist/$(DIST_NAME_WIN)/
+	@if command -v $(CROSS)strip >/dev/null 2>&1; then \
+		$(CROSS)strip dist/$(DIST_NAME_WIN)/usbmon.exe; \
+	else \
+		echo '>> NOTE: cross-strip missing, shipping unstripped exe'; \
+	fi
+	@cd dist && zip -q -r "$(DIST_NAME_WIN).zip" "$(DIST_NAME_WIN)"
+	@cd dist && sha256sum "$(DIST_NAME_WIN).zip" >> SHA256SUMS.txt
+	@echo ">> dist artifacts:"
+	@ls -la dist/
+	@cat dist/SHA256SUMS.txt
 
 clean:
 	rm -f usbmon usbmon-toast usbmon-asan usbmon-static usbmon.exe
