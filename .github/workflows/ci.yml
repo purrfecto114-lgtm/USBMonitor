@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-and-test:
-    name: strict build + smoke + e2e (mock sysfs + Xvfb GUI)
+    name: "strict build + smoke + e2e (mock sysfs + Xvfb GUI)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -23,39 +23,39 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
-      - name: Install build dependencies (X11/Xft for the toast helper)
+      - name: "Install build dependencies (X11/Xft for the toast helper)"
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               libx11-dev libxft-dev libfontconfig1-dev xvfb
 
-      - name: Build (strict: -Wall -Wextra -pedantic -Werror)
+      - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
 
-      - name: Smoke test (--version / --list)
+      - name: "Smoke test (--version / --list)"
         run: |
           ./usbmon --version
           ./usbmon --list
 
-      - name: Hooks end-to-end regression (mock sysfs, 11 assertions)
+      - name: "Hooks end-to-end regression (mock sysfs, 11 assertions)"
         run: bash tools/demo.sh
 
-      - name: GUI regression under Xvfb (toast popup, hot path, state)
+      - name: "GUI regression under Xvfb (toast popup, hot path, state)"
         run: bash tools/demo-gui.sh
 
-      - name: ASan/UBSan single round
+      - name: "ASan/UBSan single round"
         run: |
           make asan
           timeout 60 ./usbmon-asan --once
 
   analyze:
-    name: gcc static analyzer
+    name: "gcc static analyzer"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out
         uses: actions/checkout@v7
-      - name: gcc -fanalyzer (known false positive filtered)
+      - name: "gcc -fanalyzer (known false positive filtered)"
         run: |
           make analyze 2>&1 | tee analyze.log || true
           # hook.c argv loop is a documented analyzer false positive; anything
