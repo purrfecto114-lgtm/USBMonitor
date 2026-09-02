@@ -34,7 +34,15 @@ int um_gui_init(um_gui *g)
 {
     g->enabled = 0;
     if (g->requested != 1) return 0;
-    return um_gui_win_init(g);          /* thread + WM_DEVICECHANGE listener */
+    /* thread + WM_DEVICECHANGE listener; flag the GUI as active on
+     * success — main() waits on g->wake_event and toasts post to the
+     * thread only when enabled is set (it used to stay 0 on Windows,
+     * silently killing BOTH the hot path and every toast popup). */
+    if (um_gui_win_init(g)) {
+        g->enabled = 1;
+        return 1;
+    }
+    return 0;
 }
 
 void um_gui_show_add(um_gui *g, const um_device *dev)
