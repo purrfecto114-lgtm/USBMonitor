@@ -3,159 +3,74 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.1.1] — 2026-08-22
+## [2.0.0] — 2026-09-02
 
-### Security — 攻防测试发现的鲁棒性加固
+对 Python 版（PySide6 + pywin32，4,159 行单体 `app.py`）的**原生重置版**：
+C99 重写，无网页、无托盘、守护进程零运行时依赖。版本号跳到 2.0.0
+标记架构重置（1.x 为 Python 血统，历史见旧仓库）。
 
-- **[HIGH] hooks.py BatBadBut/CmdHijack 命令注入防护**。
-  新增 `_validate_hook_command_safety()`：
-  - 拒绝 `.bat`/`.cmd`/`.ps1` 作为 executable（CreateProcessW 隐式拉起 cmd.exe）
-  - 拒绝 cmd.exe 元字符 `& | < > ( ) % ^` 出现在任何 argv token
-  - 拒绝 path traversal 序列 `../` 和 `\..`（防 CmdHijack）
-  
-  攻击向量：用户配置 `command[0]` 为 `*.bat` + USB 卷标改为 `FOO&calc.exe` →
-  当前用户权限下 RCE。参考 CVE-2024-24576 / BatBadBut。
-  新增 23 个攻防测试 `tests/test_security_hardening.py`。
-- **[MEDIUM] CLI/Config 参数边界防护**。
-  `--log-max-bytes` 上限 16MB（防 `999GB` 致磁盘耗尽），
-  `--log-backups` 上限 9（防 `999999` 个备份文件）。
-  `ConfigStore.load` 同步加边界，防 config.json 恶意大值。
-- **[LOW] crash.log 轮转失败兜底**。
-  `_rotate_crash_log` 三个 `os.replace` 失败时不再静默吞错：
-  记录诊断到 stderr + 当前 crash.log 截断兜底（防磁盘涨满）。
+### Changed — 架构重置（why）
 
-### Added — 攻防测试套件
-- `tests/test_security_hardening.py` — 23个测试覆盖：
-  - BatBadBut/CmdHijack 命令注入（12个）
-  - CLI/Config 参数边界（4个）
-  - crash.log 轮转兜底（2个）
-  - AST 危险模式扫描（1个，全包扫描 eval/exec/shell=True/pickle/os.system）
-  - 智能笔/HID 识别边界（3个）
-  - mutex name 注入检查（1个）
+常驻小工具最要命的三个指标是**内存驻留、启动延迟、部署复杂度**，
+而"运行时吞吐"从来不是问题（USB 事件低频、IOCTL 是毫秒级 I/O）。
+同沙箱实测对比：
 
-### Tested — 鲁棒性验证
-- Bandit 静态扫描：0 high/medium，2 low（subprocess 黑名单，按设计 shell=False 安全契约）
-- AST 危险模式扫描：0 处（eval/exec/os.system/pickle/shell=True 均无）
-- 23/23 攻防测试通过
-- 197/197 完整测试通过（174原+23新，0回归）
+| 指标 | Python 原版 | usbmon 2.0 (C99) |
+|---|---|---|
+| 进程启动 | 58 ms（仅解释器+非 GUI import） | **0.56 ms** |
+| 常驻内存 | 17.9 MB（非 GUI import）；PySide6 托盘业界 41–220 MB | **3.1 MB / 1 线程** |
+| 产物体积 | Nuitka onefile + UPX ≈ 10–30 MB | **59 KB**（另有 26 KB 弹窗助手，可选） |
+| 运行时依赖 | Python ≥3.11、PySide6、pywin32 | **无**（弹窗助手仅 X11+Xft） |
 
-## [1.1.0] — 2026-08-22
+### Added — 新能力
 
-### Fixed — 8 项恶性bug修复
+- **1h 一轮契约**：`interval=3600s` 保底轮询；插拔通过内核事件
+  （Linux inotify 监视 `/sys/block` / Windows `WM_DEVICECHANGE` 隐藏窗口）
+  **毫秒级唤醒**，0.7 s 防抖等待挂载落定；`--no-hotpath` 强制严格间隔模式。
+- **插入 U 盘弹窗（保留原版体验）**：Linux 由独立助手进程 `usbmon-toast`
+  渲染（Xlib+Xft，右下角 4 槽堆叠、点击/超时消失、CJK 字形逐字体运行时探测），
+  守护进程本体永不链接 X11；Windows 由进程内 GUI 线程实现。
+  首轮 baseline 设备**不弹窗**（登录瞬间不该被窗口轰炸）。
+- **状态持久化**：快照落盘 `last-snapshot.txt`，守护重启 / cron `--once`
+  跨运行去重，**零重发 add / 零重触发 hooks**。
+- **JSONL 事件日志**：add/remove/round/start/stop；`round.wake`
+  字段区分 `start`/`hot`/`tick`，热路径效果可直接审计；1 MB 自动轮转 ×3。
+- **hooks**：argv 数组执行（`execv` / `CreateProcessW`，不经任何 shell），
+  glob 匹配、占位符替换、60 s reaper SIGKILL、SIGHUP 热重载；
+  Windows 保留 BatBadBut（CVE-2024-24576）与 CmdHijack 防护。
+- **安全默认**：序列号默认记 sha256 截断指纹（`--log-raw` 才记明文）；
+  `--list` 严格只读（不弹窗、不触发 hooks）；单实例锁（重复启动退出码 3）。
 
-- **智能笔/HID设备误识别为未分配U盘**（bug1）。
-  `usb_interface_guid()` 从 `GUID_DEVINTERFACE_USB_DEVICE`（覆盖所有USB含HID）
-  改为 `GUID_DEVINTERFACE_VOLUME`（仅卷接口）。`DriveScanner._classify` 在
-  `volume_disk_numbers` 返回空时，不再退化为"DRIVE_REMOVABLE 且非系统盘即外部"
-  的弱启发，改为对卷句柄直接做 `IOCTL_STORAGE_QUERY_PROPERTY` 查询 `bus_type`
-  / `removable_media`。新增 `WindowsStorageApi.volume_storage_is_external()`。
-  新增诊断日志 `removable_drive_classified_non_external`（defense-in-depth）。
-- **Toast动画卡顿**（bug2）。`ToastWindow.refresh()` 实现行复用缓存
-  （按盘符key diff，仅增删变化行），不再每次全量销毁重建VolumeRow；
-  移除冗余 `adjustSize()`；`_RESTORE_DELAYS_MS` 从 `(0,50,250)` 压缩为
-  `(0,200)`，减少1/3重定位开销。
-- **PySide6通知莫名降级为纯toast**（bug3）。`merge_cli_config` 移除
-  `--startup/--silent` 强制 `gui_backend="tray-only"` 的覆盖。后端始终
-  尊重用户 config / `--gui-backend`。`--silent` 取消 `SUPPRESS` 隐藏并
-  文档化为"开机启动兼容标记（不再降级通知通道）"。
-- **托盘右键菜单"最近操作"过长超出屏幕**（bug4）。`refresh_volume_menu`
-  最近记录分页：前5条直接展示，其余收入"更多（N 项）"子菜单，
-  避免主菜单30+项超出屏幕高度（Qt `menu-scrollable` 样式不可靠的业界共识）。
-- **托盘菜单难以点击**（bug5）。`_on_tray_activated` 抑制从200ms降到50ms
-  （不拒绝正常连击）；`_tray_popup_position` 改用 `availableGeometry().bottom()`
-  让 Qt 自动向上展开菜单，避免与任务栏重叠。
-- **日志清理功能失效**（bug6）。`LoggingManager.stop()` 显式 `join` listener
-  线程（timeout=2s）释放Windows文件句柄；`reset_files` 的 `unlink` 失败时
-  回退截断（`write_bytes(b"")`）而非静默 `continue`。
-- **日志容易过大**（bug7）。`write_crash` 加手动轮转
-  （`CRASH_LOG_MAX_BYTES=512KB`×`CRASH_LOG_BACKUPS=2`）；`reset_files`
-  默认 `include_crash=True`（原False导致crash.log越界增长）；
-  日志默认 `256KB×3`（原`1MB×5`，3类合计从15MB+降到≈2.3MB）。
-- **程序体积过大**（bug8）。`safe_eject_drive` 主路径改用
-  `IOCTL_STORAGE_EJECT_MEDIA`（纯ctypes，无需pywin32），Shell.Application
-  降为惰性回退；Nuitka构建脚本新增 `--nofollow-import-to` 排除30+未用Qt模块
-  （QtNetwork/QtSql/QtQml/QtQuick/QtWebEngine等）+ `--no-docstrings` + `--lto=yes`。
+### Removed — 原版的过度工程
 
-### Added — 合理拓展
-- `tests/test_stage2_bugfixes.py` — 20个TDD回归测试，覆盖8个bug的
-  红-绿循环验证（原版19失败/修复版20通过）。
-- bug1 诊断日志层：DRIVE_REMOVABLE 被判为非外部存储时记录
-  `removable_drive_classified_non_external`，帮助用户理解智能笔为何不显示。
+- L1/L2 LRU+TTL 缓存（1h 一轮的扫描只要亚毫秒）
+- 三层 debounce、托盘/常驻主窗口/SVG/动画
+- 启动项自愈、源码包复制、venv 启动 bat、清单签名
+  （静态单文件没有"部署状态"可自愈）
 
-### Architecture — 辩证结论
-- **不引入Rust/C++**。三方交叉验证（根因分析/业界对比/YAGNI检查）一致：
-  性能瓶颈在Qt widget重建（业务层Python）非IOCTL调用；同类项目
-  Eric-Canas/USBMonitor纯Python跨三平台运行良好；Nuitka已自动C转译。
-  走"纯Python + ctypes替代pywin32 + Nuitka显式排除未用Qt模块"路线。
+### Fixed — 相对原版的历史问题
 
-## [1.0.0] — 2026-07-17
+- 原版 Python hooks 的 BatBadBut/CmdHijack 防护在 C 版同等保留并加强
+  （元字符集合包含 `"`，占位符替换后逐 token 重新校验）。
+- 守护进程重启重发 baseline add（原版已知行为）→ 状态持久化后零重发。
+- `--list` 等只读命令不再触发用户自动化（原版会触发 hooks）。
+- reaper 表满时僵尸子进程泄漏 → 有界回收 + 溢出兜底路径。
+- Windows 路径的历史缺陷按静态评审修复：IOCTL
+  `STORAGE_DESCRIPTOR_HEADER` 8 字节 size-probe、`disks[]` 初始化、
+  `UM_MAX_DEV` 越界写、`_snwprintf_s` 截断回写、1.5 MB `um_hooks`
+  移出栈、`CREATE_NO_WINDOW`、`QueryPerformanceCounter` 单调时钟、
+  `Local\` 命名空间互斥体、宽字符日志 I/O。
+  **[WINDOWS-UNVERIFIED]**：Windows 代码按 Win32 API 编写并经静态评审，
+  但本仓库 CI 只构建 Linux；上线前请在 Windows 上构建并冒烟。
 
-### Security
-- **Hooks trust boundary documented.** README now ships a dedicated
-  `🔒 Security` section describing that `config.json` is an implicit trust
-  point, hooks run with the full current-user token, and the feature is
-  opt-in with an empty default `hooks` array.
-- **`shell=False` enforced at AST level.** Every `subprocess.*` call in
-  `usb_monitor/hooks.py` now explicitly passes `shell=False` as a keyword
-  literal, with `stdin/stdout/stderr=DEVNULL` and a 60s timeout. A new
-  regression test (`tests/test_hook_security.py`) parses the module with
-  `ast` and fails if any call site forgets the guard.
-- **`hash_id` renamed to `stable_fingerprint`.** The old name implied
-  cryptographic hashing; the new name matches what the function actually
-  is (a plain truncated SHA-256 with no salt). The docstring now states
-  explicitly that it is **not** encryption, **not** anonymization, and
-  **not** safe for secrets.
+### Verified — 沙箱实测
 
-### Added
-- `USBMonitor.pyw` — GUI entry point for double-click and Nuitka builds.
-- `USBMonitor_console.py` — diagnostic entry point that keeps the console.
-- `run_usb_monitor.bat` — user-facing launcher that creates a `.venv`,
-  installs runtime deps, and starts the app without a console window.
-- `tests/test_hook_security.py` — 5 AST-based regression tests guarding
-  the hook command-execution contract.
-- `docs/BUILD.md` — Nuitka packaging guide covering onefile, standalone,
-  debug-console, and common Qt/AV-false-positive pitfalls.
-- `pyproject.toml` — editable-install metadata and `usb-monitor` console
-  script.
-- `MANIFEST.md` — per-file change manifest for this release.
-- `.github/workflows/release.yml` — validates versions and changelog, runs Linux/Windows tests, builds the Windows x64 Nuitka executable, generates SHA-256 checksums, creates the `vX.Y.Z` tag, and publishes the GitHub Release.
-- `scripts/release_meta.py` — standard-library-only release metadata validator and changelog-section extractor.
-- `docs/RELEASE.md` — maintainer guide for the automated release flow.
-- `tests/test_release_automation.py` — regression tests for release metadata and workflow safety guards.
-
-### Changed
-- Version bumped from 1.2.7 to 1.0.0 (project reset; semantic versioning
-  from here on).
-- `build/windows_nuitka.bat` replaces the legacy
-  `build/windows_nuitka_upx.bat`.  The new script:
-  - targets `USBMonitor.pyw` instead of `usb_monitor/__main__.py`;
-  - accepts `onefile` / `standalone` as an explicit argument;
-  - auto-detects the bundled `upx/upx.exe` and passes it to Nuitka via
-    `--upx-binary` (override with `USBMONITOR_NO_UPX=1`);
-  - prefers `py -3.11` and falls back to `python` on PATH;
-  - honours `USBMONITOR_CONSOLE=1` to force a console for debugging;
-  - writes `build/nuitka/nuitka-report.xml` for dependency audits.
-- `CONFIG_VERSION` bumped from 2 to 3 (new `hooks` field).
-- `usb_monitor/__init__.py` re-exports `stable_fingerprint` and the new
-  hooks API surface.
-- Version consistency tests now derive the expected version from `pyproject.toml` instead of hard-coding `1.0.0`, so future releases only need to update the actual version declarations.
-- `build/windows_nuitka.bat` accepts `USBMONITOR_PYTHON` so CI can pin the interpreter supplied by `actions/setup-python`; automated releases disable UPX to reduce antivirus false positives.
-
-### Removed
-- `build/windows_nuitka_upx.bat` — superseded by `windows_nuitka.bat`.
-- `docs/MARKDOWN_REPORT_20260630_IMPLEMENTATION.md` — internal diagnostic,
-  no longer referenced.
-- `optimized-prompt.md` — scratch file, not part of the shipped project.
-
-### Tests
-- `tests/test_core.py` — `hash_id` tests renamed to `stable_fingerprint`;
-  added `test_stable_fingerprint_is_documented_as_not_cryptographic` to
-  guard the security docstring against regression.
-- `tests/test_entrypoint_and_nuitka.py` — version assertions updated to
-  `1.0.0`; new test verifies `USBMonitor.pyw` is syntax-valid and calls
-  `usb_monitor.app.main`.
-- Local verification after adding release automation: `154 passed, 1 skipped`; the skipped case is the real-PySide6 subprocess smoke test because PySide6 is not installed in the Linux sandbox.
+- `-Wall -Wextra -pedantic -Werror`（gcc 14）零警告，含 Xft 助手；
+- `gcc -fanalyzer` 唯一告警为 hook.c argv 循环已知误报；
+- ASan/UBSan：守护进程与 `--once` 全场景零错误零泄漏；
+- `tools/demo.sh` hooks 全链路回归通过；`tools/demo-gui.sh` 11/11 通过
+  （Xvfb 下插拔→弹窗→中文渲染经 VLM 图像识别验证）。
 
 ---
 
-Older history predates the 1.0.0 reset and is not tracked here.
+1.x 的 Python 版历史记录见旧仓库 CHANGELOG（此处不再重复）。

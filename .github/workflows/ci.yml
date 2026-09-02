@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: strict build + smoke + e2e (mock sysfs + Xvfb GUI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies (X11/Xft for the toast helper)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libx11-dev libxft-dev libfontconfig1-dev xvfb
+
+      - name: Build (strict: -Wall -Wextra -pedantic -Werror)
+        run: make strict
+
+      - name: Smoke test (--version / --list)
+        run: |
+          ./usbmon --version
+          ./usbmon --list
+
+      - name: Hooks end-to-end regression (mock sysfs, 11 assertions)
+        run: bash tools/demo.sh
+
+      - name: GUI regression under Xvfb (toast popup, hot path, state)
+        run: bash tools/demo-gui.sh
+
+      - name: ASan/UBSan single round
+        run: |
+          make asan
+          timeout 60 ./usbmon-asan --once
+
+  analyze:
+    name: gcc static analyzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+      - name: gcc -fanalyzer (known false positive filtered)
+        run: |
+          make analyze 2>&1 | tee analyze.log || true
+          # hook.c argv loop is a documented analyzer false positive; anything
+          # else fails the build.
+          OTHER=$(grep -c 'warning:' analyze.log || true)
+          KNOWN=$(grep -c "hook.c.*uninitialized" analyze.log || true)
+          echo "warnings=$OTHER known_false_positive=$KNOWN"
+          [ "$OTHER" -le "$KNOWN" ]

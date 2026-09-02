@@ -1,40 +1,15 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-build/
-dist/
-*.spec
-*.exe
+# build artifacts
+usbmon
+usbmon-toast
+usbmon-asan
+usbmon.exe
+*.o
 
-# Pytest
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Nuitka
-*.build/
-*.dist/
-*.onefile-build/
-
-# IDE
-.idea/
-.vscode/
+# editor / OS
 *.swp
-*.swo
+.DS_Store
 
-# Local
-*.log
-*.local.json
-.env
-.venv/
-
-# Keep bundled UPX binary (required for reproducible builds)
-!upx/upx.exe
-
-# Diagnostic / scratch
-optimized-prompt.md
-
-# Release staging
-.release/
+# local runtime state (never commit)
+*.jsonl
+*.jsonl.[123]
+last-snapshot.txt
