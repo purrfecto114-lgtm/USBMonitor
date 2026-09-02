@@ -6,6 +6,9 @@
 # Cross-compile from Linux (if mingw-w64 is installed):
 #   make CROSS=x86_64-w64-mingw32- windows
 #
+# Release artifacts (strict build → strip → tarball + SHA256SUMS):
+#   make dist
+#
 # The daemon NEVER links X11: popups are rendered by usbmon-toast, a
 # helper binary spawned per event.  When X11/Xft dev files are absent,
 # the helper is simply not built and the daemon runs headless.
@@ -14,6 +17,9 @@ CC      ?= cc
 CROSS   ?=
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pedantic
 LDFLAGS ?=
+
+VERSION   := $(shell sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
+DIST_NAME := usbmon-$(VERSION)-linux-amd64
 
 SRC_COMMON  = src/main.c src/util.c src/logjson.c src/json.c src/hook.c \
               src/lock.c src/gui.c src/hotpath.c
@@ -27,11 +33,11 @@ ifeq ($(strip $(XFT_LIBS)),)
 XFT_LIBS := -lX11 -lXft
 endif
 HAVE_X11 := $(shell printf 'int main(void){return 0;}' > /tmp/usbmon-x11probe.c && \
-	$(CC) -std=c99 /tmp/usbmon-x11probe.c -o /tmp/usbmon-x11probe \
-	$(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
+        $(CC) -std=c99 /tmp/usbmon-x11probe.c -o /tmp/usbmon-x11probe \
+        $(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
 
 # --- targets ----------------------------------------------------------------
-.PHONY: all clean windows strict analyze asan gui
+.PHONY: all clean windows strict analyze asan gui dist
 
 all: usbmon $(if $(HAVE_X11),usbmon-toast,)
 
@@ -66,9 +72,25 @@ asan:
 	$(CC) -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      $(SRC_LINUX) -o usbmon-asan $(LDFLAGS)
 
+# release packaging: strict build → stripped copies → tarball + SHA256SUMS.
+# Same artifacts the release workflow uploads (CI runs `make dist` too).
+dist: strict
+	@echo ">> packaging $(DIST_NAME) (version $(VERSION))"
+	@rm -rf dist
+	@mkdir -p dist/$(DIST_NAME)
+	@cp usbmon usbmon-toast README.md LICENSE dist/$(DIST_NAME)/
+	@strip dist/$(DIST_NAME)/usbmon dist/$(DIST_NAME)/usbmon-toast
+	@tar -C dist -czf dist/$(DIST_NAME).tar.gz $(DIST_NAME)
+	@cd dist && sha256sum "$(DIST_NAME).tar.gz" > SHA256SUMS.txt
+	@cd dist/$(DIST_NAME) && sha256sum usbmon usbmon-toast >> ../SHA256SUMS.txt
+	@echo ">> dist artifacts:"
+	@ls -la dist/
+	@cat dist/SHA256SUMS.txt
+
 windows: $(SRC_WIN) src/usbmon.h
 	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra $(SRC_WIN) -o usbmon.exe $(LDFLAGS) \
 	    -luser32 -lgdi32 -lshell32
 
 clean:
 	rm -f usbmon usbmon-toast usbmon-asan usbmon.exe
+	rm -rf dist

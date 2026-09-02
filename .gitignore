@@ -4,6 +4,7 @@ usbmon-toast
 usbmon-asan
 usbmon.exe
 *.o
+dist/
 
 # editor / OS
 *.swp

@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.1] — 2026-09-02
+
+### Added — 发布自动化
+
+- `make dist`：一键产出发布产物（严格构建 → strip → tarball →
+  SHA256SUMS），本地与 CI 产物同源同构，避免手滑漏文件。
+- `.github/workflows/release.yml`：推送版本相关变更（`src/usbmon.h` /
+  `CHANGELOG.md` / `Makefile` / workflow 自身）到默认分支时自动：
+  校验版本一致性（usbmon.h ↔ CHANGELOG 章节）→ 严格构建 → 冒烟 +
+  hooks 回归 → `make dist` → 从 CHANGELOG 提取 notes → 创建
+  `vX.Y.Z` tag → 发布 Release 并上传资产。**Release 已存在则安全跳过；
+  tag 指向不同提交则拒绝执行（不移动历史 tag）**。也支持
+  workflow_dispatch 手动重跑。
+- `tools/release_notes.py`：CHANGELOG 章节提取工具（发布 notes 与仓库
+  记录单一来源）。
+
+### Fixed
+
+- v2.0.0 手动发布时踩过的坑自动化解决：发布产物由 CI 从同一提交构建，
+  `SHA256SUMS.txt` 随资产一同生成上传，不再依赖本地环境。
+
 ## [2.0.0] — 2026-09-02
 
 对 Python 版（PySide6 + pywin32，4,159 行单体 `app.py`）的**原生重置版**：

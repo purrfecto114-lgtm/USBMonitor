@@ -163,6 +163,25 @@ usbmon --log-raw           # 序列号明文入日志/弹窗（默认为 sha256 
 - 无托盘/常驻主窗口/SVG/动画——只在事件发生时弹一个轻量通知窗
 - 守护进程本体不链接 X11/GUI 库——弹窗隔离在助手进程里，崩了也不影响监控
 
+## 发布（自动化）
+
+推送版本相关变更（`src/usbmon.h`、`CHANGELOG.md`、`Makefile`、
+`.github/workflows/release.yml`）到默认分支时，`.github/workflows/release.yml`
+自动完成：版本一致性校验（usbmon.h ↔ CHANGELOG 章节）→ 严格构建 →
+冒烟 + hooks 回归 → `make dist` 打包 → 从 CHANGELOG 提取 notes →
+创建 `vX.Y.Z` tag → 发布 Release 并上传资产（tarball + SHA256SUMS）。
+Release 已存在则安全跳过；tag 指向不同提交则拒绝执行。也可在
+Actions 页面手动 workflow_dispatch 重跑。
+
+本地等价操作（产物同构）：
+
+```bash
+make dist          # → dist/usbmon-<ver>-linux-amd64.tar.gz + dist/SHA256SUMS.txt
+```
+
+发布新版本的流程：改 `src/usbmon.h` 的 `UM_VERSION` + 在 `CHANGELOG.md`
+顶部加对应 `## [X.Y.Z]` 章节 → push —— 工作流完成其余全部。
+
 ## 目录
 
 ```
@@ -171,6 +190,7 @@ usbmon/
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE              MIT（与 1.x Python 版同源授权）
+├── .github/workflows/   ci.yml（每次 push）+ release.yml（版本变更时发布）
 ├── src/
 │   ├── usbmon.h       公共类型与契约
 │   ├── main.c         CLI、快照 diff、轮循环、热路径接线、状态持久化
@@ -185,7 +205,7 @@ usbmon/
 │   ├── logjson.c      JSONL 日志 + 轮转
 │   ├── lock.c         单实例（flock / 命名互斥体）
 │   └── util.c         时间、glob、SHA-256 指纹、目录助手
-└── tools/  demo.sh + demo-gui.sh   端到端演示与 GUI 回归测试
+└── tools/  demo.sh + demo-gui.sh + release_notes.py   端到端演示、GUI 回归、发布 notes 提取
 ```
 
 ## 已验证行为（沙箱实测）

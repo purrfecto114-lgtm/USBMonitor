@@ -1,0 +1,119 @@
+name: Build, tag and release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/usbmon.h"
+      - "CHANGELOG.md"
+      - "Makefile"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: "validate, build, tag and publish"
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: "Check out (full history, tags included)"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "Install build dependencies (X11/Xft for the toast helper)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libx11-dev libxft-dev libfontconfig1-dev
+
+      - name: "Validate release metadata (usbmon.h vs CHANGELOG.md)"
+        run: |
+          set -eu
+          VERSION=$(sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
+          [ -n "$VERSION" ] || { echo "UM_VERSION missing in src/usbmon.h"; exit 1; }
+          echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            || { echo "version '$VERSION' is not plain semver"; exit 1; }
+          grep -q "^## \[$VERSION\]" CHANGELOG.md \
+            || { echo "CHANGELOG.md has no '## [$VERSION]' section"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "release version: $VERSION"
+
+      - name: "Skip if release already exists (safe no-op)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v$VERSION already exists — nothing to do"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          else
+            echo "SKIP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
+        if: env.SKIP != 'true'
+        run: make strict
+
+      - name: "Smoke test (version must match the tag being released)"
+        if: env.SKIP != 'true'
+        run: |
+          test "$(./usbmon --version)" = "usbmon $VERSION"
+          ./usbmon --list
+
+      - name: "Hooks end-to-end regression (mock sysfs, 11 assertions)"
+        if: env.SKIP != 'true'
+        run: bash tools/demo.sh
+
+      - name: "Package dist artifacts (stripped tarball + SHA256SUMS)"
+        if: env.SKIP != 'true'
+        run: make dist
+
+      - name: "Extract release notes from CHANGELOG.md"
+        if: env.SKIP != 'true'
+        run: python3 tools/release_notes.py CHANGELOG.md "$VERSION" > release-notes.md
+
+      - name: "Create tag and publish release with assets"
+        if: env.SKIP != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            TAG_COMMIT=$(git rev-parse "v$VERSION^{commit}")
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+              echo "tag v$VERSION already exists at $TAG_COMMIT but head is $HEAD_COMMIT"
+              echo "refusing to move a historical tag — bump UM_VERSION in src/usbmon.h"
+              exit 1
+            fi
+            echo "tag v$VERSION exists at head — publishing release for it"
+          fi
+          gh release create "v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "usbmon v$VERSION" \
+            --notes-file release-notes.md \
+            --latest \
+            "dist/usbmon-$VERSION-linux-amd64.tar.gz" \
+            "dist/SHA256SUMS.txt"
+
+      - name: "Summary"
+        run: |
+          if [ "${SKIP:-false}" = "true" ]; then
+            echo "### release v$VERSION already existed — skipped" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### release v$VERSION published"
+              echo '```'
+              cat dist/SHA256SUMS.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
