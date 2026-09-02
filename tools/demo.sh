@@ -13,6 +13,10 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Override the binary under test (e.g. the musl static build):
+#   USBMON=./usbmon-static bash tools/demo.sh
+USBMON_BIN="${USBMON:-./usbmon}"
+
 SYS=/tmp/usbmon-demo-sys
 LOG=/tmp/usbmon-demo-events.jsonl
 HOOKS=/tmp/usbmon-demo-hooks.json
@@ -20,6 +24,8 @@ MARK=/tmp/usbmon-demo-hook-fired
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  >>> PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  >>> FAIL: $1"; }
+
+echo "(binary under test: $USBMON_BIN)"
 
 rm -rf "$SYS" "$LOG" "$MARK" ~/.local/state/usbmon/last-snapshot.txt
 mkdir -p "$SYS/block"
@@ -60,13 +66,13 @@ EOF
 
 echo "== 1. initial state: one USB stick present =="
 make_device sdb "SanDisk " "Cruzer Glide 3.0 " "0101834A2B341234" 59105800 usb
-./usbmon --list --sys-root "$SYS"
-grep -q 'sdb' <<<"$(./usbmon --list --sys-root "$SYS")" \
+"$USBMON_BIN" --list --sys-root "$SYS"
+grep -q 'sdb' <<<"$("$USBMON_BIN" --list --sys-root "$SYS")" \
     && ok "--list shows sdb" || bad "--list missing sdb"
 
 echo
 echo "== 2. --once: baseline round, add-event logged + hook fires =="
-./usbmon --once --sys-root "$SYS" --log "$LOG" --hooks "$HOOKS" --verbose
+"$USBMON_BIN" --once --sys-root "$SYS" --log "$LOG" --hooks "$HOOKS" --verbose
 sleep 0.5
 [ -f "$MARK" ] && ok "hook fired: marker file created" \
                 || bad "hook did NOT fire for baseline add"
@@ -77,7 +83,7 @@ echo
 echo "== 3. simulate plug of a second stick (sdc) =="
 rm -f "$MARK"
 make_device sdc "Kingston " "DataTraveler 3.0 " "60A44C4C1234567890" 121395200 usb
-./usbmon --once --sys-root "$SYS" --log "$LOG" --hooks "$HOOKS" --verbose
+"$USBMON_BIN" --once --sys-root "$SYS" --log "$LOG" --hooks "$HOOKS" --verbose
 sleep 0.5
 [ -f "$MARK" ] && ok "hook fired again (sdc)" || bad "hook did NOT fire for sdc"
 grep -q '"ev":"add","key":"sdc"' "$LOG" \
@@ -86,7 +92,7 @@ grep -q '"ev":"add","key":"sdc"' "$LOG" \
 echo
 echo "== 4. simulate unplug of sdb + stale mount entry check =="
 rm -rf "$SYS/block/sdb"
-./usbmon --once --sys-root "$SYS" --log "$LOG" --verbose
+"$USBMON_BIN" --once --sys-root "$SYS" --log "$LOG" --verbose
 grep -q '"ev":"remove","key":"sdb"' "$LOG" \
     && ok "sdb remove logged" || bad "sdb remove event missing"
 
@@ -112,7 +118,7 @@ then ok "every JSONL line is valid JSON"; else bad "invalid JSONL lines"; fi
 echo
 echo "== 6. daemon mode: 2s rounds, live plug during run =="
 rm -rf "$SYS/block/sdc"
-./usbmon --sys-root "$SYS" --log "$LOG" --interval 2 --verbose &
+"$USBMON_BIN" --sys-root "$SYS" --log "$LOG" --interval 2 --verbose &
 DPID=$!
 sleep 1
 make_device sdd "Generic " "Flash Disk " "070B77A08123" 15634432 usb

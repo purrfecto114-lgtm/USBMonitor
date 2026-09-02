@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define UM_VERSION "2.0.1"
+#define UM_VERSION "2.1.0"
 
 /* ---- limits (defensive caps, same spirit as the original normalizers) ---- */
 #define UM_MAX_DEV          64      /* devices per snapshot            */

@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.0] — 2026-09-02
+
+### Fixed — 发布产物自包含（release 中此前不含可移植运行时）
+
+v2.0.1 及更早的 tarball 里两个二进制都是**动态链接**产物：守护进程
+依赖构建机的 glibc 符号基线（`GLIBC_2.34`，仅 Ubuntu 22.04+/Debian 12+
+可运行），toast 助手另有 17 个动态库依赖。用户正确指出"release 中不
+包含程序运行时"。按业界标准做法修复：
+
+- **守护进程 `usbmon` → musl 完全静态链接**：无 ELF interpreter、无
+  glibc 符号基线，任意 x86-64 Linux 内核即跑——这才是名副其实的
+  "零运行时依赖"。选 musl 而非 `-static` glibc 的原因：glibc 静态
+  有 NSS/locale dlopen 的经典坑，本项目虽未调用 NSS，仍按社区共识
+  走 musl（musl 本身就是为静态链接设计的）。
+- **toast 助手 → glibc 2.31 基线**：在 `debian:bullseye` 容器中构建，
+  覆盖 Ubuntu 20.04+/Debian 11+；运行时仅需桌面标配的
+  `libX11/libXft/fontconfig`（README 已明确声明）。
+- CI 在每次 push 与每次发布时都验证静态链接性
+  （`ldd` 必须报 "not a dynamic executable"）并以静态二进制完整跑
+  11 项 hooks 回归；发布时额外校验 toast 的 glibc 符号基线 < 2.32。
+
+### Added
+
+- `make static`：musl 静态守护进程构建目标（缺 musl-gcc 时显式报错
+  而非静默降级）；`make dist` 优先打包静态版。
+- `tools/demo.sh` 支持 `USBMON=` 覆盖被测二进制（同一套 11 断言既测
+  动态版也测静态版）。
+
 ## [2.0.1] — 2026-09-02
 
 ### Added — 发布自动化

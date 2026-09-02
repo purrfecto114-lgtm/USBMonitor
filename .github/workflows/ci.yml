@@ -23,11 +23,11 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
-      - name: "Install build dependencies (X11/Xft for the toast helper)"
+      - name: "Install build dependencies (X11/Xft, musl for the toast helper + static daemon)"
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev xvfb
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools xvfb
 
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
@@ -37,8 +37,19 @@ jobs:
           ./usbmon --version
           ./usbmon --list
 
+      - name: "Build static daemon (musl, self-contained) + verify linkage"
+        run: |
+          make static
+          ldd usbmon-static 2>&1 | grep -q "not a dynamic executable" \
+            || { echo "usbmon-static is NOT statically linked"; exit 1; }
+          ./usbmon-static --version
+          ./usbmon-static --list
+
       - name: "Hooks end-to-end regression (mock sysfs, 11 assertions)"
         run: bash tools/demo.sh
+
+      - name: "Hooks e2e regression — musl static build (11 assertions)"
+        run: USBMON=./usbmon-static bash tools/demo.sh
 
       - name: "GUI regression under Xvfb (toast popup, hot path, state)"
         run: bash tools/demo-gui.sh

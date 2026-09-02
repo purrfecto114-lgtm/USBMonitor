@@ -25,7 +25,7 @@ sdb      usb       SanDisk Cruzer Glide 3.0   28.2 GB  /media/user/CRUZER
 | 进程启动 | 58 ms（仅解释器+非 GUI import）；PySide6 GUI 版 0.5–3 s（社区实测，Vorta 托盘常驻 215–220MB） | **0.56 ms** | ~100× |
 | 常驻内存 | 17.9 MB（仅非 GUI import）；PySide6 托盘 41–220 MB | **3.1 MB**（1 线程） | 5.8–70× |
 | 产物体积 | Nuitka onefile + UPX ≈ 10–30 MB，另带 venv/启动 bat/自愈复制 | **52 KB**（另有 23 KB 弹窗助手，可选） | ~200–600× |
-| 运行时依赖 | Python ≥3.11、PySide6、pywin32 | **无** | — |
+| 运行时依赖 | Python ≥3.11、PySide6、pywin32 | **守护进程：无（musl 静态自包含）**；弹窗助手：libX11/libXft/fontconfig（桌面标配，glibc ≥ 2.31） | — |
 | 代码规模 | 4,959 行 + 18 个测试文件 + Nuitka/UPX 构建链 | ~3,800 行 C（含跨平台两套扫描器） | — |
 
 诚实结论：原版"运行时吞吐性能"其实不是问题（USB 事件低频、IOCTL 是毫秒级 IO，
@@ -36,12 +36,19 @@ ctypes 的 µs 级 FFI 开销可忽略）。真正的问题是**内存驻留、�
 
 ```bash
 make            # 守护进程 + usbmon-toast 弹窗助手（需 X11/Xft 开发文件）
+make static     # musl 静态守护进程（需 musl-tools；发布产物同款）
 make strict     # -Wall -Wextra -pedantic -Werror 全绿
+make dist       # 发布打包：静态守护进程 + toast + tarball + SHA256SUMS
 ```
 
 守护进程**永不链接 X11**：弹窗由独立助手二进制 `usbmon-toast` 渲染，
 每事件 fork+exec（纯 argv，不经 shell）。无 X11 开发文件时助手不构建，
 守护进程照常运行（纯无头模式）；无显示器的服务器上也完全不受影响。
+
+发布产物中的守护进程为 **musl 完全静态链接**（无 ELF interpreter、
+无 glibc 符号基线，任意 x86-64 Linux 可直接运行）；`usbmon-toast`
+为动态链接（glibc ≥ 2.31 + libX11/libXft/fontconfig，任一桌面
+发行版标配——弹窗本就需要桌面环境）。
 
 Windows（MSVC 或 mingw-w64；本仓库无 Windows 编译产物，代码按 Win32 API 编写）：
 

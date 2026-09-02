@@ -18,7 +18,10 @@ ok()   { PASS=$((PASS+1)); echo "  >>> PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  >>> FAIL: $1"; }
 
 command -v Xvfb >/dev/null || { echo "Xvfb not installed"; exit 1; }
-make >/dev/null || exit 1
+# build only what is missing (CI may ship a glibc-baseline usbmon-toast
+# or a musl-static usbmon here — never overwrite those)
+[ -x ./usbmon ] || make >/dev/null || exit 1
+[ -x ./usbmon-toast ] || make usbmon-toast >/dev/null || exit 1
 
 rm -rf "$SYS" "$LOG" ~/.local/state/usbmon/last-snapshot.txt
 mkdir -p "$SYS/block"

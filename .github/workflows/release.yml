@@ -22,7 +22,7 @@ jobs:
     name: "validate, build, tag and publish"
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: "Check out (full history, tags included)"
@@ -30,11 +30,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "Install build dependencies (X11/Xft for the toast helper)"
+      - name: "Install build dependencies (X11/Xft, musl for static daemon)"
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools
 
       - name: "Validate release metadata (usbmon.h vs CHANGELOG.md)"
         run: |
@@ -63,19 +63,64 @@ jobs:
         if: env.SKIP != 'true'
         run: make strict
 
+      - name: "Build static daemon (musl, self-contained)"
+        if: env.SKIP != 'true'
+        run: |
+          make static
+          file usbmon-static
+          ldd usbmon-static 2>&1 | grep -q "not a dynamic executable" \
+            || { echo "usbmon-static is NOT statically linked"; exit 1; }
+          ./usbmon-static --version
+          ./usbmon-static --list
+
       - name: "Smoke test (version must match the tag being released)"
         if: env.SKIP != 'true'
         run: |
           test "$(./usbmon --version)" = "usbmon $VERSION"
+          test "$(./usbmon-static --version)" = "usbmon $VERSION"
           ./usbmon --list
 
-      - name: "Hooks end-to-end regression (mock sysfs, 11 assertions)"
+      - name: "Hooks e2e regression — dynamic build (11 assertions)"
         if: env.SKIP != 'true'
         run: bash tools/demo.sh
 
-      - name: "Package dist artifacts (stripped tarball + SHA256SUMS)"
+      - name: "Hooks e2e regression — musl static build (11 assertions)"
         if: env.SKIP != 'true'
-        run: make dist
+        run: USBMON=./usbmon-static bash tools/demo.sh
+
+      - name: "Build toast helper on a glibc 2.31 baseline (debian:bullseye)"
+        if: env.SKIP != 'true'
+        run: |
+          set -eu
+          docker run --rm -v "$PWD:/src" -w /src debian:bullseye bash -eu -c '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                  gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev
+              gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
+                  $(pkg-config --cflags x11 xft) src/gui_toast.c \
+                  -o /src/usbmon-toast $(pkg-config --libs x11 xft)
+          '
+          echo "--- baseline check ---"
+          MAXGLIBC=$(objdump -T usbmon-toast | grep -oE 'GLIBC_[0-9.]+' \
+                      | sort -uV | tail -1)
+          echo "toast max GLIBC symbol: $MAXGLIBC"
+          [ "${MAXGLIBC#GLIBC_}" \< "2.32" ] \
+            || { echo "toast glibc baseline too new: $MAXGLIBC"; exit 1; }
+          ./usbmon-toast --help >/dev/null 2>&1 || true
+
+      - name: "GUI regression under Xvfb (dynamic daemon + baseline toast)"
+        if: env.SKIP != 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb
+          bash tools/demo-gui.sh
+
+      - name: "Package dist artifacts (static daemon + SHA256SUMS)"
+        if: env.SKIP != 'true'
+        run: |
+          make dist
+          echo "--- packaged daemon linkage ---"
+          file dist/*/usbmon
+          ldd dist/*/usbmon 2>&1 | head -2
 
       - name: "Extract release notes from CHANGELOG.md"
         if: env.SKIP != 'true'
@@ -112,6 +157,7 @@ jobs:
           else
             {
               echo "### release v$VERSION published"
+              echo ''
               echo '```'
               cat dist/SHA256SUMS.txt
               echo '```'
