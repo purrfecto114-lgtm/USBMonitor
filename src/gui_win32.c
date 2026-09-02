@@ -1,10 +1,15 @@
 /* gui_win32.c — Windows GUI backend: toasts + WM_DEVICECHANGE hot path.
  *
  * One dedicated GUI thread owns every window:
- *   - a message-only listener window receiving WM_DEVICECHANGE
- *     (DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE) — the Microsoft-
- *     recommended event model; it sets the wake event the daemon main
- *     loop waits on (instant rounds on plug/unplug);
+ *   - an invisible TOP-LEVEL listener window receiving WM_DEVICECHANGE
+ *     (DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_VOLUME)
+ *     — the Microsoft-recommended event model; it sets the wake event
+ *     the daemon main loop waits on (instant rounds on plug/unplug).
+ *     The window MUST be top-level: message-only windows (created with
+ *     a HWND_MESSAGE parent) do not receive broadcast messages at all
+ *     (see "Window Features" on learn.microsoft.com), and WM_DEVICECHANGE
+ *     device events are broadcast to top-level windows.  It is never
+ *     shown, so it stays invisible.
  *   - top-level toast windows (WS_POPUP | WS_EX_TOPMOST | tool window,
  *     bottom-right stacking, WM_TIMER auto-dismiss, click to dismiss).
  *
@@ -12,16 +17,17 @@
  * is no reason to split rendering into a helper process; a thread is
  * enough and keeps the message pump on one owner.
  *
- * [WINDOWS-UNVERIFIED] — this file is maintained alongside the Linux
- * implementation but the sandbox has no mingw/MSVC and no Windows:
- * it must be smoke-tested on a real machine before shipping.
+ * Verified on a real Windows machine by CI (windows-latest runner runs
+ * tools/demo.ps1, including a simulated WM_DEVICECHANGE broadcast that
+ * must wake the daemon and log a "wake":"hot" round).
  */
 #include "usbmon.h"
 
 #ifdef _WIN32
 
 #include <windows.h>
-#include <shellapi.h>      /* DEV_BROADCAST_*  */
+#include <dbt.h>           /* DEV_BROADCAST_*, DBT_* (device-change events) */
+#include <wchar.h>         /* wcslen, wcscpy_s */
 #include <string.h>
 #include <stdlib.h>
 
@@ -212,8 +218,10 @@ static LRESULT CALLBACK listen_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_DEVICECHANGE) {
         PDEV_BROADCAST_HDR hdr = (PDEV_BROADCAST_HDR)lp;
         if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) {
-            if (hdr && (hdr->dbch_devicetype == DBT_DEVTYP_VOLUME ||
-                        hdr->dbch_devicetype == DBT_DEVTYP_DISK))
+            /* volume arrivals/removals are what the OS broadcasts to all
+             * top-level windows; DBT_DEVTYP_DISK is not a broadcast device
+             * type (dbt.h defines OEM/PORT/VOLUME/DEVICEINTERFACE/HANDLE) */
+            if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME)
                 SetEvent((HANDLE)GetWindowLongPtrW(hw, GWLP_USERDATA));
         }
         return TRUE;
@@ -223,14 +231,11 @@ static LRESULT CALLBACK listen_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 
 /* ------------------------------------------------------------- GUI thread -- */
 
-typedef struct {
-    um_gui *g;
-} gui_thread_ctx;
-
 static DWORD WINAPI gui_thread_main(LPVOID param)
 {
-    gui_thread_ctx ctx = *(gui_thread_ctx *)param;
-    um_gui *g = ctx.g;
+    /* um_gui lives in static storage inside main() -- always valid, no
+     * lifetime race (the old stack-copied ctx was technically racy). */
+    um_gui *g = (um_gui *)param;
     WNDCLASSW wc;
     HWND listener;
     MSG msg;
@@ -252,8 +257,11 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
     al = RegisterClassW(&wc);
     (void)al;
 
+    /* Invisible top-level listener (never ShowWindow'd).  Top-level is
+     * REQUIRED: message-only windows (HWND_MESSAGE parent) never receive
+     * broadcast messages such as WM_DEVICECHANGE. */
     listener = CreateWindowExW(0, g_class_listen, L"usbmon", WS_OVERLAPPED,
-                               0, 0, 0, 0, HWND_MESSAGE, NULL,
+                               0, 0, 0, 0, NULL, NULL,
                                GetModuleHandleW(NULL), NULL);
     if (listener)
         SetWindowLongPtrW(listener, GWLP_USERDATA, (LONG_PTR)g->wake_event);
@@ -296,13 +304,11 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
 
 int um_gui_win_init(um_gui *g)
 {
-    gui_thread_ctx ctx;
     HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!ev) return 0;
     g->wake_event = ev;
 
-    ctx.g = g;
-    g->gui_thread = CreateThread(NULL, 0, gui_thread_main, &ctx, 0,
+    g->gui_thread = CreateThread(NULL, 0, gui_thread_main, g, 0,
                                  &g->gui_tid);
     if (!g->gui_thread) {
         CloseHandle(ev);

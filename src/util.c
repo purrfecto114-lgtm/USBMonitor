@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>   /* _mkdir */
 #else
 #include <time.h>
 #include <unistd.h>

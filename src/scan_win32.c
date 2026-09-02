@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <string.h>
+#include <stdlib.h>   /* _TRUNCATE (secure-CRT constant) */
 
 #include <winioctl.h>   /* minimal winioctl; fallbacks below */
 

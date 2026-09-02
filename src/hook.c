@@ -4,9 +4,11 @@
  *   - hooks are entirely opt-in; the default config has none;
  *   - commands are argv arrays, executed WITHOUT a shell on every platform
  *     (execv on POSIX, CreateProcessW with an explicit argv on Windows);
- *   - on Windows, BatBadBut (CVE-2024-24576) and CmdHijack guards reject
- *     .bat/.cmd/.ps1 executables, cmd.exe metacharacters and ../ sequences,
- *     because CreateProcessW implicitly spawns cmd.exe for those;
+ *   - on Windows, BatBadBut (CVE-2024-24576) protection rejects
+ *     .bat/.cmd/.ps1 executables, because CreateProcess implicitly
+ *     launches cmd.exe for those; everything else is spawned directly
+ *     as .exe with CRT argument quoting (trailing-backslash doubling,
+ *     the "2n rule"), so no shell ever parses hook arguments;
  *   - the child's stdio is redirected to /dev/null (NUL);
  *   - a reaper kills children that outlive UM_HOOK_TIMEOUT_S seconds.
  * This is NOT a sandbox: a hook runs with the full rights of the user.
@@ -21,6 +23,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <wchar.h>   /* wcslen, wmemcpy */
 #else
 #include <fcntl.h>
 #include <signal.h>
@@ -189,7 +192,6 @@ void um_hooks_shutdown(um_hooks *hk, int max_wait_ms)
 
 #ifdef _WIN32
 static const char *CMD_SUFFIXES[] = { ".bat", ".cmd", ".ps1", NULL };
-static const char CMD_METACHARS[] = "&|<>()%^";
 
 static const char *validate_command_win(char **argv, int argc)
 {
@@ -198,7 +200,10 @@ static const char *validate_command_win(char **argv, int argc)
     size_t el;
     int s;
 
-    /* 1) shell-script executables implicitly invoke cmd.exe (BatBadBut) */
+    /* 1) shell-script executables implicitly invoke cmd.exe (BatBadBut,
+     * CVE-2024-24576: "This happens only if a batch file is explicitly
+     * specified in the command line passed to CreateProcess(), and it
+     * doesn't happen when a .exe file is specified.")  Reject them. */
     exec_lower = argv[0];
     el = strlen(exec_lower);
     for (s = 0; CMD_SUFFIXES[s]; s++) {
@@ -206,19 +211,19 @@ static const char *validate_command_win(char **argv, int argc)
         if (el >= sl && _stricmp(exec_lower + el - sl, CMD_SUFFIXES[s]) == 0)
             return "shell_script_executable";
     }
-    /* 2) cmd.exe metacharacters + traversal in any token.  Also reject
-     * '"' and trailing '\\': with our naive quoting those would let the
-     * child's argument parser shift token boundaries (argument injection). */
+    /* 2) embedded double quotes: the builder below does not escape
+     * mid-string quotes (conservative posture inherited from the
+     * original); everything else -- spaces, parentheses, %, ^ -- is
+     * inert without a shell and legal in Windows file paths
+     * (e.g. "C:\Program Files (x86)\...").  Traversal sequences are
+     * rejected as in the Python original. */
     for (i = 0; i < argc; i++) {
         const char *p;
         size_t tl = strlen(argv[i]);
-        for (p = argv[i]; *p; p++) {
-            if (strchr(CMD_METACHARS, *p)) return "cmd_metachar";
+        for (p = argv[i]; *p; p++)
             if (*p == '"') return "embedded_quote";
-        }
-        if (tl > 0 && argv[i][tl-1] == '\\') return "trailing_backslash";
         if (strstr(argv[i], "../") || strstr(argv[i], "\\..")) return "path_traversal";
-        if (tl >= 2 && argv[i][0] == '.' && argv[i][1] == '.' &&
+        if (tl >= 3 && argv[i][0] == '.' && argv[i][1] == '.' &&
             (argv[i][2] == '\\' || argv[i][2] == '/')) return "path_traversal";
     }
     return NULL;
@@ -283,17 +288,31 @@ static void spawn_child(um_hooks *hk, const um_hook *h, char **argv, int argc,
         memset(wargv[i], 0, sizeof wargv[i]);
         um_utf8_to_wide(argv[i], wargv[i], UM_HOOK_ARG_MAX);
     }
-    /* Build one command line with every argument quoted; argv semantics are
-     * preserved because validate_command_win() already rejected '"' and
-     * trailing '\' inside tokens. */
+    /* Build one command line with every argument quoted, implementing
+     * the CRT argument-quoting rule for the cases our validator allows:
+     * backslashes that directly precede the closing quote are doubled
+     * (the "2n rule") so the child's argv parser reproduces exactly one
+     * token per argument.  Embedded '"' is rejected upstream, so no
+     * mid-string escapes are needed.  A trailing-backslash token such
+     * as E:\ (the {path} placeholder on Windows) therefore becomes
+     * "E:\\" and round-trips correctly. */
     for (i = 0; i < argc; i++) {
-        int ret = _snwprintf_s(cmdline + off, CAP - off, _TRUNCATE,
-                               L"\"%s\"%s", wargv[i], i + 1 < argc ? L" " : L"");
-        if (ret < 0 || off + (size_t)ret >= CAP) {
+        const wchar_t *arg = wargv[i];
+        size_t al = wcslen(arg);
+        size_t tb = 0;             /* trailing backslashes to double */
+        size_t k;
+        while (tb < al && arg[al - 1 - tb] == L'\\') tb++;
+        if (off + al + tb + 4 > CAP) {   /* 2 quotes + space + NUL */
             fprintf(stderr, "usbmon: hook '%s' command line too long\n", h->name);
             return;
         }
-        off += (size_t)ret;
+        cmdline[off++] = L'"';
+        wmemcpy(cmdline + off, arg, al);
+        off += al;
+        for (k = 0; k < tb; k++) cmdline[off++] = L'\\';
+        cmdline[off++] = L'"';
+        if (i + 1 < argc) cmdline[off++] = L' ';
+        cmdline[off] = L'\0';
     }
 
     /* stdio -> NUL, no console window flash */

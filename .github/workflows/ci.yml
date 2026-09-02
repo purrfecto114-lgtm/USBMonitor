@@ -75,3 +75,69 @@ jobs:
           KNOWN=$(grep -c "hook.c.*uninitialized" analyze.log || true)
           echo "warnings=$OTHER known_false_positive=$KNOWN"
           [ "$OTHER" -le "$KNOWN" ]
+
+  build-windows:
+    name: "cross-compile Windows exe (mingw-w64, strict, static)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: "Install mingw-w64 cross compiler"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: "Build usbmon.exe (strict: -Wall -Wextra -pedantic -Werror, fully static)"
+        run: |
+          x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
+              src/main.c src/util.c src/logjson.c src/json.c src/hook.c \
+              src/lock.c src/gui.c src/hotpath.c src/scan_win32.c src/gui_win32.c \
+              -o usbmon.exe -static -luser32 -lgdi32
+          x86_64-w64-mingw32-strip usbmon.exe
+          file usbmon.exe
+          ls -la usbmon.exe
+
+      - name: "Assert self-contained PE imports (system DLLs only)"
+        run: |
+          IMPORTS=$(x86_64-w64-mingw32-objdump -p usbmon.exe | grep 'DLL Name:' | sort -u)
+          echo "--- PE import table ---"
+          echo "$IMPORTS"
+          echo "$IMPORTS" | grep -q 'KERNEL32.dll' \
+            || { echo "usbmon.exe does not even import KERNEL32?"; exit 1; }
+          BAD=$(echo "$IMPORTS" | grep -Ei 'libgcc|winpthread|libstdc|mingw' || true)
+          if [ -n "$BAD" ]; then
+            echo "usbmon.exe needs a non-system runtime DLL: $BAD"
+            exit 1
+          fi
+          echo "OK: only Windows system DLLs are imported"
+
+      - name: "Upload usbmon.exe artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: usbmon-windows-exe
+          path: usbmon.exe
+          if-no-files-found: error
+
+  verify-windows:
+    name: "Windows runtime smoke on windows-latest (demo.ps1)"
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: "Download usbmon.exe"
+        uses: actions/download-artifact@v4
+        with:
+          name: usbmon-windows-exe
+          path: winbin
+
+      - name: "Run demo.ps1 (CLI smoke, JSONL, lock, GUI thread, WM_DEVICECHANGE hot path)"
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/usbmon.h -Pattern '#define UM_VERSION "([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "expected version: $v"
+          pwsh -NoProfile -File tools/demo.ps1 -ExePath (Join-Path $PWD 'winbin/usbmon.exe') -Version $v
