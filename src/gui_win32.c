@@ -151,7 +151,7 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         RECT rc, rc_bar;
         HBRUSH bg, bar;
         HPEN border;
-        int i, y;
+        int i;
 
         if (!td) return 0;
         hdc = BeginPaint(hw, &ps);

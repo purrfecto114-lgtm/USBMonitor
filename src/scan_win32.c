@@ -97,11 +97,6 @@ static HANDLE open_device(const wchar_t *path)
     return h;
 }
 
-static void utf8_to_wide(const char *in, wchar_t *out, size_t out_n)
-{
-    MultiByteToWideChar(CP_UTF8, 0, in, -1, out, (int)out_n);
-}
-
 static void wide_to_utf8(const wchar_t *in, char *out, size_t out_n)
 {
     WideCharToMultiByte(CP_UTF8, 0, in, -1, out, (int)out_n, NULL, NULL);

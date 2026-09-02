@@ -25,8 +25,13 @@
 
 /* ---------------------------------------------------------------- signals */
 
+#ifndef _WIN32
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_reload_hooks = 0;
+#else
+static volatile int g_stop = 0;          /* set by the console ctrl handler */
+static volatile int g_reload_hooks = 0;  /* Windows has no SIGHUP: never set */
+#endif
 
 #ifndef _WIN32
 static void on_signal(int sig)
