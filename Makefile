@@ -3,8 +3,10 @@
 # Linux/macOS:   make            (daemon + usbmon-toast popup helper)
 # Windows:       make CROSS=x86_64-w64-mingw32- windows
 #                (mingw-w64 cross-compile; -static: the exe imports only
-#                 Windows system DLLs — KERNEL32/msvcrt/user32/gdi32 —
-#                 and needs NO runtime installation on the target box)
+#                 Windows system DLLs — KERNEL32/msvcrt/user32/gdi32/
+#                 shell32/advapi32 — and needs NO runtime installation on
+#                 the target box; -mwindows: GUI subsystem, so double-
+#                 clicking usbmon.exe shows the tray, not a black console)
 #
 # Release artifacts (primary target platform: Windows):
 #   make static         (musl, fully self-contained Linux daemon)
@@ -35,7 +37,7 @@ DIST_NAME := usbmon-$(VERSION)-linux-amd64
 SRC_COMMON  = src/main.c src/util.c src/logjson.c src/json.c src/hook.c \
 	      src/lock.c src/gui.c src/hotpath.c
 SRC_LINUX   = $(SRC_COMMON) src/scan_linux.c
-SRC_WIN     = $(SRC_COMMON) src/scan_win32.c src/gui_win32.c
+SRC_WIN     = $(SRC_COMMON) src/scan_win32.c src/gui_win32.c src/tray_win32.c
 
 # --- X11/Xft availability probe (for usbmon-toast only) ---------------------
 XFT_CFLAGS := $(shell pkg-config --cflags x11 xft 2>/dev/null)
@@ -138,12 +140,18 @@ dist: usbmon
 	@ls -la dist/
 	@cat dist/SHA256SUMS.txt
 
-# Windows exe: strict, fully static.  Requires mingw-w64:
+# Windows exe: strict, fully static, GUI subsystem.  Requires mingw-w64:
 #   sudo apt-get install gcc-mingw-w64-x86-64
 #   make CROSS=x86_64-w64-mingw32- windows
-windows: $(SRC_WIN) src/usbmon.h
+# res/usbmon.ico (embedded tray/executable icon) is committed; regenerate
+# with tools/make_icon.py.  windres ships with the mingw binutils.
+res/usbmon.res.o: res/usbmon.rc res/usbmon.ico
+	$(CROSS)windres res/usbmon.rc -O coff -o $@
+
+windows: $(SRC_WIN) src/usbmon.h res/usbmon.res.o
 	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_WIN) \
-	    -o usbmon.exe $(LDFLAGS) -static -luser32 -lgdi32
+	    res/usbmon.res.o -o usbmon.exe $(LDFLAGS) -mwindows -static \
+	    -luser32 -lgdi32 -lshell32 -ladvapi32
 
 # Windows packaging: zip + append to dist/SHA256SUMS.txt.
 # Run AFTER `make dist` (which creates dist/ and writes the Linux sums);
@@ -167,4 +175,5 @@ dist-windows: windows
 
 clean:
 	rm -f usbmon usbmon-toast usbmon-asan usbmon-static usbmon.exe
+	rm -f res/usbmon.res.o
 	rm -rf dist

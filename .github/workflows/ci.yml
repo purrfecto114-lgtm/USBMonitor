@@ -88,19 +88,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+          command -v x86_64-w64-mingw32-windres \
+            || { echo "windres missing (binutils-mingw-w64-x86-64 should provide it)"; exit 1; }
 
-      - name: "Build usbmon.exe (strict: -Wall -Wextra -pedantic -Werror, fully static)"
+      - name: "Build usbmon.exe (make windows: strict, static, GUI subsystem + icon)"
         run: |
-          x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
-              src/main.c src/util.c src/logjson.c src/json.c src/hook.c \
-              src/lock.c src/gui.c src/hotpath.c src/scan_win32.c src/gui_win32.c \
-              -o usbmon.exe -static -luser32 -lgdi32
+          make CROSS=x86_64-w64-mingw32- windows
           x86_64-w64-mingw32-strip usbmon.exe
           file usbmon.exe
           ls -la usbmon.exe
 
-      - name: "Assert self-contained PE imports (system DLLs only)"
+      - name: "Assert GUI subsystem + embedded icon + self-contained PE imports"
         run: |
+          file usbmon.exe | grep -q 'PE32+ executable (GUI)' \
+            || { echo "usbmon.exe is not a GUI-subsystem binary — double-click would flash a console window"; exit 1; }
+          x86_64-w64-mingw32-objdump -h usbmon.exe | grep -q '\.rsrc' \
+            || { echo "usbmon.exe lacks the .rsrc section — tray/executable icon not embedded"; exit 1; }
           IMPORTS=$(x86_64-w64-mingw32-objdump -p usbmon.exe | grep 'DLL Name:' | sort -u)
           echo "--- PE import table ---"
           echo "$IMPORTS"
@@ -111,7 +114,7 @@ jobs:
             echo "usbmon.exe needs a non-system runtime DLL: $BAD"
             exit 1
           fi
-          echo "OK: only Windows system DLLs are imported"
+          echo "OK: GUI subsystem, icon embedded, only Windows system DLLs are imported"
 
       - name: "Upload usbmon.exe artifact"
         uses: actions/upload-artifact@v4
@@ -135,7 +138,7 @@ jobs:
           name: usbmon-windows-exe
           path: winbin
 
-      - name: "Run demo.ps1 (CLI smoke, JSONL, lock, GUI thread, WM_DEVICECHANGE hot path)"
+      - name: "Run demo.ps1 (CLI smoke, JSONL, lock, GUI thread, tray menus, WM_DEVICECHANGE hot path)"
         shell: pwsh
         run: |
           $v = (Select-String -Path src/usbmon.h -Pattern '#define UM_VERSION "([^"]+)"').Matches[0].Groups[1].Value

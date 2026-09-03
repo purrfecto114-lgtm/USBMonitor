@@ -31,6 +31,9 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* UMWM_TOAST / UMWM_QUIT / UMWM_TRAY* come from usbmon.h (numeric,
+ * WM_APP-based) so tray_win32.c and this file agree on every id. */
+
 /* ---------------------------------------------------------------- palette */
 
 #define TW_BG       RGB(0x22, 0x27, 0x2e)
@@ -48,9 +51,6 @@
 #define TW_MARGIN_R     24
 #define TW_MARGIN_B     48
 #define TW_SLOT_GAP     12
-
-#define UMWM_TOAST   (WM_APP + 1)   /* wparam: 1 add / 0 remove; lparam: toast_data*  */
-#define UMWM_QUIT    (WM_APP + 2)
 
 /* ------------------------------------------------------------------ types */
 
@@ -215,6 +215,11 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 
 static LRESULT CALLBACK listen_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* tray first: tray_win32.c owns UMWM_TRAY*, the taskbar-restart
+     * message and the test-injection ids; 1 = fully handled. */
+    if (um_tray_filter(hw, msg, (void *)(size_t)wp, (void *)(size_t)lp))
+        return 0;
+
     if (msg == WM_DEVICECHANGE) {
         PDEV_BROADCAST_HDR hdr = (PDEV_BROADCAST_HDR)lp;
         if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) {
@@ -263,8 +268,13 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
     listener = CreateWindowExW(0, g_class_listen, L"usbmon", WS_OVERLAPPED,
                                0, 0, 0, 0, NULL, NULL,
                                GetModuleHandleW(NULL), NULL);
-    if (listener)
+    if (listener) {
         SetWindowLongPtrW(listener, GWLP_USERDATA, (LONG_PTR)g->wake_event);
+        /* The same invisible top-level window doubles as the tray owner:
+         * one message pump serves WM_DEVICECHANGE, tray clicks, menus
+         * and toasts — the tray can never deadlock the hot path. */
+        um_tray_install(listener, g);
+    }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (msg.message == UMWM_TOAST) {
@@ -296,7 +306,10 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (listener) DestroyWindow(listener);
+    if (listener) {
+        um_tray_uninstall();      /* remove the icon before the window dies */
+        DestroyWindow(listener);
+    }
     return 0;
 }
 
@@ -329,6 +342,35 @@ void um_gui_win_show(um_gui *g, const um_device *dev, int is_add)
                             (LPARAM)td)) {
         free(td);            /* GUI thread gone: drop the toast quietly */
     }
+}
+
+/* Arbitrary-text toast (tray action feedback: eject result, startup
+ * toggle).  Green accent when `accent_ok`, gray otherwise. */
+void um_gui_win_notify(um_gui *g, const char *title, const char *body,
+                        int accent_ok)
+{
+    toast_data *td = malloc(sizeof *td);
+    wchar_t wbuf[192];
+
+    if (!td) return;
+    memset(td, 0, sizeof *td);
+    td->is_add = accent_ok ? 1 : 0;
+    td->ttl = g->toast_ttl;
+    td->slot = g->slot_seq % UM_GUI_SLOTS;
+    g->slot_seq++;
+
+    wcopy(title, wbuf, 192);
+    wcscpy_s(td->lines[td->n_lines], 192, wbuf);
+    td->n_lines++;
+    if (body && body[0]) {
+        wcopy(body, wbuf, 192);
+        wcscpy_s(td->lines[td->n_lines], 192, wbuf);
+        td->n_lines++;
+    }
+    td->n_dim_from = 1;   /* title bright, body dim */
+
+    if (!PostThreadMessageW(g->gui_tid, UMWM_TOAST, 1, (LPARAM)td))
+        free(td);
 }
 
 void um_gui_win_shutdown(um_gui *g)

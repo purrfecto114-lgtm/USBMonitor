@@ -3,6 +3,53 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.0] — 2026-09-03
+
+### Added — 恢复 Windows 托盘与左/右键菜单（用户实测 v2.2.0 反馈）
+
+用户实测 v2.2.0：双击 `usbmon.exe` 出现**黑色控制台窗口**，且原 1.x
+Python 版具备的**系统托盘图标、左键/右键菜单**全部缺失。本版恢复完整
+托盘体验（`src/tray_win32.c`，原生 Win32，零新增运行时依赖）：
+
+- **系统托盘图标**（Shell_NotifyIcon，内嵌 `res/usbmon.ico`，与 toast
+  同视觉语言；explorer.exe 重启后监听 `TaskbarCreated` 自动重挂）
+- **左键 = USB 设备菜单**（对标原版 volume menu，弹出时实时扫描）：
+  每个卷一条目，子菜单 打开 / 在资源管理器中显示 / 安全弹出；空态诚实
+  显示"当前没有检测到 USB 存储设备"
+- **右键 = 应用菜单**（对标原版 compact app menu）：状态（N 台设备）/
+  立即重新扫描 / 工具（打开日志目录、打开配置目录）/ 随系统启动 /
+  退出。与原版同样的左右键分工，设备列表只归左键
+- **安全弹出** = `IOCTL_STORAGE_EJECT_MEDIA`（Python 原版的主路径，
+  无 pywin32/COM 依赖）：发出后确认盘符真正消失，结果以右下角 toast
+  反馈（成功绿条/失败灰条，被占用时明确提示）
+- **随系统启动**：菜单勾选即写 HKCU Run 键（无需管理员）
+- **退出**：干净停机（退出码 0，JSONL stop 原因 `tray-quit`，移除图标）
+- **GUI 子系统（`-mwindows`）**：双击运行不再出现黑色控制台窗口；
+  交互式 cmd/PowerShell 中的 `--version/--help/--list` 通过
+  AttachConsole 附加父控制台照常打印（管道/CI 捕获不受影响）
+- **内嵌图标**：`tools/make_icon.py`（纯标准库生成 16/32/48px ICO）+
+  `res/usbmon.rc`，`make windows` 走 windres 编译链接（.ico 已提交，
+  构建不依赖 Python）
+- **线程模型**：托盘与 WM_DEVICECHANGE 监听共用同一 GUI 线程消息泵，
+  菜单打开期间设备事件照常送达，无死锁面；菜单数据来自弹出时的独立
+  全量扫描（不共享主线程状态，无锁）
+
+### Changed — CI / 发布门禁随托盘升级
+
+- `tools/demo.ps1` 断言 9 → 15 项：新增 **PE 子系统 = GUI**（防黑窗
+  回归）、**托盘图标安装**、**左/右键菜单内容**（注入与真实点击完全
+  相同的窗口消息，经 `USBMON_TRAY_TEST` 转储断言；CI 无 explorer 时
+  自动拉起一个）、**托盘触发重扫**（新的 `wake=hot` 轮）、**托盘退出**
+  （退出码 0 + stop 原因 `tray-quit`）
+- `ci.yml` / `release.yml` 的 build-windows：统一走 `make windows`
+  （原 ci.yml 手写 gcc 行有漂移风险），新增断言 PE 为 GUI 子系统、
+  `.rsrc` 图标段存在、windres 可用性预检
+- `Makefile`：`windows` 目标新增 `res/usbmon.res.o`（windres）并链接
+  `-mwindows -lshell32 -ladvapi32`（Shell_NotifyIcon / 注册表），全部
+  仍为系统自带 DLL
+- 停机事件记录原因（`signal` / `tray-quit`），README 新增托盘章节与
+  原版对齐说明
+
 ## [2.2.0] — 2026-09-02
 
 ### Added — Windows 成为首要目标平台（发布产物含 Windows 程序）

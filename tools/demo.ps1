@@ -24,9 +24,24 @@
 #       listener window (class "usbmonListen", matched by PID)
 #   9.  a broadcast WM_DEVICECHANGE wakes the daemon: JSONL round with
 #       wake="hot" appears within ~3s
+#  10.  the exe is a GUI-subsystem PE (IMAGE_SUBSYSTEM_WINDOWS_GUI):
+#       double-clicking it must never open a black console window
+#  11.  the system-tray icon installs (Shell_NotifyIcon; the script
+#       starts explorer.exe when the runner has no shell running)
+#  12.  LEFT-click menu content: fresh scan -> per-volume entries with
+#       打开 / 在资源管理器中显示 / 安全弹出 — or the honest empty state
+#  13.  RIGHT-click menu content: 状态 / 立即重新扫描 / 工具 / 随系统启动 / 退出
+#  14.  tray-triggered rescan: the tray rescan message produces another
+#       wake="hot" round (same path the menu item uses)
+#  15.  tray quit: the tray quit message exits the daemon with code 0
+#       and a JSONL stop event whose reason is "tray-quit"
+#
+# Tray internals (10-15) are exercised by posting the exact window
+# messages a real tray click delivers (USBMON_TRAY_TEST additionally
+# asks the daemon to dump menu contents instead of popping menus up).
 #
 # Usage:
-#   pwsh tools/demo.ps1 [-ExePath .\usbmon.exe] [-Version 2.2.0]
+#   pwsh tools/demo.ps1 [-ExePath .\usbmon.exe] [-Version 2.3.0]
 # Exits non-zero when any assertion fails.
 
 param(
@@ -206,6 +221,24 @@ namespace UsbmonDemo {
             }, IntPtr.Zero);
             return pids;
         }
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessageW(IntPtr hWnd, uint msg,
+            UIntPtr wParam, IntPtr lParam);
+        public static IntPtr FindListenerHwnd(uint pid) {
+            IntPtr found = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                if (found != IntPtr.Zero) return false;
+                var sb = new StringBuilder(64);
+                GetClassName(h, sb, 64);
+                if (sb.ToString() == "usbmonListen") {
+                    uint wpid;
+                    GetWindowThreadProcessId(h, out wpid);
+                    if (wpid == pid) found = h;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -235,6 +268,25 @@ namespace UsbmonDemo {
 "@
 
 $LogG = Join-Path $Root "daemon-gui.jsonl"
+
+# USBMON_TRAY_TEST: daemon appends tray install result + menu dumps here
+# (menus are dumped instead of popped up, so a headless runner can still
+# assert their CONTENT).
+$TrayFile = Join-Path $Root "tray-test.txt"
+$env:USBMON_TRAY_TEST = $TrayFile
+
+# CI runners may run without explorer.exe; a tray icon needs a shell.
+# Start one when absent — a no-op on real desktops (already running).
+try {
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        Write-Output "(no explorer running — starting one for the tray test)"
+        Start-Process explorer.exe
+        Start-Sleep -Seconds 3
+    }
+} catch {
+    Write-Output "(explorer start attempt failed — tray test may report it)"
+}
+
 $proc2 = Start-Process -FilePath $ExePath `
     -ArgumentList @("--log", $LogG, "--interval", "3600") `
     -PassThru -WindowStyle Hidden
@@ -262,8 +314,111 @@ if ($hotRounds.Count -ge 1) {
     Bad "no 'wake':'hot' round after broadcast -- hot path is not receiving device events"
 }
 
+function Read-TrayLog {
+    if (Test-Path -LiteralPath $TrayFile) {
+        return (Get-Content -LiteralPath $TrayFile -Raw -Encoding UTF8)
+    }
+    return ""
+}
+function Truncate-From([string]$text, [string]$marker) {
+    $i = $text.LastIndexOf($marker)
+    if ($i -ge 0) { return $text.Substring($i) }
+    return ""
+}
+
+# --- 10) GUI subsystem (no black console window on double-click) ---------------
+$bytes  = [IO.File]::ReadAllBytes($ExePath)
+$peOff  = [BitConverter]::ToInt32($bytes, 0x3C)
+$subsys = [BitConverter]::ToUInt16($bytes, $peOff + 24 + 68)   # PE32+ optional header
+if ($subsys -eq 2) {
+    Ok "PE subsystem = WINDOWS_GUI (2): double-click opens no console window"
+} else {
+    Bad "PE subsystem = $subsys (expected 2 = GUI)"
+}
+
+# --- 11) system-tray icon installed --------------------------------------------
+$trayTxt = Read-TrayLog
+if ($trayTxt -match 'icon_add ok' -or $trayTxt -match 'icon_readd ok') {
+    Ok "system-tray icon installed (Shell_NotifyIcon)"
+} else {
+    Bad "tray icon not installed; tray log: $(($trayTxt -replace "`n", ' | ').Trim())"
+}
+
+# --- 12) LEFT-click menu: USB devices (打开 / 显示 / 安全弹出) ------------------
+$hwnd = [UsbmonDemo.Win32]::FindListenerHwnd([uint32]$proc2.Id)
+if ($hwnd -ne [IntPtr]::Zero) {
+    # WM_APP+3 (UMWM_TRAY) with LPARAM=WM_LBUTTONUP: exactly what a real
+    # left click on the tray icon delivers.
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8003, [UIntPtr]::Zero, [IntPtr]0x0202) | Out-Null
+    Start-Sleep -Milliseconds 800
+    $menuLeft = Truncate-From (Read-TrayLog) "menu left"
+    if ($menuLeft -ne "") {
+        if ($menuLeft -match '安全弹出' -or $menuLeft -match '当前没有检测到 USB 存储设备') {
+            Ok "left-click menu built from a fresh scan (volume entries or honest empty state)"
+        } else {
+            Bad "left menu has neither volume entries nor empty state: $(($menuLeft -replace "`n", ' | ').Trim())"
+        }
+    } else {
+        Bad "no 'menu left' dump after left-click message"
+    }
+} else {
+    Bad "listener hwnd not found for pid $($proc2.Id) — cannot inject tray clicks"
+}
+
+# --- 13) RIGHT-click menu: 状态 / 立即重新扫描 / 工具 / 随系统启动 / 退出 -------
+if ($hwnd -ne [IntPtr]::Zero) {
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8003, [UIntPtr]::Zero, [IntPtr]0x0204) | Out-Null
+    Start-Sleep -Milliseconds 800
+    $menuRight = Truncate-From (Read-TrayLog) "menu right"
+    $need = @('状态：', '立即重新扫描', '打开日志目录', '随系统启动', '退出')
+    $missing = @($need | Where-Object { $menuRight -notmatch [regex]::Escape($_) })
+    if ($menuRight -ne "" -and $missing.Count -eq 0) {
+        Ok "right-click menu complete (状态/重新扫描/工具/随系统启动/退出)"
+    } else {
+        Bad "right menu missing: $($missing -join ',') | got: $(($menuRight -replace "`n", ' | ').Trim())"
+    }
+}
+
+# --- 14) tray-triggered rescan produces another hot round ------------------------
+$eventsG2 = Read-JsonLines $LogG
+$hotBefore = @($eventsG2 | Where-Object { $_.ev -eq "round" -and $_.wake -eq "hot" }).Count
+if ($hwnd -ne [IntPtr]::Zero) {
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8004, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Seconds 3      # 0.7s debounce + round
+    $eventsG3 = Read-JsonLines $LogG
+    $hotAfter = @($eventsG3 | Where-Object { $_.ev -eq "round" -and $_.wake -eq "hot" }).Count
+    if ($hotAfter -gt $hotBefore) {
+        Ok "tray 立即重新扫描 message triggered another wake=hot round"
+    } else {
+        Bad "no new hot round after tray rescan (before=$hotBefore after=$hotAfter)"
+    }
+}
+
+# --- 15) tray quit: graceful shutdown, exit 0, stop reason tray-quit -------------
+if ($hwnd -ne [IntPtr]::Zero) {
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8005, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $exited = $false
+    foreach ($i in 1..20) {
+        if ($proc2.HasExited) { $exited = $true; break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($exited -and $proc2.ExitCode -eq 0) {
+        Ok "tray 退出 shut the daemon down cleanly (exit code 0)"
+    } else {
+        Bad "tray quit did not exit cleanly (exited=$exited code=$($proc2.ExitCode))"
+    }
+    $eventsG4 = Read-JsonLines $LogG
+    $stopEv = $eventsG4 | Where-Object { $_.ev -eq "stop" } | Select-Object -Last 1
+    if ($stopEv -and $stopEv.detail -eq "tray-quit") {
+        Ok "JSONL stop event records reason 'tray-quit'"
+    } else {
+        Bad "stop event reason: $($stopEv.detail) (expected 'tray-quit')"
+    }
+}
+
 # --- cleanup ---------------------------------------------------------------------
 if ($proc2 -and -not $proc2.HasExited) { Stop-Process -Id $proc2.Id -Force }
+Remove-Item Env:USBMON_TRAY_TEST -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output ""

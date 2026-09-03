@@ -33,6 +33,17 @@ static volatile int g_stop = 0;          /* set by the console ctrl handler */
 static volatile int g_reload_hooks = 0;  /* Windows has no SIGHUP: never set */
 #endif
 
+/* Why the daemon is stopping ("signal" / "tray-quit"): recorded in the
+ * JSONL stop event so the log explains every shutdown. */
+static char g_stop_reason[32] = "signal";
+
+void um_request_stop(const char *reason)
+{
+    g_stop = 1;
+    snprintf(g_stop_reason, sizeof g_stop_reason, "%s",
+             (reason && reason[0]) ? reason : "signal");
+}
+
 #ifndef _WIN32
 static void on_signal(int sig)
 {
@@ -49,6 +60,7 @@ static void install_signals(void)
     sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 }
+#define win_cli_console_attach() ((void)0)   /* POSIX: nothing to attach */
 #else
 static BOOL WINAPI on_ctrl(DWORD type)
 {
@@ -59,6 +71,26 @@ static BOOL WINAPI on_ctrl(DWORD type)
 }
 static void install_signals(void) { SetConsoleCtrlHandler(on_ctrl, TRUE); }
 static void sleep_ms(int ms) { Sleep(ms); }   /* POSIX sleeps in um_hot_wait */
+
+/* Windows GUI-subsystem build (-mwindows): the process owns no console,
+ * so double-clicking usbmon.exe never flashes a black window.  When a
+ * print-and-exit CLI mode runs from an INTERACTIVE console we attach to
+ * the parent's console so --version/--help/--list are still visible.
+ * Pipe/redirect captures (CI, `|`, $(...)) keep the inherited handle and
+ * skip the attach, so output capture is unaffected. */
+static void win_cli_console_attach(void)
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD ft;
+    if (h && h != INVALID_HANDLE_VALUE) {
+        ft = GetFileType(h);
+        if (ft == FILE_TYPE_PIPE || ft == FILE_TYPE_DISK) return;
+    }
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONERR$", "w", stderr);
+    }
+}
 #endif
 
 /* ---------------------------------------------------------------- helpers */
@@ -305,11 +337,12 @@ static int do_round(um_logger *lg, um_hooks *hk, um_gui *gui, const char *sys_ro
 static void usage(FILE *out)
 {
     fprintf(out,
-"usbmon " UM_VERSION " — native USB storage monitor (no webpage, no tray)\n"
+"usbmon " UM_VERSION " — native USB storage monitor (no webpage; tray on Windows)\n"
 "\n"
 "Usage: usbmon [OPTIONS]\n"
 "  (default)          run as daemon, one scan round per hour (1h 一轮);\n"
-"                     plug/unplug events wake it instantly (toast pops up)\n"
+"                     plug/unplug events wake it instantly (toast pops up);\n"
+"                     Windows adds a system-tray icon with left/right menus\n"
 "  --interval N       round interval in seconds (min 1, default 3600)\n"
 "  --once             run a single round and exit (cron / Task Scheduler)\n"
 "  --list             list external storage devices and exit\n"
@@ -356,8 +389,14 @@ int main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(stdout); return 0; }
-        else if (!strcmp(a, "--version")) { printf("usbmon " UM_VERSION "\n"); return 0; }
+        if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
+            win_cli_console_attach();
+            usage(stdout); return 0;
+        }
+        else if (!strcmp(a, "--version")) {
+            win_cli_console_attach();
+            printf("usbmon " UM_VERSION "\n"); return 0;
+        }
         else if (!strcmp(a, "--once")) once = 1;
         else if (!strcmp(a, "--list")) list_only = 1;
         else if (!strcmp(a, "--verbose")) verbose = 1;
@@ -383,6 +422,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--hooks") && i + 1 < argc) hooks_path = argv[++i];
         else if (!strcmp(a, "--sys-root") && i + 1 < argc) sys_root = argv[++i];
         else {
+            win_cli_console_attach();
             fprintf(stderr, "usbmon: unknown option '%s' (try --help)\n", a);
             return 2;
         }
@@ -412,6 +452,7 @@ int main(int argc, char **argv)
     }
 
     if (um_log_open(&lg, log_path, raw, verbose) != 0) {
+        win_cli_console_attach();
         fprintf(stderr, "usbmon: cannot open log %s: %s\n", log_path, strerror(errno));
         return 1;
     }
@@ -445,6 +486,7 @@ int main(int argc, char **argv)
     }
 
     if (list_only) {
+        win_cli_console_attach();
         (void)do_round(&lg, &hk, &gui, sys_root, interval_s, 0, 1, "list");
         um_log_close(&lg);
         return 0;
@@ -460,6 +502,7 @@ int main(int argc, char **argv)
                  "%s/usbmon.lock", statebuf);
 #endif
         if (um_single_instance_acquire(lockbuf) != 0) {
+            win_cli_console_attach();
             fprintf(stderr, "usbmon: another instance is already running\n");
             emit_meta(&lg, "error", "already_running");
             um_log_close(&lg);
@@ -567,7 +610,7 @@ int main(int argc, char **argv)
     }
 
     um_hooks_reap(&hk);
-    emit_meta(&lg, "stop", "signal");
+    emit_meta(&lg, "stop", g_stop_reason);
     um_hooks_shutdown(&hk, 10000);   /* responsive exit, then kill stragglers */
     um_gui_shutdown(&gui);           /* toasts: brief grace, then kill */
 #ifndef _WIN32

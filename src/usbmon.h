@@ -12,7 +12,9 @@
  *   - JSONL structured event log, serial/label redaction by default
  *   - opt-in hooks executed as argv arrays (never through a shell),
  *     with the same BatBadBut/CmdHijack guards as the Python original
- *   - no tray, no webpage, no background service beyond one process
+ *   - no webpage, no background service beyond one process; on Windows
+ *     the daemon owns a system-tray icon with left/right menus (native
+ *     Win32, tray_win32.c — parity with the 1.x PySide6 tray)
  */
 #ifndef USBMON_H
 #define USBMON_H
@@ -21,7 +23,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define UM_VERSION "2.2.0"
+#define UM_VERSION "2.3.0"
 
 /* ---- limits (defensive caps, same spirit as the original normalizers) ---- */
 #define UM_MAX_DEV          64      /* devices per snapshot            */
@@ -201,8 +203,35 @@ void um_gui_show_remove(um_gui *g, const um_device *dev);
 void um_gui_reap(um_gui *g);            /* POSIX: reap finished helper children  */
 void um_gui_shutdown(um_gui *g);        /* brief wait, then forget helpers       */
 
+#ifdef _WIN32
+/* gui_win32.c: arbitrary-text toast (tray action feedback, e.g. eject). */
+void um_gui_win_notify(um_gui *g, const char *title, const char *body,
+                        int accent_ok);
+
+/* tray_win32.c: system tray + left/right menus, on the GUI thread. */
+void um_tray_install(void *owner_hwnd, void *gui);
+void um_tray_uninstall(void);
+int  um_tray_filter(void *hwnd, unsigned msg, void *wparam, void *lparam);
+
+/* Window messages shared by gui_win32.c and tray_win32.c.  Numeric
+ * (WM_APP base 0x8000) so this header stays free of windows.h.
+ * UMWM_TOAST / UMWM_QUIT are thread messages; the UMWM_TRAY* ones are
+ * posted to the listener window — including by tests: posting them with
+ * the exact LPARAM a real tray click delivers exercises the full menu
+ * path on headless CI runners. */
+#define UMWM_TOAST        0x8001
+#define UMWM_QUIT         0x8002
+#define UMWM_TRAY         0x8003
+#define UMWM_TRAY_RESCAN  0x8004
+#define UMWM_TRAY_QUIT    0x8005
+#endif
+
 /* -------------------------------------------------------------- main.c ---- */
 /* implemented in main.c: snapshot diff + round loop */
 int  um_snapshot_find(const um_snapshot *s, const char *key);
+
+/* main.c: request a clean daemon shutdown from another thread (the
+ * tray "退出" item).  `reason` lands in the JSONL stop event. */
+void um_request_stop(const char *reason);
 
 #endif /* USBMON_H */

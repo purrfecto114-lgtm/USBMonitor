@@ -7,10 +7,12 @@
 
 对原 `USBMonitor`（Python + PySide6，4,159 行单体 app.py）的**重置版**。
 **首要目标平台是 Windows**（发布产物以 Windows 为主，Linux 同源支持）：
-无托盘、无网页、守护进程零运行时依赖。默认**每 1 小时一轮**扫描（`1h 一轮`，
-保底节奏）；插拔事件通过内核事件（Windows: WM_DEVICECHANGE / Linux:
-inotify）**毫秒级唤醒**，插入 U 盘时右下角弹出设备信息窗，事件写入 JSONL
-日志，可选 hooks 在插入时以 argv 数组执行外部命令。
+无网页、双击运行**无黑色控制台窗口**（GUI 子系统）、**系统托盘图标 +
+左/右键菜单**（对标原版核心交互）、守护进程零运行时依赖。默认**每 1 小时
+一轮**扫描（`1h 一轮`，保底节奏）；插拔事件通过内核事件（Windows:
+WM_DEVICECHANGE / Linux: inotify）**毫秒级唤醒**，插入 U 盘时右下角弹出
+设备信息窗，事件写入 JSONL 日志，可选 hooks 在插入时以 argv 数组执行
+外部命令。
 
 ```
 KEY      BUS       MODEL                       SIZE  MOUNT
@@ -41,37 +43,43 @@ make                  # 守护进程 + usbmon-toast 弹窗助手（需 X11/Xft �
 make static           # musl 静态守护进程（需 musl-tools；发布产物同款）
 make strict           # -Wall -Wextra -pedantic -Werror 全绿
 
-# Windows（首要目标平台，mingw-w64 交叉编译，静态自包含）：
+# Windows（首要目标平台，mingw-w64 交叉编译，静态自包含 + GUI 子系统）：
 sudo apt-get install gcc-mingw-w64-x86-64        # Ubuntu/Debian
-make CROSS=x86_64-w64-mingw32- windows           # → usbmon.exe（strict + -static）
+make CROSS=x86_64-w64-mingw32- windows           # → usbmon.exe（strict + -static + -mwindows）
 make CROSS=x86_64-w64-mingw32- dist-windows      # → dist zip + 追加 SHA256SUMS
 
 # 发布打包（双平台，产物与 CI 同构）：
 make dist && make CROSS=x86_64-w64-mingw32- dist-windows
 ```
 
-Windows 产物为 **mingw-w64 完全静态链接**：PE import 表仅
-`KERNEL32.dll / USER32.dll / GDI32.dll / msvcrt.dll`——全部随 Windows 系统
-自带（msvcrt 自 Win98/NT4 起就是系统组件），**目标机无需安装任何运行时**，
-单文件即拷即用（CI 断言无 libgcc/libwinpthread 等运行时 DLL）。MSVC 亦可
-直接编译（源码为标准 C99 + Win32 API）。
+Windows 产物为 **mingw-w64 完全静态链接 + GUI 子系统（`-mwindows`）**：
+双击 usbmon.exe 不再弹出黑色控制台窗口，只出现托盘图标；在交互式
+cmd/PowerShell 里运行 `--version/--help/--list` 时会 AttachConsole 到
+父控制台正常打印（管道/CI 捕获不受影响）。PE import 表仅
+`KERNEL32.dll / USER32.dll / GDI32.dll / SHELL32.dll / ADVAPI32.dll /
+msvcrt.dll`——全部随 Windows 系统自带（msvcrt 自 Win98/NT4 起就是系统
+组件），**目标机无需安装任何运行时**，单文件即拷即用（CI 断言无
+libgcc/libwinpthread 等运行时 DLL）。托盘/可执行文件图标由 windres
+内嵌（`res/usbmon.ico`，`tools/make_icon.py` 生成）。MSVC 亦可直接编译
+（源码为标准 C99 + Win32 API）。
 
 Linux 上守护进程**永不链接 X11**：弹窗由独立助手二进制 `usbmon-toast`
 渲染（每事件 fork+exec，纯 argv，不经 shell）；无 X11 开发文件时助手不
 构建、守护进程照常运行。Linux 发布产物中的守护进程为 **musl 完全静态
 链接**（无 glibc 符号基线，任意 x86-64 Linux 可跑）；toast 为 glibc ≥ 2.31
-基线 + 桌面标配库。Windows 上弹窗与 WM_DEVICECHANGE 热路径由进程内 GUI
-线程实现（`gui_win32.c`，user32/gdi32 随系统存在，无需助手二进制）。
+基线 + 桌面标配库。Windows 上弹窗、WM_DEVICECHANGE 热路径与系统托盘由
+进程内 GUI 线程实现（`gui_win32.c` / `tray_win32.c`，user32/gdi32 随系统
+存在，无需助手二进制）。
 
 ## 用法（Windows）
 
 ```
 usbmon.exe                       # 守护进程：立即一轮，之后每 3600s 一轮（保底 1h），
-                                 # 插拔即时唤醒 + 右下角弹窗
+                                 # 插拔即时唤醒 + 右下角弹窗 + 托盘图标（双击无黑窗）
 usbmon.exe --interval 300        # 自定义轮询间隔（秒）
 usbmon.exe --once                # 单轮退出（任务计划程序模式，跨运行去重）
 usbmon.exe --list                # 列出当前外部存储设备（只读：不弹窗、不触发 hooks）
-usbmon.exe --gui / --no-gui      # 强制开/关弹窗（守护模式默认自动）
+usbmon.exe --gui / --no-gui      # 强制开/关弹窗+托盘（守护模式默认自动）
 usbmon.exe --toast-secs 30       # 弹窗自动消失秒数（默认 12）
 usbmon.exe --no-hotpath          # 忽略插拔唤醒，严格按间隔轮询
 usbmon.exe --baseline            # 首轮把在位设备全部报为 add
@@ -82,9 +90,9 @@ usbmon.exe --log-raw             # 序列号明文入日志（默认为 sha256 �
 - **数据目录**：`%LOCALAPPDATA%\usbmon\`（`events.jsonl`、
   `last-snapshot.txt`、日志轮转 `.1/.2/.3`）
 - **hooks 配置**：`%APPDATA%\usbmon\hooks.json`
-- **开机自启（无需管理员）**：注册表
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 新增字符串值
-  `usbmon = C:\path\to\usbmon.exe`（与原 1.x Python 版同一做法），或把
+- **开机自启（无需管理员）**：托盘右键菜单勾选“随系统启动”即可（写入注册表
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 字符串值
+  `usbmon = C:\path\to\usbmon.exe`，与原 1.x Python 版同一做法）；或把
   快捷方式放进启动文件夹；也可用
   `schtasks /create /tn usbmon /tr C:\path\usbmon.exe /sc onlogon /rl LIMITED`
   （可加 `/delay 0000:30` 错峰登录）。守护进程自身不需要任何特权。
@@ -111,6 +119,36 @@ Linux 用法完全相同（数据目录 `~/.local/state/usbmon`），详见上�
 - 中文设备名正常渲染（Linux 助手运行时逐字体探测 CJK 字形；Windows 用
   系统 Unicode API，天然支持）
 - 序列号默认显示指纹，与日志一致（`--log-raw` 才显明文）
+
+### 系统托盘（左/右键菜单，对标原版 TrayMenuController 的分工）
+
+```
+左键（USB 设备菜单，弹出时实时扫描）      右键（应用菜单）
+├─ E: · SanDisk Cruzer Glide (28.2 GB)   ├─ 状态：2 台 USB 存储设备
+│   ├─ 打开                              ├──────────────
+│   ├─ 在资源管理器中显示                 ├─ 立即重新扫描
+│   └─ 安全弹出                          ├──────────────
+├─ F: · 金士顿 DataTraveler (62.7 GB)    ├─ 工具 ▸ 打开日志目录 / 打开配置目录
+│   └─ …                                 ├──────────────
+└─（无设备时）当前没有检测到 USB 存储设备    ├─ 随系统启动（☑）
+                                          ├──────────────
+                                          └─ 退出
+```
+
+- **安全弹出**走 `IOCTL_STORAGE_EJECT_MEDIA`（原 Python 版的主路径），
+  发出后确认盘符真正消失，结果以右下角 toast 反馈（成功绿色/失败灰色，
+  占用时明确提示关闭相关文件）
+- **立即重新扫描**复用热路径唤醒事件（SetEvent）→ 0.7s 防抖 → 完整扫描
+  轮，与插拔事件同一条代码路径，日志记为 `"wake":"hot"`
+- **随系统启动**：勾选写 HKCU Run 键（无需管理员）；**退出**干净停守护
+  进程（JSONL stop 原因 `tray-quit`），移除托盘图标
+- explorer.exe 重启后图标自动重挂（监听 `TaskbarCreated` 广播）
+- 托盘与 WM_DEVICECHANGE 监听共用同一 GUI 线程消息泵——菜单打开期间
+  设备事件照常送达，无死锁面
+- 菜单弹出时重新扫描一次（每次点击都是最新快照，不读旧缓存）
+- 原版“设置”子菜单中的主题/日志模式/置顶等开关属 Qt 主题系统范畴，
+  C 版对应能力改由 CLI 旗标（`--log-raw`、`--toast-secs`、`--interval`）
+  提供——配置面收窄为进程参数，避免第二份运行时状态
 
 ## 事件日志（JSONL）
 
@@ -185,9 +223,10 @@ Linux 用法完全相同（数据目录 `~/.local/state/usbmon`），详见上�
 - 无 L1/L2 LRU+TTL 缓存——每小时一轮的扫描本身只要亚毫秒
 - 无三层 debounce——一个防抖窗口 + hooks 侧每 (规则,设备) 时间戳即可
 - 无启动项自愈/源码包复制/清单签名——静态单文件没有"部署状态"可自愈
-- 无托盘/常驻主窗口/SVG/动画——只在事件发生时弹一个轻量通知窗
-- Windows 弹窗留在进程内（user32/gdi32 系统必带）；Linux 守护进程本体
-  不链接 X11（弹窗隔离在助手进程里，崩了也不影响监控）
+- 无常驻主窗口/SVG/动画/QSS 主题系统——托盘图标 + 左右键菜单 +
+  事件弹窗已覆盖原版全部核心交互，其余保持 CLI 参数化
+- Windows 弹窗与托盘留在进程内（user32/gdi32/shell32 系统必带）；
+  Linux 守护进程本体不链接 X11（弹窗隔离在助手进程里，崩了也不影响监控）
 
 ## 发布（自动化，双平台）
 
@@ -199,7 +238,8 @@ Linux 用法完全相同（数据目录 `~/.local/state/usbmon`），详见上�
    toast + Xvfb GUI 回归 → 打包 tarball
 3. Windows：mingw-w64 静态构建（`-Werror` 零警告）+ PE import 自包含
    断言（不得出现 libgcc/libwinpthread 等运行时 DLL）
-4. **windows-latest 真机验证**：`tools/demo.ps1` 15 项断言门禁——任何
+4. **windows-latest 真机验证**：`tools/demo.ps1` 15 项断言门禁（CLI/日志/
+   锁/GUI 线程/热路径/**托盘图标与双菜单内容/托盘退出**）——任何
    一项失败都阻止发布
 5. 从 CHANGELOG 提取 notes → tag 冲突检查（存在且指向不同提交则拒绝）→
    发布 Release，上传三份资产：
@@ -225,6 +265,9 @@ usbmon/
 ├── LICENSE              MIT（与 1.x Python 版同源授权）
 ├── .github/workflows/   ci.yml（每次 push，含 Windows 真机验证）
 │                        release.yml（版本变更时发布，双平台门禁）
+├── res/
+│   ├── usbmon.rc        windres 资源（图标 ID 1）
+│   └── usbmon.ico       托盘/可执行文件图标（make_icon.py 生成后提交）
 ├── src/
 │   ├── usbmon.h       公共类型与契约
 │   ├── main.c         CLI、快照 diff、轮循环、热路径接线、状态持久化
@@ -234,13 +277,16 @@ usbmon/
 │   ├── gui.c          GUI 管理器（Windows 线程接线 / Linux 助手发现+回收）
 │   ├── gui_toast.c    Linux 弹窗助手：Xlib+Xft 渲染、CJK 字体探测
 │   ├── gui_win32.c    Windows GUI 线程：Win32 弹窗 + 顶层监听窗口
+│   ├── tray_win32.c   Windows 托盘：左/右键菜单、安全弹出、自启、退出
 │   ├── hook.c         hooks 解析/调度/BatBadBut 防线/子进程 reaper
 │   ├── json.c         迷你递归下降 JSON 解析器（深度/节点数封顶）
 │   ├── logjson.c      JSONL 日志 + 轮转
 │   ├── lock.c         单实例（flock / Local\ 命名互斥体）
 │   └── util.c         时间、glob、SHA-256 指纹、目录助手
 └── tools/  demo.sh + demo-gui.sh + demo.ps1 + release_notes.py
-           Linux hooks 回归 / Linux GUI 回归 / Windows 真机冒烟 / 发布 notes
+           + make_icon.py
+           Linux hooks 回归 / Linux GUI 回归 / Windows 真机冒烟 /
+           发布 notes / 图标生成
 ```
 
 ## 已验证行为
@@ -251,13 +297,24 @@ usbmon/
 - `--once` 产出 JSONL 逐行合法（start/round/stop 齐全）；hooks.json
   解析（start 事件 `hooks=N`）
 - 单实例锁：第二实例退出码 3；无头守护进程（`--no-gui`）稳定常驻
+- **PE 子系统 = WINDOWS_GUI**（解析 PE 头断言）：双击运行无黑色控制台
+  窗口；CLI 输出在管道捕获与交互控制台两种场景均正常
 - GUI 线程启动 + **隐身顶层监听窗口存在**（EnumWindows 按类名
   `usbmonListen` + PID 精确匹配）
+- **系统托盘图标安装成功**（Shell_NotifyIcon；CI 无 explorer 时自动
+  拉起一个以提供任务栏）
+- **左键菜单内容验证**：注入与真实点击完全相同的窗口消息 → 菜单结构
+  转储（USBMON_TRAY_TEST）断言含设备条目（打开/显示/安全弹出子菜单）
+  或诚实的空态文案；**右键菜单内容验证**：状态/立即重新扫描/工具/
+  随系统启动/退出齐全
+- **托盘触发重扫**：注入重扫消息 → 新的 `"wake":"hot"` 轮；**托盘退出**：
+  干净停机（退出码 0 + JSONL stop 原因 `tray-quit`）
 - **模拟系统级 WM_DEVICECHANGE 广播 → 守护进程即时唤醒 → 日志出现
   `"wake":"hot"`**（广播内容与操作系统卷到达通知逐字节一致；若监听
   窗口仍是 message-only，此项必挂——正是用来钉死该类缺陷）
 - mingw-w64 13.2 `-std=c99 -Wall -Wextra -pedantic -Werror` 零警告；
-  PE import 断言：仅 KERNEL32/USER32/GDI32/msvcrt，无任何运行时 DLL
+  PE 断言：GUI 子系统、`.rsrc` 图标段存在、import 仅
+  KERNEL32/USER32/GDI32/SHELL32/ADVAPI32/msvcrt，无任何运行时 DLL
 
 **Linux（沙箱实测）：**
 - `--list` / `--once` / 守护模式 / SIGTERM 干净退出；跨 `--once` 与跨

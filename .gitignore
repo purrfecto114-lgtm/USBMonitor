@@ -14,3 +14,4 @@ dist/
 *.jsonl
 *.jsonl.[123]
 last-snapshot.txt
+res/usbmon.res.o
