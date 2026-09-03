@@ -391,7 +391,9 @@ if ($hwnd -ne [IntPtr]::Zero) {
 
 # --- 13) RIGHT-click menu: 状态 / 立即重新扫描 / 工具 / 随系统启动 / 退出 -------
 if ($hwnd -ne [IntPtr]::Zero) {
-    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8003, [UIntPtr]::Zero, [IntPtr]0x0204) | Out-Null
+    # LPARAM = WM_RBUTTONUP (0x0205; 0x0204 is RBUTTONDOWN — the filter
+    # swallows it like a real hover)
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8003, [UIntPtr]::Zero, [IntPtr]0x0205) | Out-Null
     Start-Sleep -Milliseconds 800
     $menuRight = Truncate-From (Read-TrayLog) "menu right"
     $need = @('状态：', '立即重新扫描', '打开日志目录', '随系统启动', '退出')
