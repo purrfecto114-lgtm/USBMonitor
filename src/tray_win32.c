@@ -322,7 +322,7 @@ static void tray_run_menu(HMENU menu, const char *tag)
         GetCursorPos(&pt);
         SetForegroundWindow(g_owner);
         cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                    (int)pt.x, (int)pt.y, 0, g_owner, NULL);
+                                    (int)pt.x, (int)pt.y, g_owner, NULL);
         PostMessageW(g_owner, WM_NULL, 0, 0);   /* the canonical dismiss fix */
     }
     DestroyMenu(menu);
@@ -466,7 +466,7 @@ void um_tray_install(void *owner, void *gui)
 
     g_icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
     if (!g_icon)
-        g_icon = LoadIconW(NULL, IDI_APPLICATION);
+        g_icon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
 
     if (!g_owner) {
         tray_log_result("icon_add", 0);
