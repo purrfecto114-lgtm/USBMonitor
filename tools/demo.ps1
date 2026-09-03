@@ -65,12 +65,36 @@ Write-Output "(binary under test: $ExePath)"
 Write-Output "(scratch dir:      $Root)"
 
 function Invoke-Usbmon {
-    param([string[]]$ArgList)
-    $out = $null
-    try { $out = & $ExePath @ArgList 2>&1 } catch { $out = @("$_") }
-    [pscustomobject]@{
-        Out  = @($out | ForEach-Object { "$_" })
-        Code = $LASTEXITCODE
+    param([string[]]$ArgList, [int]$TimeoutSec = 60)
+    # PowerShell only WAITS for console-subsystem executables; a GUI-
+    # subsystem binary (usbmon.exe since -mwindows) returns immediately
+    # from the call operator with $LASTEXITCODE unset.  Start the process
+    # explicitly, redirect stdout/stderr to files, and wait on the process
+    # handle with a timeout — identical semantics for console builds.
+    $so = [IO.Path]::GetTempFileName()
+    $se = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $ExePath -ArgumentList $ArgList `
+                -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput $so -RedirectStandardError $se
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $p.WaitForExit(5000) | Out-Null
+            return [pscustomobject]@{ Out = @("TIMEOUT after $TimeoutSec s (process killed)"); Code = -1 }
+        }
+        $p.Refresh()
+        $out = @()
+        foreach ($f in @($so, $se)) {
+            if ((Test-Path -LiteralPath $f) -and ((Get-Item -LiteralPath $f).Length -gt 0)) {
+                $out += @(Get-Content -LiteralPath $f)
+            }
+        }
+        [pscustomobject]@{
+            Out  = @($out | ForEach-Object { "$_" })
+            Code = $p.ExitCode
+        }
+    } finally {
+        Remove-Item -LiteralPath $so, $se -Force -ErrorAction SilentlyContinue
     }
 }
 

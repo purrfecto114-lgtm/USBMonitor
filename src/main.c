@@ -469,6 +469,28 @@ int main(int argc, char **argv)
         hk.count = 0;
     }
 
+    /* single-instance lock BEFORE any GUI/thread work: a refused
+     * duplicate must exit fast without ever spawning a listener window
+     * or a tray icon.  The old order (GUI first) meant a refused second
+     * instance briefly created both -- and left a ghost tray icon behind,
+     * because this early-return path never ran um_gui_shutdown. */
+    if (!once && !list_only) {
+        um_state_dir(statebuf, sizeof statebuf);
+        snprintf(lockbuf, sizeof lockbuf,
+#ifdef _WIN32
+                 "%s\\usbmon.lock", statebuf);
+#else
+                 "%s/usbmon.lock", statebuf);
+#endif
+        if (um_single_instance_acquire(lockbuf) != 0) {
+            win_cli_console_attach();
+            fprintf(stderr, "usbmon: another instance is already running\n");
+            emit_meta(&lg, "error", "already_running");
+            um_log_close(&lg);
+            return 3;
+        }
+    }
+
     /* GUI: auto-on for the daemon when a display exists, off for --once
      * (cron context) and always off for --list (read-only). */
     if (gui.requested == -1)
@@ -490,24 +512,6 @@ int main(int argc, char **argv)
         (void)do_round(&lg, &hk, &gui, sys_root, interval_s, 0, 1, "list");
         um_log_close(&lg);
         return 0;
-    }
-
-    /* single instance only for daemon mode (--once may run beside it) */
-    if (!once) {
-        um_state_dir(statebuf, sizeof statebuf);
-        snprintf(lockbuf, sizeof lockbuf,
-#ifdef _WIN32
-                 "%s\\usbmon.lock", statebuf);
-#else
-                 "%s/usbmon.lock", statebuf);
-#endif
-        if (um_single_instance_acquire(lockbuf) != 0) {
-            win_cli_console_attach();
-            fprintf(stderr, "usbmon: another instance is already running\n");
-            emit_meta(&lg, "error", "already_running");
-            um_log_close(&lg);
-            return 3;
-        }
     }
 
     install_signals();
