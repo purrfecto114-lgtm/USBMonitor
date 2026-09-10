@@ -32,6 +32,9 @@ jobs:
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
 
+      - name: "Panel UI kernel + evidence layer tests (164 assertions, win32_shim)"
+        run: make selftest
+
       - name: "Smoke test (--version / --list)"
         run: |
           ./usbmon --version
@@ -109,6 +112,10 @@ jobs:
           echo "$IMPORTS"
           echo "$IMPORTS" | grep -q 'KERNEL32.dll' \
             || { echo "usbmon.exe does not even import KERNEL32?"; exit 1; }
+          echo "$IMPORTS" | grep -qi 'setupapi' \
+            || { echo "SetupAPI not imported — um_enum.c evidence layer missing from the build?"; exit 1; }
+          echo "$IMPORTS" | grep -qi 'cfgmgr32' \
+            || { echo "cfgmgr32 not imported — has_usb_ancestor() parent-chain walk missing?"; exit 1; }
           BAD=$(echo "$IMPORTS" | grep -Ei 'libgcc|winpthread|libstdc|mingw' || true)
           if [ -n "$BAD" ]; then
             echo "usbmon.exe needs a non-system runtime DLL: $BAD"

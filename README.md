@@ -103,22 +103,45 @@ hooks**；`--once` 复用同一状态文件，定时任务同样能正确产生 
 
 Linux 用法完全相同（数据目录 `~/.local/state/usbmon`），详见上文 CLI。
 
-### 弹窗（保留原版"插入 U 盘即弹窗"体验）
+### 设备面板（原版 ToastWindow 的完整移植：面板即通知）
+
+插入/拔出 USB 设备时，右下角弹出的不再是单行文字，而是 v1.1.1
+ToastWindow 同源的**完整设备面板**：
 
 ```
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ USB 设备已插入                     ┃
-┃ 金士顿 DataTraveler 3.0 (disk3)   ┃
-┃ 容量 62.7 GB · 2 个分区            ┃
-┃ 挂载点 E:\                         ┃
-┃ 序列 sha256:60a44c4c12ab           ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ ⛭  USB 设备监控          3 个 ┃
+┃     已插入：金士顿 DataTraveler  ┃
+┃ ┌─────────────────────────┐  ┃
+┃ │ E:、F: 可移动磁盘           │  ┃
+┃ │ 可移动磁盘 · E:、F:（2 个分区） │  ┃
+┃ │ 容量 59.4 GB · 可用 21.2 GB   │  ┃
+┃ │ ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░  │  ┃
+┃ ├─────────────────────────┤  ┃
+┃ │ USB 拓展坞 / 集线器          │  ┃
+┠─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  ┃
+┃ [展开] [关闭]  10s [ 打开U盘 ] ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
-- 右下角堆叠（4 槽位），绿色边条=插入、灰色=拔出；点击或超时自动消失
-- 中文设备名正常渲染（Linux 助手运行时逐字体探测 CJK 字形；Windows 用
-  系统 Unicode API，天然支持）
-- 序列号默认显示指纹，与日志一致（`--log-raw` 才显明文）
+- **设备行**：多分区聚合为一行（E:、F: 计 N 个分区）、容量条、hover
+  高亮；非存储 USB 设备（拓展坞/无线网卡/HID 手写笔）也占一行但
+  无 打开/弹出 按钮（对它们弹介质既无意义也会失败）
+- **交互**：行点击=打开、底部主按钮=打开第一个可打开卷、行右键菜单
+  （打开/在资源管理器中显示/复制路径/安全弹出）、展开/折叠切换多
+  分区视图、hover 暂停倒计时、键盘可达（Esc 关闭/Enter 打开/Tab
+  焦点环）、滚轮滚动（行多时）
+- **面板与托盘共享动作**：面板的 打开/显示/弹出 与托盘菜单调用同一份
+  实现（`um_tray_open/reveal/eject_letter`）；弹出结果以右下角反馈
+  toast 呈现（成功绿/失败灰）
+- **深浅色主题自动跟随系统**（AppsUseLightTheme）、DPI 缩放、右下角
+  工作区锚定、GDI 双缓冲无闪烁
+- **比 Python 版看得更多**：面板数据来自 SetupAPI 证据层（接口类枚举
+  + 全卷枚举 + 卷→磁盘归属 + 父链判 USB），因此未分配盘符的卷、读卡
+  器空槽、BitLocker 未解锁卷都能正确呈现（对应 1.1.1 只能猜一句
+  “可能尚未分配盘符”的场景）；拔出事件在面板状态行显示“已拔出：xxx”
+- 反馈类通知（弹出结果、自启开关）仍用轻量文字 toast；设备事件在
+  证据层不可用时同样降级为文字 toast，永不静默丢失
 
 ### 系统托盘（左/右键菜单，对标原版 TrayMenuController 的分工）
 
@@ -276,13 +299,20 @@ usbmon/
 │   ├── hotpath.c      inotify 热路径（POSIX；Windows 用 WM_DEVICECHANGE）
 │   ├── gui.c          GUI 管理器（Windows 线程接线 / Linux 助手发现+回收）
 │   ├── gui_toast.c    Linux 弹窗助手：Xlib+Xft 渲染、CJK 字体探测
-│   ├── gui_win32.c    Windows GUI 线程：Win32 弹窗 + 顶层监听窗口
+│   ├── gui_win32.c    Windows GUI 线程：设备面板 + 文字 toast + 监听窗口
 │   ├── tray_win32.c   Windows 托盘：左/右键菜单、安全弹出、自启、退出
+│   ├── um_toast_ui.c/h     面板 UI 内核（纯 C99：模型/布局/命中/状态机）
+│   ├── um_toast_win32.c/h  面板 Win32 渲染后端（GDI 双缓冲/输入/主题）
+│   ├── um_enum.c/h    设备证据层（SetupAPI+全卷枚举+父链，面板数据源）
 │   ├── hook.c         hooks 解析/调度/BatBadBut 防线/子进程 reaper
 │   ├── json.c         迷你递归下降 JSON 解析器（深度/节点数封顶）
 │   ├── logjson.c      JSONL 日志 + 轮转
 │   ├── lock.c         单实例（flock / Local\ 命名互斥体）
 │   └── util.c         时间、glob、SHA-256 指纹、目录助手
+├── tests/
+│   ├── win32_shim.c/h  最小 Win32 API 仿真层（Linux 上跑面板/采集测试）
+│   ├── ui_test.c       面板内核断言（112 项：布局/命中/状态机/UTF-8）
+│   └── enum_test.c     采集层断言（52 项：SetupAPI 流程/磁盘归属/装夹）
 └── tools/  demo.sh + demo-gui.sh + demo.ps1 + release_notes.py
            + make_icon.py
            Linux hooks 回归 / Linux GUI 回归 / Windows 真机冒烟 /
@@ -291,7 +321,7 @@ usbmon/
 
 ## 已验证行为
 
-**Windows（windows-latest 真机 CI，`tools/demo.ps1` 15 项断言全过）：**
+**Windows（windows-latest 真机 CI，`tools/demo.ps1` 20 项断言全过）：**
 - `--version`（含与发布 tag 一致性）/ `--help` / `--list` / `--once`
   退出码与输出全部正确；未知选项退出码 2
 - `--once` 产出 JSONL 逐行合法（start/round/stop 齐全）；hooks.json
@@ -301,6 +331,13 @@ usbmon/
   窗口；CLI 输出在管道捕获与交互控制台两种场景均正常
 - GUI 线程启动 + **隐身顶层监听窗口存在**（EnumWindows 按类名
   `usbmonListen` + PID 精确匹配）
+- **设备面板窗口创建**（类 `usbmonToast2` + PID 归属断言）——CI 无
+  USB 设备，经 `USBMON_PANEL_TEST` 固定 3 设备证据集走**完整生产
+  链路**（守护线程建模 → UMWM_PANEL 堆封送 → GUI 线程拷贝 → 单实例
+  窗口）；**面板内容转储断言**（标题/副标题/存储+拓展坞+手写笔三行）；
+  **行点击与主按钮双路径打开动作**、**展开真实改变窗口几何**
+  （SetWindowPos）、**Esc 隐藏 + 动作日志**——注入与真实输入完全相同
+  的窗口消息
 - **系统托盘图标安装成功**（Shell_NotifyIcon；CI 无 explorer 时自动
   拉起一个以提供任务栏）
 - **左键菜单内容验证**：注入与真实点击完全相同的窗口消息 → 菜单结构
@@ -314,23 +351,30 @@ usbmon/
   窗口仍是 message-only，此项必挂——正是用来钉死该类缺陷）
 - mingw-w64 13.2 `-std=c99 -Wall -Wextra -pedantic -Werror` 零警告；
   PE 断言：GUI 子系统、`.rsrc` 图标段存在、import 仅
-  KERNEL32/USER32/GDI32/SHELL32/ADVAPI32/msvcrt，无任何运行时 DLL
+  KERNEL32/USER32/GDI32/SHELL32/ADVAPI32/msvcrt/SETUPAPI/CFGMGR32
+  （全系统自带 DLL，无任何运行时依赖；SetupAPI/cfgmgr32 的存在性
+  单独断言，防证据层被误排除出链接）
 
 **Linux（沙箱实测）：**
 - `--list` / `--once` / 守护模式 / SIGTERM 干净退出；跨 `--once` 与跨
   重启的 add/remove（状态文件，重启零重发）；单实例锁退出码 3
 - hooks：正常触发、glob 匹配、占位符替换、未知占位符拒绝、损坏 JSON
   降级、exec 失败(127)与超时(60s)被记录/击杀（mock sysfs 11 项断言）
+- **面板内核 + 采集层 164 项断言**（`make selftest`，win32_shim 仿真）：
+  布局/命中测试/交互状态机/主题/UTF-8 解码边界（代理对、截断、孤
+  代理、非法序列 U+FFFD）/多分区聚合/分类决策树/采集返回值装夹
+  （回归外部评审发现的越界读）/卷→磁盘归属/SDD 布局一致性
 - SHA-256 指纹与 `python3 hashlib` 逐字节一致；JSONL 每行合法 JSON
 - GUI（Xvfb，`tools/demo-gui.sh` 11/11）：插拔约 1s 内弹窗（inotify +
   0.7s 防抖）、中文渲染（VLM 图像识别验证）、拔出灰窗、4 槽堆叠、
   点击/超时消失、零僵尸、`--no-hotpath` 严格间隔、无 DISPLAY 自动降级
-- 编译零警告（含 Xft 助手）；ASan/UBSan 全场景零错误零泄漏（助手仅剩
-  libfontconfig 内部 320B 上游缓存）；`gcc -fanalyzer` 唯一告警为
-  hook.c 已知误报
+- 编译零警告（含 Xft 助手与面板内核/测试）；ASan/UBSan 全场景零错误
+  零泄漏（助手仅剩 libfontconfig 内部 320B 上游缓存）；
+  `gcc -fanalyzer` 唯一告警为 hook.c 已知误报
 
 **诚实的边界**：物理插拔（真 U 盘插入）无法在 CI 模拟——CI 用与操作系统
 插拔时**完全相同的** WM_DEVICECHANGE 广播验证事件链路（监听窗口→唤醒→
 防抖→扫描→日志），Windows 扫描器与弹窗渲染已分别验证；首次拿到 exe 后
-建议实机插拔一次做最终体验确认。Linux 基线产物 toast 需桌面环境
-（glibc ≥ 2.31）。
+建议实机插拔一次做最终体验确认（设备面板的内容在 CI 以固定证据集
+驱动，真实 SetupAPI 采集在真机运行、其逻辑由 Linux 侧 164 项断言
+覆盖）。Linux 基线产物 toast 需桌面环境（glibc ≥ 2.31）。

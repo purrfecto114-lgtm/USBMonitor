@@ -20,6 +20,18 @@
 #       as JSON with start + round + stop events
 #   6.  hooks.json is parsed (start event reports hooks=N)
 #   7.  single-instance lock: second daemon refused with exit code 3
+#  16.  device panel window created (class usbmonToast2, owned by the
+#       daemon) — run as a DEDICATED daemon instance between 7 and 8,
+#       because runners have no USB devices: USBMON_PANEL_TEST feeds a
+#       fixed 3-device evidence set through the full production path
+#       (daemon thread -> um_toast_model -> UMWM_PANEL heap marshaling
+#       -> GUI thread copy -> window)
+#  17.  panel content dump: headline/subtitle + storage (E:+F:) + dock
+#       + pen rows
+#  18.  panel interactions: row click + bottom 打开 button both fire
+#       open actions (logged by the callback -> tray volume action chain)
+#  19.  展开 grows the real window (SetWindowPos geometry, not just repaint)
+#  20.  Esc hides the panel and logs the close action
 #   8.  GUI daemon stays alive and creates its invisible TOP-LEVEL
 #       listener window (class "usbmonListen", matched by PID)
 #   9.  a broadcast WM_DEVICECHANGE wakes the daemon: JSONL round with
@@ -39,6 +51,8 @@
 # Tray internals (10-15) are exercised by posting the exact window
 # messages a real tray click delivers (USBMON_TRAY_TEST additionally
 # asks the daemon to dump menu contents instead of popping menus up).
+# Panel internals (16-20) are exercised the same way: clicks and keys
+# are posted as the exact window messages real input delivers.
 #
 # Usage:
 #   pwsh tools/demo.ps1 [-ExePath .\usbmon.exe] [-Version 2.3.0]
@@ -248,6 +262,19 @@ namespace UsbmonDemo {
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool PostMessageW(IntPtr hWnd, uint msg,
             UIntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindWindowW(string className, string windowName);
+        [DllImport("user32.dll")]
+        public static extern bool GetClientRect(IntPtr hWnd, out RECT rc);
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+        public static uint WindowPid(IntPtr hWnd) {
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            return pid;
+        }
         public static IntPtr FindListenerHwnd(uint pid) {
             IntPtr found = IntPtr.Zero;
             EnumWindows(delegate(IntPtr h, IntPtr l) {
@@ -290,6 +317,115 @@ namespace UsbmonDemo {
     }
 }
 "@
+
+# --- 16-20) device panel (DEDICATED daemon instance; run before test 8) ------
+# Runners have no USB devices to plug, so USBMON_PANEL_TEST feeds a fixed
+# 3-device evidence set (dual-partition stick E:+F:, a dock, an HID pen)
+# through the FULL production path: daemon-thread model build -> heap
+# um_toast_model marshaled via UMWM_PANEL -> GUI-thread copy -> single-
+# instance window.  Panel shows dump their content and every action
+# callback logs a line, so the whole chain is assertable headlessly.
+$PanelFile = Join-Path $Root "panel-test.txt"
+$LogP = Join-Path $Root "panel.jsonl"
+$env:USBMON_PANEL_TEST = $PanelFile
+
+$procP = Start-Process -FilePath $ExePath `
+    -ArgumentList @("--log", $LogP, "--interval", "3600") `
+    -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 2
+
+# 16) panel window exists and belongs to this daemon instance
+$panelHwnd = [UsbmonDemo.Win32]::FindWindowW("usbmonToast2", $null)
+if ($panelHwnd -ne [IntPtr]::Zero) {
+    $panelOwner = [UsbmonDemo.Win32]::WindowPid($panelHwnd)
+    if ($panelOwner -eq [uint32]$procP.Id) {
+        Ok "device panel window created (class usbmonToast2, owned by the daemon)"
+    } else {
+        Bad "panel window owned by pid $panelOwner, expected $($procP.Id)"
+    }
+} else {
+    Bad "device panel window (class usbmonToast2) not found"
+}
+
+# 17) panel content: model -> window -> dump (storage + dock + pen rows)
+$panelTxt = ""
+if (Test-Path -LiteralPath $PanelFile) {
+    $panelTxt = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+}
+$needP = @('panel show', 'USB 设备监控', '3 个设备 · 2 个卷',
+           'E:、F: 可移动磁盘', 'USB 拓展坞 / 集线器', 'USB HID 设备')
+$missingP = @($needP | Where-Object { $panelTxt -notlike "*$_*" })
+if ($panelTxt -ne "" -and $missingP.Count -eq 0) {
+    Ok "panel content: headline/subtitle + storage(E:+F:) + dock + pen rows"
+} else {
+    Bad "panel content missing: $($missingP -join ' | ')"
+}
+
+# 18) row click + bottom 打开 button both fire open actions
+#     (logical geometry: window width 440; row0 center (100, 117);
+#      button row center y = H-37; main button center x = 365; the client
+#      rect gives the actual scale, so this holds at any DPI)
+function Send-PanelClick([IntPtr]$Hwnd, [double]$X, [double]$Y, [double]$Scale) {
+    $px = [int]([math]::Round($X * $Scale))
+    $py = [int]([math]::Round($Y * $Scale))
+    $lp = [IntPtr](((($py -band 0xFFFF) -shl 16) -bor ($px -band 0xFFFF)))
+    [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0201, [UIntPtr]::One, $lp) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0202, [UIntPtr]::Zero, $lp) | Out-Null
+}
+if ($panelHwnd -ne [IntPtr]::Zero) {
+    $rcp = New-Object UsbmonDemo.Win32+RECT
+    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcp) | Out-Null
+    $scaleP = $rcp.Right / 440.0
+    $logicalH = $rcp.Bottom / $scaleP
+    Send-PanelClick $panelHwnd 100 117 $scaleP                  # row 0
+    Send-PanelClick $panelHwnd 365 ($logicalH - 37) $scaleP     # main 打开 button
+    Start-Sleep -Milliseconds 400
+    $panelTxt2 = ""
+    if (Test-Path -LiteralPath $PanelFile) {
+        $panelTxt2 = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+    }
+    if ($panelTxt2 -match 'action open_row row=0 E:' -and
+        $panelTxt2 -match 'action open row=0 E:') {
+        Ok "panel row click + 打开 button fire open actions (callback -> tray volume action)"
+    } else {
+        Bad "panel open actions missing from log (got: $($panelTxt2 -replace "`n", ' | '))"
+    }
+
+    # 19) 展开 grows the real window (SetWindowPos geometry, not repaint only)
+    $h0 = $rcp.Bottom
+    Send-PanelClick $panelHwnd 61 ($logicalH - 37) $scaleP      # expand button
+    Start-Sleep -Milliseconds 400
+    $rcp2 = New-Object UsbmonDemo.Win32+RECT
+    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcp2) | Out-Null
+    if ($rcp2.Bottom - $h0 -gt 20) {
+        Ok "展开 grows the real window height (${h0}px -> $($rcp2.Bottom)px)"
+    } else {
+        Bad "展开 did not resize the window (${h0}px -> $($rcp2.Bottom)px)"
+    }
+
+    # 20) Esc hides the panel + logs the close action
+    [UsbmonDemo.Win32]::PostMessageW($panelHwnd, 0x0100, [UIntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 400
+    $vis = [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)
+    $panelTxt3 = ""
+    if (Test-Path -LiteralPath $PanelFile) {
+        $panelTxt3 = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+    }
+    if (-not $vis -and $panelTxt3 -match 'action close') {
+        Ok "Esc hides the panel and logs the close action"
+    } else {
+        Bad "Esc: visible=$vis, close action logged=$($panelTxt3 -match 'action close')"
+    }
+} else {
+    Bad "panel interaction tests skipped (no panel window)"
+    Bad "panel expand/geometry test skipped"
+    Bad "panel Esc test skipped"
+}
+
+if ($procP -and -not $procP.HasExited) { Stop-Process -Id $procP.Id -Force }
+Start-Sleep -Milliseconds 700      # release the single-instance lock cleanly
+Remove-Item Env:USBMON_PANEL_TEST -ErrorAction SilentlyContinue
 
 $LogG = Join-Path $Root "daemon-gui.jsonl"
 
@@ -445,6 +581,7 @@ if ($hwnd -ne [IntPtr]::Zero) {
 # --- cleanup ---------------------------------------------------------------------
 if ($proc2 -and -not $proc2.HasExited) { Stop-Process -Id $proc2.Id -Force }
 Remove-Item Env:USBMON_TRAY_TEST -ErrorAction SilentlyContinue
+Remove-Item Env:USBMON_PANEL_TEST -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output ""

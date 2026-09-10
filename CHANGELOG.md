@@ -3,6 +3,69 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.0] — 2026-09-10
+
+### Added — v1.1.1 视觉/交互面板完整移植（设备通知浮层）
+
+把 1.1.1（PySide6）ToastWindow/VolumeRow/Theme 里"看得见、点得着"的
+部分移植为原生 C99，替换 2.3.0 的纯文本 toast——**设备插拔现在弹出
+完整的设备面板**（不是一行文字），且新增了 Python 版都没有的设备分类
+能力：
+
+- **设备面板**（`um_toast_win32.c`，GDI 双缓冲 + 圆角 + 淡入）：
+  头部图标/标题/设备计数、逐设备行（标题/副标题/容量条/剩余空间）、
+  hover 暂停倒计时、展开/折叠（多分区视图）、行点击打开、底部主按钮
+  打开U盘、右键行菜单（打开/在资源管理器中显示/复制路径/安全弹出）、
+  键盘可达（Esc 关闭、Enter 打开、Tab/方向键焦点环）、深浅色主题跟随
+  系统（AppsUseLightTheme）、DPI 缩放、右下角工作区锚定
+- **平台无关 UI 内核**（`um_toast_ui.c/h`）：model→layout→drawlist
+  分层 + 命中测试 + 交互状态机 + 主题表 + UTF-8→UTF-16 解码（含代理
+  对与非法序列 U+FFFD 替换），全部纯 C99 可在 Linux 上单测——守护进程
+  永不链接 X11 的底线不变
+- **设备证据采集层**（`um_enum.c/h`）：SetupAPI 按接口类枚举
+  （DISK/VOLUME/HID/NET/HUB）+ FindFirstVolume 枚举**所有**卷（含无盘
+  符卷）+ IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS 卷→物理磁盘归属 +
+  CM_Locate_DevNodeW/CM_Get_Parent 父链判 USB。由此面板能看见 2.3.0
+  看不见的东西：未分配盘符的卷、读卡器空槽、BitLocker 未解锁卷、
+  USB 拓展坞、无线网卡、HID 设备——并对每类给出正确的能力判定
+  （非存储设备不可打开不可弹出，按钮置灰）
+- **设备分类决策树**（`um_ui_classify`）：位掩码标签而非互斥枚举
+  （复合设备如"智能笔+配置盘"正确呈现），证据不足一律判 UNKNOWN 不
+  硬猜（1.1.1 的"可能尚未分配盘符"兜底猜测由真实证据取代）
+- **多分区聚合**（`um_ui_group_by_disk`）：同一物理磁盘的多个卷合并
+  为一行（E:、F:、G: 计 3 个分区），与原版 VolumeRow 聚合语义一致
+- **面板 ↔ 托盘共享动作**：面板的 打开/显示/弹出 按钮与托盘菜单调
+  用**同一份** `um_tray_open/reveal/eject_letter` 实现（一处修复两处
+  生效）；安全弹出结果仍以右下角反馈 toast 呈现
+- **线程封送协议**（UMWM_PANEL）：守护线程构建堆 `um_toast_model`
+  → PostThreadMessage → GUI 线程拷贝入单实例面板并释放——面板与
+  WM_DEVICECHANGE 热路径共用一个消息泵，无锁无竞态
+
+### Changed — 测试与门禁全面升级
+
+- **新增 `tests/`（164 项断言）**：`ui_test`（112 项：布局/命中/状态
+  机/主题/UTF-8 边界/聚合/分类）与 `enum_test`（52 项：采集层逻辑），
+  在 Linux 上经 `tests/win32_shim.c`（最小 Win32 API 仿真层）端到端
+  运行；`make strict` 一并严格编译，`make selftest` 运行
+- `tools/demo.ps1` 断言 15 → 20 项：新增**面板窗口创建**（类名
+  usbmonToast2 + PID 归属）、**面板内容转储**（标题/副标题/存储+拓展
+  坞+手写笔三行）、**行点击与主按钮双路径打开动作**、**展开真实改变
+  窗口几何**（SetWindowPos 而非重画）、**Esc 隐藏+动作日志**。CI 无
+  USB 设备，经 `USBMON_PANEL_TEST` 固定 3 设备证据集走完整生产链路
+  （守护线程建模 → 堆封送 → GUI 拷贝 → 窗口 → 命中 → 回调 → 托盘
+  动作）——与托盘测试同一"注入真实窗口消息"方法论
+- `ci.yml`/`release.yml`：Linux job 新增 selftest 步骤；build-windows
+  新增 SetupAPI/cfgmgr32 导入存在性断言（防采集层被误排除出链接）
+- `Makefile`：`windows` 目标纳入三个新源文件并链接 `-lsetupapi
+  -lcfgmgr32`（均为系统自带 DLL，自包含底线不变）；新增 selftest/
+  ui-test/enum-test 目标与对应 clean 项
+- 外部评审修复全部并入：`um_enum_collect` 返回值装夹（评审 CRITICAL，
+  接口数 > max 时越界读，UBSan 可复现）、mingw -Werror 四个编译阻断
+  （NULL_BRUSH 假常量/SetupDiGetDeviceInterfaceDetail A-W 混用/GUID
+  头文件依赖/未用变量）、展开重锚几何、hover 暂停、GDI 笔泄漏、菜单
+  前台化、定时器重画节流、UTF-8 非法序列拒绝、实例 ID 改由
+  SetupDiGetDeviceInstanceIdW 提供、滚轮 max_scroll 夹逼
+
 ## [2.3.0] — 2026-09-03
 
 ### Added — 恢复 Windows 托盘与左/右键菜单（用户实测 v2.2.0 反馈）

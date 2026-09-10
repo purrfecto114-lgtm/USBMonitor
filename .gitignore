@@ -6,6 +6,11 @@ usbmon.exe
 *.o
 dist/
 
+# panel UI-kernel test binaries + SVG visual snapshots (tests/ui_test)
+tests/ui_test
+tests/enum_test
+out-toast-*.svg
+
 # editor / OS
 *.swp
 .DS_Store

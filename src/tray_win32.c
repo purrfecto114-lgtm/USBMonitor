@@ -525,4 +525,28 @@ int um_tray_filter(void *hwnd, unsigned msg, void *wp, void *lp)
     return 0;
 }
 
+/* ---- volume actions, shared with the device panel --------------------------
+ * gui_win32.c wires the panel's 打开 / 在资源管理器中显示 / 安全弹出 buttons
+ * to these, so the tray menus and the panel share ONE implementation of each
+ * action (ShellExecuteW / explorer /select / IOCTL eject + confirmation +
+ * feedback toast).  GUI thread only. */
+
+void um_tray_open_letter(char letter)
+{
+    tray_open_volume(letter);
+}
+
+void um_tray_reveal_letter(char letter)
+{
+    tray_reveal_volume(letter);
+}
+
+void um_tray_eject_letter(char letter, const char *model)
+{
+    tray_entry e;
+    e.letter = letter;
+    um_copy_str(e.model, sizeof e.model, model ? model : "");
+    tray_do_eject(&e);
+}
+
 #endif /* _WIN32 */

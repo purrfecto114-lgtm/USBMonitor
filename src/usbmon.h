@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define UM_VERSION "2.3.0"
+#define UM_VERSION "2.4.0"
 
 /* ---- limits (defensive caps, same spirit as the original normalizers) ---- */
 #define UM_MAX_DEV          64      /* devices per snapshot            */
@@ -207,23 +207,36 @@ void um_gui_shutdown(um_gui *g);        /* brief wait, then forget helpers      
 /* gui_win32.c: arbitrary-text toast (tray action feedback, e.g. eject). */
 void um_gui_win_notify(um_gui *g, const char *title, const char *body,
                         int accent_ok);
+/* gui_win32.c: device add/remove -> the single-instance panel (heap model
+ * marshaled to the GUI thread via UMWM_PANEL; falls back to a text toast
+ * when the evidence layer yields nothing). */
+void um_gui_win_show(um_gui *g, const um_device *dev, int is_add);
 
 /* tray_win32.c: system tray + left/right menus, on the GUI thread. */
 void um_tray_install(void *owner_hwnd, void *gui);
 void um_tray_uninstall(void);
 int  um_tray_filter(void *hwnd, unsigned msg, void *wparam, void *lparam);
 
+/* tray_win32.c: volume actions shared with the toast panel (gui_win32.c
+ * wires the panel's Open/Reveal/Eject buttons to these).  GUI thread. */
+void um_tray_open_letter(char letter);
+void um_tray_reveal_letter(char letter);
+void um_tray_eject_letter(char letter, const char *model);
+
 /* Window messages shared by gui_win32.c and tray_win32.c.  Numeric
  * (WM_APP base 0x8000) so this header stays free of windows.h.
- * UMWM_TOAST / UMWM_QUIT are thread messages; the UMWM_TRAY* ones are
- * posted to the listener window — including by tests: posting them with
- * the exact LPARAM a real tray click delivers exercises the full menu
- * path on headless CI runners. */
+ * UMWM_TOAST / UMWM_QUIT / UMWM_PANEL are thread messages; the UMWM_TRAY*
+ * ones are posted to the listener window — including by tests: posting them
+ * with the exact LPARAM a real tray click delivers exercises the full menu
+ * path on headless CI runners.  UMWM_PANEL carries a heap um_toast_model*
+ * built on the daemon thread (um_enum_collect) — the GUI thread copies it
+ * into the single-instance panel, shows it and frees it. */
 #define UMWM_TOAST        0x8001
 #define UMWM_QUIT         0x8002
 #define UMWM_TRAY         0x8003
 #define UMWM_TRAY_RESCAN  0x8004
 #define UMWM_TRAY_QUIT    0x8005
+#define UMWM_PANEL        0x8006
 #endif
 
 /* -------------------------------------------------------------- main.c ---- */
