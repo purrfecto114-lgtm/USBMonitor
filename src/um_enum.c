@@ -7,7 +7,9 @@
 #include <stdio.h>
 
 #ifdef _WIN32
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
+#endif
 #  include <windows.h>
 #  include <winioctl.h>   /* STORAGE_* / IOCTL_* / VOLUME_DISK_EXTENTS */
 #  include <setupapi.h>
@@ -29,6 +31,15 @@ static const GUID UM_GUID_DEVINTERFACE_NET =
   {0xcac88484,0x7515,0x4c03,{0x82,0xe6,0x71,0xa8,0x7a,0xb8,0x62,0x9b}};
 static const GUID UM_GUID_DEVINTERFACE_USB_HUB =
   {0xf18a0e88,0xc30c,0x11d0,{0x88,0x15,0x00,0xa0,0xc9,0x08,0xbe,0xdc}};
+/* STORAGE_BUS_TYPE 枚举值（ntddstor.h：BusTypeUnknown=0、BusTypeUsb=7）。
+ * Linux 侧 win32_shim.h 定义同名宏且数值一致，这里补齐 Windows 侧并
+ * 双向 #ifndef 防重复定义。 */
+#ifndef BUS_TYPE_UNKNOWN
+#define BUS_TYPE_UNKNOWN 0
+#endif
+#ifndef BUS_TYPE_USB
+#define BUS_TYPE_USB    7
+#endif
 #ifndef CM_LOCATE_DEVNODE_NORMAL
 #define CM_LOCATE_DEVNODE_NORMAL 0x00000000UL
 #endif
@@ -552,10 +563,10 @@ int um_enum_collect(um_evidence *out, int max)
 
     /* ---- 1) 功能接口 → 标签（同一设备多接口按 instance_id 合并） ---- */
 #ifdef _WIN32
-    enum_iface(recs, &n, 64, (const GUID *)&GUID_DEVINTERFACE_DISK,   UM_TAG_STORAGE);
-    enum_iface(recs, &n, 64, (const GUID *)&GUID_DEVINTERFACE_HID,    UM_TAG_HID);
-    enum_iface(recs, &n, 64, (const GUID *)&GUID_DEVINTERFACE_NET,    UM_TAG_NET);
-    enum_iface(recs, &n, 64, (const GUID *)&GUID_DEVINTERFACE_USB_HUB, UM_TAG_HUB);
+    enum_iface(recs, &n, 64, &UM_GUID_DEVINTERFACE_DISK,     UM_TAG_STORAGE);
+    enum_iface(recs, &n, 64, &UM_GUID_DEVINTERFACE_HID,      UM_TAG_HID);
+    enum_iface(recs, &n, 64, &UM_GUID_DEVINTERFACE_NET,      UM_TAG_NET);
+    enum_iface(recs, &n, 64, &UM_GUID_DEVINTERFACE_USB_HUB,  UM_TAG_HUB);
 #else
     enum_iface(recs, &n, 64, IF_DISK, UM_TAG_STORAGE);
     enum_iface(recs, &n, 64, IF_HID,  UM_TAG_HID);
