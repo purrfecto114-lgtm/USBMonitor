@@ -294,3 +294,84 @@ const char *um_config_dir(char *buf, size_t n)
     um_mkdir_p(buf);
     return buf;
 }
+
+/* --------------------------------------------------- login autostart ------ */
+/* Linux implementation of the v1.1.1 --install-startup trio: an XDG
+ * autostart entry (~/.config/autostart/usbmon.desktop), the same mechanism
+ * every desktop environment honors — no root, fully reversible.  The
+ * Windows twin (HKCU Run) lives in tray_win32.c. */
+#ifndef _WIN32
+
+static int autostart_path(char *buf, size_t n)
+{
+    const char *xdg  = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+
+    if (xdg && *xdg) snprintf(buf, n, "%s/autostart/usbmon.desktop", xdg);
+    else if (home && *home)
+        snprintf(buf, n, "%s/.config/autostart/usbmon.desktop", home);
+    else
+        return -1;
+    return 0;
+}
+
+int um_startup_install(void)
+{
+    char p[512], exe[512];
+    ssize_t len;
+    FILE *f;
+
+    if (autostart_path(p, sizeof p)) return -1;
+    len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (len <= 0) return -1;
+    exe[len] = '\0';
+
+    /* parent dir first (~/.config/autostart may not exist yet) */
+    {
+        char dir[512];
+        char *slash;
+        snprintf(dir, sizeof dir, "%s", p);
+        slash = strrchr(dir, '/');
+        if (slash) *slash = '\0';
+        um_mkdir_p(dir);
+    }
+
+    f = fopen(p, "w");
+    if (!f) return -1;
+    fprintf(f,
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=usbmon\n"
+            "Comment=USB storage monitor (daemon + tray/toasts)\n"
+            "Exec=%s\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n",
+            exe);
+    fclose(f);
+    return 0;
+}
+
+int um_startup_uninstall(void)
+{
+    char p[512];
+
+    if (autostart_path(p, sizeof p)) return -1;
+    /* absent entry == already uninstalled == success */
+    if (remove(p) != 0 && errno != ENOENT) return -1;
+    return 0;
+}
+
+int um_startup_enabled(void)
+{
+    char p[512];
+
+    if (autostart_path(p, sizeof p)) return 0;
+    return access(p, F_OK) == 0 ? 1 : 0;
+}
+
+const char *um_startup_where(void)
+{
+    return "XDG autostart ~/.config/autostart/usbmon.desktop";
+}
+
+#endif /* !_WIN32 */

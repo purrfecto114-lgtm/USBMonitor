@@ -138,6 +138,32 @@ ADDS=$(grep -c '"ev":"add"' "$LOG")
                   || bad "expected 3 adds, got $ADDS"
 
 echo
+echo "== 7. login autostart CLI roundtrip (isolated HOME) =="
+ASTART=/tmp/usbmon-demo-home
+rm -rf "$ASTART"; mkdir -p "$ASTART"
+if HOME="$ASTART" "$USBMON_BIN" --startup-status | grep -q "未启用"; then
+    ok "--startup-status reports 未启用 on a fresh HOME"
+else
+    bad "--startup-status fresh check failed"
+fi
+HOME="$ASTART" "$USBMON_BIN" --install-startup >/dev/null 2>&1 \
+    && ok "--install-startup exits 0" || bad "--install-startup failed"
+[ -f "$ASTART/.config/autostart/usbmon.desktop" ] \
+    && ok "XDG autostart entry created" || bad "autostart .desktop missing"
+grep -q "Exec=" "$ASTART/.config/autostart/usbmon.desktop" \
+    && ok "autostart entry has an Exec line" || bad "autostart Exec missing"
+if HOME="$ASTART" "$USBMON_BIN" --startup-status | grep -q "已启用"; then
+    ok "--startup-status reports 已启用 after install"
+else
+    bad "--startup-status post-install check failed"
+fi
+HOME="$ASTART" "$USBMON_BIN" --uninstall-startup >/dev/null 2>&1 \
+    && ok "--uninstall-startup exits 0" || bad "--uninstall-startup failed"
+[ ! -f "$ASTART/.config/autostart/usbmon.desktop" ] \
+    && ok "XDG autostart entry removed" || bad "autostart .desktop still present"
+rm -rf "$ASTART"
+
+echo
 echo "== final log tail =="
 tail -6 "$LOG"
 

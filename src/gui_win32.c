@@ -86,6 +86,12 @@ static const wchar_t *g_class_listen = L"usbmonListen";
 
 static um_toast_win *g_panel;      /* single instance; events refresh it */
 
+/* Toast windows per stacking slot (GUI thread only).  A new toast posted
+ * into an occupied slot replaces it in place — that is how the async-eject
+ * "正在安全弹出" progress line is upgraded to the final result without
+ * stacking a second window on top. */
+static HWND g_slot_win[UM_GUI_SLOTS];
+
 /* USBMON_PANEL_TEST=path (test-only, same pattern as USBMON_TRAY_TEST):
  *   - evidence comes from a fixed 3-device set instead of the machine
  *     (CI runners have no USB devices to plug in);
@@ -411,7 +417,12 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_DESTROY: {
         toast_data *td = (toast_data *)GetWindowLongPtrW(hw, GWLP_USERDATA);
-        if (td) free(td);
+        if (td) {
+            if (td->slot >= 0 && td->slot < UM_GUI_SLOTS &&
+                g_slot_win[td->slot] == hw)
+                g_slot_win[td->slot] = NULL;
+            free(td);
+        }
         SetWindowLongPtrW(hw, GWLP_USERDATA, 0);
         return 0;
     }
@@ -494,6 +505,12 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
                         (td->n_lines - 1) * TW_LINE_H + TW_PAD;
                 int x = sw - TW_WIDTH - TW_MARGIN_R;
                 int y = sh - h - TW_MARGIN_B - td->slot * (h + TW_SLOT_GAP);
+                /* slot re-use replaces the previous toast in place */
+                if (td->slot >= 0 && td->slot < UM_GUI_SLOTS &&
+                    g_slot_win[td->slot]) {
+                    DestroyWindow(g_slot_win[td->slot]);
+                    g_slot_win[td->slot] = NULL;
+                }
                 HWND t = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                                          g_class_toast, L"usbmon-toast",
                                          WS_POPUP,
@@ -501,6 +518,8 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
                                          NULL, NULL, GetModuleHandleW(NULL),
                                          td);
                 if (t) {
+                    if (td->slot >= 0 && td->slot < UM_GUI_SLOTS)
+                        g_slot_win[td->slot] = t;
                     ShowWindow(t, SW_SHOWNOACTIVATE);
                     UpdateWindow(t);
                 } else {
@@ -652,6 +671,40 @@ void um_gui_win_notify(um_gui *g, const char *title, const char *body,
     td->n_dim_from = 1;   /* title bright, body dim */
 
     if (!PostThreadMessageW(g->gui_tid, UMWM_TOAST, 1, (LPARAM)td))
+        free(td);
+}
+
+/* Thread-safe variant with EXPLICIT slot and ttl: reads no um_gui state,
+ * so worker threads (async safe-eject) may call it — only the immutable
+ * gui_tid crosses the thread boundary.  Re-using a slot replaces the
+ * previous toast in place (handled on the GUI thread by the message loop). */
+void um_gui_win_post(unsigned long gui_tid, const char *title,
+                     const char *body, int accent_ok, int slot, int ttl)
+{
+    toast_data *td = malloc(sizeof *td);
+    wchar_t wbuf[192];
+
+    if (!td) return;
+    if (slot < 0 || slot >= UM_GUI_SLOTS || ttl < 1) {
+        free(td);
+        return;
+    }
+    memset(td, 0, sizeof *td);
+    td->is_add = accent_ok ? 1 : 0;
+    td->ttl = ttl;
+    td->slot = slot;
+
+    wcopy(title, wbuf, 192);
+    wcscpy_s(td->lines[td->n_lines], 192, wbuf);
+    td->n_lines++;
+    if (body && body[0]) {
+        wcopy(body, wbuf, 192);
+        wcscpy_s(td->lines[td->n_lines], 192, wbuf);
+        td->n_lines++;
+    }
+    td->n_dim_from = 1;   /* title bright, body dim */
+
+    if (!PostThreadMessageW((DWORD)gui_tid, UMWM_TOAST, 1, (LPARAM)td))
         free(td);
 }
 

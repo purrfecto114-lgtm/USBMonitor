@@ -357,6 +357,10 @@ static void usage(FILE *out)
 "  --no-hotpath       ignore plug/unplug wakeups, strict interval rounds\n"
 "  --baseline         first round reports all present devices as adds\n"
 "                     (default: state file suppresses re-adds on restart)\n"
+"  --install-startup  register login autostart and exit (v1.1.1 parity:\n"
+"                     HKCU Run on Windows, XDG autostart on Linux)\n"
+"  --uninstall-startup remove login autostart and exit\n"
+"  --startup-status   print whether login autostart is installed, exit\n"
 "  --sys-root PATH    sysfs root override (Linux, for tests)\n"
 "  --verbose          mirror event lines to stderr in human form\n"
 "  --version          print version\n"
@@ -406,6 +410,28 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-gui")) gui.requested = 0;
         else if (!strcmp(a, "--no-hotpath")) no_hotpath = 1;
         else if (!strcmp(a, "--baseline")) force_baseline = 1;
+        else if (!strcmp(a, "--install-startup")) {
+            win_cli_console_attach();
+            int r = um_startup_install();
+            printf(r == 0 ? "usbmon: 已安装登录自启动（%s）。\n"
+                          : "usbmon: 安装自启动失败。\n",
+                   um_startup_where());
+            return r == 0 ? 0 : 1;
+        }
+        else if (!strcmp(a, "--uninstall-startup")) {
+            win_cli_console_attach();
+            int r = um_startup_uninstall();
+            printf(r == 0 ? "usbmon: 已移除登录自启动。\n"
+                          : "usbmon: 移除自启动失败。\n");
+            return r == 0 ? 0 : 1;
+        }
+        else if (!strcmp(a, "--startup-status")) {
+            win_cli_console_attach();
+            printf("usbmon 登录自启动：%s（%s）\n",
+                   um_startup_enabled() ? "已启用" : "未启用",
+                   um_startup_where());
+            return 0;
+        }
         else if (!strcmp(a, "--toast-secs") && i + 1 < argc) {
             char *endp = NULL;
             long v = strtol(argv[++i], &endp, 10);

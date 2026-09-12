@@ -207,6 +207,13 @@ void um_gui_shutdown(um_gui *g);        /* brief wait, then forget helpers      
 /* gui_win32.c: arbitrary-text toast (tray action feedback, e.g. eject). */
 void um_gui_win_notify(um_gui *g, const char *title, const char *body,
                         int accent_ok);
+/* gui_win32.c: thread-safe toast post with an EXPLICIT slot and ttl —
+ * unlike um_gui_win_notify it touches no um_gui state, so the async-eject
+ * worker thread can call it (only the immutable gui_tid crosses threads).
+ * Re-using a slot replaces the previous toast in place: the "正在安全弹出"
+ * progress line is upgraded to the final result in the same slot. */
+void um_gui_win_post(unsigned long gui_tid, const char *title,
+                     const char *body, int accent_ok, int slot, int ttl);
 /* gui_win32.c: device add/remove -> the single-instance panel (heap model
  * marshaled to the GUI thread via UMWM_PANEL; falls back to a text toast
  * when the evidence layer yields nothing). */
@@ -237,7 +244,22 @@ void um_tray_eject_letter(char letter, const char *model);
 #define UMWM_TRAY_RESCAN  0x8004
 #define UMWM_TRAY_QUIT    0x8005
 #define UMWM_PANEL        0x8006
+/* Test-only: posted to the listener window by demo.ps1 to drive the async
+ * safe-eject path headlessly (WPARAM packs the drive letter in its low
+ * byte); honored only when USBMON_TRAY_TEST is set in the environment. */
+#define UMWM_TRAY_EJECT_TEST 0x8007
 #endif
+
+/* Login autostart (v1.1.1 --install-startup/--uninstall-startup/--startup-
+ * status parity).  Windows: HKCU Run "usbmon" (same value the tray toggle
+ * writes, no admin needed); Linux: XDG autostart ~/.config/autostart/
+ * usbmon.desktop.  Return 0 on success, -1 on failure.  Implemented in
+ * tray_win32.c (Windows) and util.c (Linux). */
+int  um_startup_install(void);
+int  um_startup_uninstall(void);
+int  um_startup_enabled(void);
+/* human-readable WHERE the autostart lives (for --startup-status output) */
+const char *um_startup_where(void);
 
 /* -------------------------------------------------------------- main.c ---- */
 /* implemented in main.c: snapshot diff + round loop */

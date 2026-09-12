@@ -32,6 +32,7 @@
 #include <windows.h>
 #include <shellapi.h>     /* Shell_NotifyIconW, ShellExecuteW */
 #include <winioctl.h>
+#include <process.h>      /* _beginthreadex: async safe-eject worker */
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,24 +181,10 @@ static void tray_reveal_volume(char letter)
     ShellExecuteW(g_owner, NULL, L"explorer.exe", params, NULL, SW_SHOWNORMAL);
 }
 
-/* Sleep that keeps the message pump alive (toasts keep painting,
- * WM_DEVICECHANGE keeps arriving) while we wait for the eject to land. */
-static void pump_sleep_ms(int ms)
-{
-    int waited = 0;
-    MSG msg;
-    while (waited < ms) {
-        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        Sleep(40);
-        waited += 40;
-    }
-}
-
-/* 0 = ejected, 1 = request accepted but still mounted, -1 = refused. */
-static int tray_eject_volume(char letter)
+/* 0 = ejected, 1 = request accepted but still mounted, -1 = refused.
+ * Runs on the async-eject WORKER thread: plain Sleep only — message
+ * pumping belongs to the thread that owns the windows. */
+static int eject_volume_sync(char letter)
 {
     wchar_t vol[8];
     HANDLE h;
@@ -214,32 +201,80 @@ static int tray_eject_volume(char letter)
         return -1;
     }
     CloseHandle(h);
-    for (i = 0; i < 75; i++) {                  /* ~3 s, pumping messages */
-        pump_sleep_ms(40);
+    for (i = 0; i < 75; i++) {              /* ~3 s for the letter to drop */
+        Sleep(40);
         if (!(GetLogicalDrives() & (1UL << (letter - 'A')))) return 0;
     }
     return 1;
 }
 
-static void tray_do_eject(const tray_entry *e)
-{
-    char title[64], body[256];
-    int r = tray_eject_volume(e->letter);
+/* Everything the eject worker needs, heap-copied before the thread starts
+ * (tray entries can be refreshed by a rescan mid-eject).  gui_tid/ttl/slot
+ * are captured BY VALUE on the GUI thread — the worker never touches any
+ * shared state, it only PostThreadMessageW's its result toast back. */
+typedef struct {
+    char          letter;
+    char          model[UM_MODEL_MAX];
+    unsigned long gui_tid;
+    int           ttl;
+    int           slot;
+} eject_job;
 
-    snprintf(title, sizeof title, "安全弹出 %c:", e->letter);
+static unsigned __stdcall eject_worker(void *arg)
+{
+    eject_job *j = (eject_job *)arg;
+    char title[64], body[256];
+    int r = eject_volume_sync(j->letter);
+
+    snprintf(title, sizeof title, "安全弹出 %c:", j->letter);
     if (r == 0)
         snprintf(body, sizeof body, "%s 已安全弹出，现在可以拔出。",
-                 e->model[0] ? e->model : "设备");
+                 j->model[0] ? j->model : "设备");
     else if (r == 1)
         snprintf(body, sizeof body,
                  "已发送弹出请求，但 %c: 仍可访问。请关闭占用它的文件后重试。",
-                 e->letter);
+                 j->letter);
     else
         snprintf(body, sizeof body,
                  "无法弹出 %c:（设备被占用或系统拒绝）。请关闭相关文件后重试。",
-                 e->letter);
-    if (g_gui)
-        um_gui_win_notify(g_gui, title, body, r == 0);
+                 j->letter);
+    /* same slot as the "正在安全弹出" line -> replaces it in place */
+    um_gui_win_post(j->gui_tid, title, body, r == 0, j->slot, j->ttl);
+    tray_log_result("eject", r == 0);
+    free(j);
+    return 0;
+}
+
+/* v1.1.1 parity: eject runs on a worker thread so the GUI thread (message
+ * pump for WM_DEVICECHANGE, tray menus, toasts) never stalls 1~10 s inside
+ * DeviceIoControl.  The user sees "正在安全弹出…" immediately; the same
+ * toast slot is then upgraded to the final result by the worker. */
+static void tray_do_eject(const tray_entry *e)
+{
+    eject_job *j;
+
+    if (!g_gui || !g_gui->gui_tid) return;
+    j = malloc(sizeof *j);
+    if (!j) return;
+    memset(j, 0, sizeof *j);
+    j->letter = e->letter;
+    snprintf(j->model, sizeof j->model, "%s", e->model);
+    j->gui_tid = g_gui->gui_tid;
+    j->ttl = g_gui->toast_ttl;
+    j->slot = (int)(g_gui->slot_seq++ % UM_GUI_SLOTS);
+
+    um_gui_win_post(j->gui_tid, "正在安全弹出", "正在安全弹出，请稍候…",
+                    1, j->slot, 12);
+    {
+        HANDLE th = (HANDLE)_beginthreadex(NULL, 0, eject_worker, j, 0, NULL);
+        if (th) {
+            CloseHandle(th);   /* thread keeps running on its own */
+        } else {
+            /* could not spawn (~never): run inline so the action is never
+             * lost — this is exactly the old blocking behavior */
+            eject_worker(j);
+        }
+    }
 }
 
 static void tray_open_dir_utf8(const char *dir)
@@ -492,9 +527,9 @@ void um_tray_uninstall(void)
 int um_tray_filter(void *hwnd, unsigned msg, void *wp, void *lp)
 {
     size_t lpv = (size_t)lp;
+    size_t wpv = (size_t)wp;
 
     (void)hwnd;
-    (void)wp;
 
     if (msg == UMWM_TRAY && g_owner) {
         switch ((UINT)lpv) {
@@ -518,6 +553,16 @@ int um_tray_filter(void *hwnd, unsigned msg, void *wp, void *lp)
         um_request_stop("tray-quit");
         return 1;
     }
+    if (msg == UMWM_TRAY_EJECT_TEST && tray_test_out()) {
+        /* test-only (USBMON_TRAY_TEST set): drive the async eject chain —
+         * worker spawn -> IOCTL attempt -> result toast marshaled back —
+         * headlessly.  WPARAM packs the drive letter in the low byte. */
+        tray_entry e;
+        e.letter = (char)(wpv & 0xFF);
+        um_copy_str(e.model, sizeof e.model, "Test Stick");
+        tray_do_eject(&e);
+        return 1;
+    }
     if (g_msg_taskbar && msg == g_msg_taskbar) {
         if (g_owner) tray_add_icon(1);   /* explorer restarted: re-add */
         return 1;
@@ -529,7 +574,7 @@ int um_tray_filter(void *hwnd, unsigned msg, void *wp, void *lp)
  * gui_win32.c wires the panel's 打开 / 在资源管理器中显示 / 安全弹出 buttons
  * to these, so the tray menus and the panel share ONE implementation of each
  * action (ShellExecuteW / explorer /select / IOCTL eject + confirmation +
- * feedback toast).  GUI thread only. */
+ * feedback toast).  GUI thread only; the eject itself hops to a worker. */
 
 void um_tray_open_letter(char letter)
 {
@@ -547,6 +592,30 @@ void um_tray_eject_letter(char letter, const char *model)
     e.letter = letter;
     um_copy_str(e.model, sizeof e.model, model ? model : "");
     tray_do_eject(&e);
+}
+
+/* ---- login autostart: HKCU Run (v1.1.1 --install-startup parity) ---------- */
+
+int um_startup_install(void)
+{
+    startup_set(1);
+    return startup_enabled() ? 0 : -1;
+}
+
+int um_startup_uninstall(void)
+{
+    startup_set(0);
+    return startup_enabled() ? -1 : 0;
+}
+
+int um_startup_enabled(void)
+{
+    return startup_enabled();
+}
+
+const char *um_startup_where(void)
+{
+    return "注册表 HKCU Run\\usbmon";
 }
 
 #endif /* _WIN32 */

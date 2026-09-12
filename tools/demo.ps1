@@ -18,6 +18,9 @@
 #   4.  --list exits 0 (read-only round)
 #   5.  --once exits 0 and writes a JSONL log whose every line parses
 #       as JSON with start + round + stop events
+#   5b. --startup-status / --install-startup / --uninstall-startup CLI
+#       roundtrip (v1.1.1 parity): HKCU Run value appears/disappears and
+#       the status output flips 未启用 -> 已启用 -> 未启用
 #   6.  hooks.json is parsed (start event reports hooks=N)
 #   7.  single-instance lock: second daemon refused with exit code 3
 #  16.  device panel window created (class usbmonToast2, owned by the
@@ -45,6 +48,10 @@
 #  13.  RIGHT-click menu content: 状态 / 立即重新扫描 / 工具 / 随系统启动 / 退出
 #  14.  tray-triggered rescan: the tray rescan message produces another
 #       wake="hot" round (same path the menu item uses)
+#  14b. async safe-eject (v1.1.1 parity): UMWM_TRAY_EJECT_TEST drives the
+#       full worker chain headlessly — GUI thread returns immediately,
+#       worker runs the IOCTL, result toast is marshaled back and the tray
+#       log records the eject result; the daemon must stay alive
 #  15.  tray quit: the tray quit message exits the daemon with code 0
 #       and a JSONL stop event whose reason is "tray-quit"
 #
@@ -180,6 +187,35 @@ if ($evNames -contains "start" -and $evNames -contains "round" -and $evNames -co
     Ok "JSONL contains start + round + stop events"
 } else {
     Bad "JSONL events seen: $($evNames -join ',')"
+}
+
+# --- 5b) startup CLI roundtrip: HKCU Run appears/disappears -------------------
+$RunKeyPs = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$r = Invoke-Usbmon @("--startup-status")
+if ($r.Code -eq 0 -and (($r.Out -join "") -match "未启用")) {
+    Ok "--startup-status exits 0 and reports 未启用 (fresh)"
+} else {
+    Bad "--startup-status fresh: exit=$($r.Code) out=$($r.Out -join '|')"
+}
+$r = Invoke-Usbmon @("--install-startup")
+$runVal = (Get-ItemProperty -Path $RunKeyPs -Name "usbmon" -ErrorAction SilentlyContinue).usbmon
+if ($r.Code -eq 0 -and $runVal) {
+    Ok "--install-startup writes HKCU Run usbmon = $runVal"
+} else {
+    Bad "--install-startup: exit=$($r.Code) registry value='$runVal'"
+}
+$r = Invoke-Usbmon @("--startup-status")
+if ($r.Code -eq 0 -and (($r.Out -join "") -match "已启用")) {
+    Ok "--startup-status reports 已启用 after install"
+} else {
+    Bad "--startup-status post-install: exit=$($r.Code) out=$($r.Out -join '|')"
+}
+$r = Invoke-Usbmon @("--uninstall-startup")
+$runVal2 = (Get-ItemProperty -Path $RunKeyPs -Name "usbmon" -ErrorAction SilentlyContinue).usbmon
+if ($r.Code -eq 0 -and -not $runVal2) {
+    Ok "--uninstall-startup removes the HKCU Run value"
+} else {
+    Bad "--uninstall-startup: exit=$($r.Code) value still='$runVal2'"
 }
 
 # --- 6) hooks.json is parsed (hook count shows in the start event) -------------
@@ -554,6 +590,36 @@ if ($hwnd -ne [IntPtr]::Zero) {
     } else {
         Bad "no new hot round after tray rescan (before=$hotBefore after=$hotAfter)"
     }
+}
+
+# --- 14b) async safe-eject: worker thread + marshaled result toast -----------
+# UMWM_TRAY_EJECT_TEST (0x8007), honored only under USBMON_TRAY_TEST: drives
+# tray_do_eject with letter 'Q' (0x51) — almost certainly absent on a runner,
+# so the worker's CreateFileW fails fast, but the WHOLE async chain runs:
+# GUI thread returns immediately, worker runs the IOCTL attempt, the result
+# toast is marshaled back via PostThreadMessageW and the tray log records it.
+if ($hwnd -ne [IntPtr]::Zero) {
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8007, [UIntPtr]0x51, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 1500     # progress toast + worker + result toast
+    $ejectTxt = Read-TrayLog
+    if ($ejectTxt -match 'eject (ok|fail)') {
+        Ok "async safe-eject ran on a worker thread (tray log: $($Matches[0]))"
+    } else {
+        Bad "async eject chain left no result in the tray log"
+    }
+    $toastHwnd = [UsbmonDemo.Win32]::FindWindowW("usbmonToast", $null)
+    if ($toastHwnd -ne [IntPtr]::Zero) {
+        Ok "eject progress/result toast window exists (class usbmonToast)"
+    } else {
+        Bad "no usbmonToast window after the eject test"
+    }
+    if (-not $proc2.HasExited) {
+        Ok "daemon still alive after async eject (GUI thread never blocked)"
+    } else {
+        Bad "daemon died during the async eject test"
+    }
+} else {
+    Bad "async eject test skipped (no listener hwnd)"
 }
 
 # --- 15) tray quit: graceful shutdown, exit 0, stop reason tray-quit -------------

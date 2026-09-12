@@ -85,15 +85,21 @@ usbmon.exe --no-hotpath          # 忽略插拔唤醒，严格按间隔轮询
 usbmon.exe --baseline            # 首轮把在位设备全部报为 add
 usbmon.exe --log FILE            # JSONL 日志路径
 usbmon.exe --log-raw             # 序列号明文入日志（默认为 sha256 指纹）
+usbmon.exe --install-startup     # 安装登录自启并退出（v1.1.1 同名命令）
+usbmon.exe --uninstall-startup   # 移除登录自启并退出
+usbmon.exe --startup-status      # 查询自启状态并退出
 ```
 
 - **数据目录**：`%LOCALAPPDATA%\usbmon\`（`events.jsonl`、
   `last-snapshot.txt`、日志轮转 `.1/.2/.3`）
 - **hooks 配置**：`%APPDATA%\usbmon\hooks.json`
-- **开机自启（无需管理员）**：托盘右键菜单勾选“随系统启动”即可（写入注册表
+- **开机自启（无需管理员）**：托盘右键菜单勾选“随系统启动”，或命令行
+  `--install-startup`（两者写同一处，互为等价操作）：注册表
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 字符串值
-  `usbmon = C:\path\to\usbmon.exe`，与原 1.x Python 版同一做法）；或把
-  快捷方式放进启动文件夹；也可用
+  `usbmon = C:\path\to\usbmon.exe`，与原 1.x Python 版同一做法；
+  `--startup-status` 随时查询、`--uninstall-startup` 移除。Linux 上
+  同一组命令写 XDG autostart（`~/.config/autostart/usbmon.desktop`）。
+  也可把快捷方式放进启动文件夹；或用
   `schtasks /create /tn usbmon /tr C:\path\usbmon.exe /sc onlogon /rl LIMITED`
   （可加 `/delay 0000:30` 错峰登录）。守护进程自身不需要任何特权。
 
@@ -159,11 +165,15 @@ ToastWindow 同源的**完整设备面板**：
 ```
 
 - **安全弹出**走 `IOCTL_STORAGE_EJECT_MEDIA`（原 Python 版的主路径），
-  发出后确认盘符真正消失，结果以右下角 toast 反馈（成功绿色/失败灰色，
-  占用时明确提示关闭相关文件）
+  且**在工作线程异步执行**（v1.1.1 QThread SafeEjectWorker 的等价
+  实现）：点击后立即显示"正在安全弹出，请稍候…"状态行，GUI 线程
+  （消息泵）全程不被阻塞；工作线程发出 IOCTL 并确认盘符真正消失后，
+  同一 toast 槽位**原位升级**为最终结果（成功绿色/失败灰色，占用时
+  明确提示关闭相关文件）。托盘菜单与设备面板按钮共用这一条异步路径
 - **立即重新扫描**复用热路径唤醒事件（SetEvent）→ 0.7s 防抖 → 完整扫描
   轮，与插拔事件同一条代码路径，日志记为 `"wake":"hot"`
-- **随系统启动**：勾选写 HKCU Run 键（无需管理员）；**退出**干净停守护
+- **随系统启动**：勾选写 HKCU Run 键（无需管理员，与
+  `--install-startup` 同一键值互为等价操作）；**退出**干净停守护
   进程（JSONL stop 原因 `tray-quit`），移除托盘图标
 - explorer.exe 重启后图标自动重挂（监听 `TaskbarCreated` 广播）
 - 托盘与 WM_DEVICECHANGE 监听共用同一 GUI 线程消息泵——菜单打开期间
@@ -243,9 +253,13 @@ ToastWindow 同源的**完整设备面板**：
 ```
 
 刻意**不做**的事（原版过度工程的部分）：
-- 无 L1/L2 LRU+TTL 缓存——每小时一轮的扫描本身只要亚毫秒
+- 无 L1/L2 LRU+TTL 缓存——每小时一轮的扫描本身只要亚毫秒（1.x 的
+  缓存是为 Python ctypes 往返开销设计的，C 直调 IOCTL 单次 µs 级）
 - 无三层 debounce——一个防抖窗口 + hooks 侧每 (规则,设备) 时间戳即可
 - 无启动项自愈/源码包复制/清单签名——静态单文件没有"部署状态"可自愈
+- 无托盘"最近操作"历史子菜单——JSONL 事件日志（含指纹、跨重启、可
+  审计）+ 面板"已拔出：xxx"状态行 + 每动作即时反馈 toast 是它的
+  等价实现，且不占菜单高度（1.x 为此还得分页）
 - 无常驻主窗口/SVG/动画/QSS 主题系统——托盘图标 + 左右键菜单 +
   事件弹窗已覆盖原版全部核心交互，其余保持 CLI 参数化
 - Windows 弹窗与托盘留在进程内（user32/gdi32/shell32 系统必带）；
@@ -257,13 +271,13 @@ ToastWindow 同源的**完整设备面板**：
 `.github/workflows/release.yml`）到默认分支时，`release.yml` 自动完成：
 
 1. 版本一致性校验（usbmon.h ↔ CHANGELOG 章节）+ 已存在 release 安全跳过
-2. Linux：严格构建 + musl 静态 + 11 断言 hooks 回归 ×2 + bullseye 基线
+2. Linux：严格构建 + musl 静态 + 18 断言回归（含启动项 CLI 往返）×2 + bullseye 基线
    toast + Xvfb GUI 回归 → 打包 tarball
 3. Windows：mingw-w64 静态构建（`-Werror` 零警告）+ PE import 自包含
    断言（不得出现 libgcc/libwinpthread 等运行时 DLL）
-4. **windows-latest 真机验证**：`tools/demo.ps1` 15 项断言门禁（CLI/日志/
-   锁/GUI 线程/热路径/**托盘图标与双菜单内容/托盘退出**）——任何
-   一项失败都阻止发布
+4. **windows-latest 真机验证**：`tools/demo.ps1` 24 项断言门禁（CLI/日志/
+   锁/启动项往返/GUI 线程/热路径/**托盘图标与双菜单内容/异步安全弹出/
+   托盘退出**）——任何一项失败都阻止发布
 5. 从 CHANGELOG 提取 notes → tag 冲突检查（存在且指向不同提交则拒绝）→
    发布 Release，上传三份资产：
    `usbmon-<ver>-windows-amd64.zip`、`usbmon-<ver>-linux-amd64.tar.gz`、
@@ -321,7 +335,7 @@ usbmon/
 
 ## 已验证行为
 
-**Windows（windows-latest 真机 CI，`tools/demo.ps1` 20 项断言全过）：**
+**Windows（windows-latest 真机 CI，`tools/demo.ps1` 24 项断言全过）：**
 - `--version`（含与发布 tag 一致性）/ `--help` / `--list` / `--once`
   退出码与输出全部正确；未知选项退出码 2
 - `--once` 产出 JSONL 逐行合法（start/round/stop 齐全）；hooks.json
@@ -346,6 +360,12 @@ usbmon/
   随系统启动/退出齐全
 - **托盘触发重扫**：注入重扫消息 → 新的 `"wake":"hot"` 轮；**托盘退出**：
   干净停机（退出码 0 + JSONL stop 原因 `tray-quit`）
+- **异步安全弹出链**（UMWM_TRAY_EJECT_TEST 驱动）：注入弹出消息 →
+  GUI 线程立即返回 → 工作线程跑 IOCTL → 结果 toast 封送回 GUI 线程 →
+  托盘日志记录 eject 结果，usbmonToast 窗口存在，守护进程全程存活
+- **启动项 CLI 往返**：`--startup-status`（未启用）→ `--install-startup`
+  （HKCU Run 键值写入且指向本 exe）→ 状态翻转为已启用 →
+  `--uninstall-startup`（键值移除）→ 状态回到未启用
 - **模拟系统级 WM_DEVICECHANGE 广播 → 守护进程即时唤醒 → 日志出现
   `"wake":"hot"`**（广播内容与操作系统卷到达通知逐字节一致；若监听
   窗口仍是 message-only，此项必挂——正是用来钉死该类缺陷）

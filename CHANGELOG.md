@@ -41,19 +41,55 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   → PostThreadMessage → GUI 线程拷贝入单实例面板并释放——面板与
   WM_DEVICECHANGE 热路径共用一个消息泵，无锁无竞态
 
+### Added — v1.1.1 功能对齐补全（异步弹出 + 启动项 CLI）
+
+对照 v1.1.1 tag 逐项核查后发现的两处真实缺口，本版补齐（等价实现，
+方向可变但语义对齐）：
+
+- **异步安全弹出**（v1.1.1 的 QThread SafeEjectWorker 等价物）：
+  弹出 IOCTL 从 GUI 线程移到 `_beginthreadex` 工作线程——此前同步
+  路径会在 DeviceIoControl + 3s 盘符确认期间阻塞消息泵（WM_DEVICECHANGE
+  /托盘菜单/toast 全部停摆，v1.1.1 明确异步化正是为此）。现在点击
+  "安全弹出"立即看到 **"正在安全弹出，请稍候…"** 状态行，工作线程
+  完成后**同一槽位原位升级**为最终结果（成功绿/失败灰）——toast 槽位
+  追踪表（GUI 线程独占）实现原位替换，不叠窗。工作线程与 GUI 线程
+  之间只传**按值捕获**的 `eject_job`（盘符/型号/gui_tid/ttl/slot），
+  零共享状态零锁；结果经 `um_gui_win_post`（线程安全 toast 投递）封送
+  回 GUI 线程。托盘菜单与设备面板按钮共用同一条异步路径
+- **启动项管理 CLI**（v1.1.1 的 `--install-startup/--uninstall-startup/
+  --startup-status` 等价物）：Windows 写 HKCU Run（与托盘"随系统启动"
+  开关同一键值，互为等价操作）；Linux 写 XDG autostart
+  （`~/.config/autostart/usbmon.desktop`，`XDG_CONFIG_HOME` 感知，
+  Exec 为 `/proc/self/exe` 解析的绝对路径）。三命令即测即退，输出
+  人类可读状态（含注册位置说明）
+- **v1.1.1 "最近操作"托盘子菜单的等价物声明**：1.x 在右键菜单维护
+  recent_volumes 列表（分页展示）；2.x 以 JSONL 事件日志（含指纹、
+  可审计、跨重启）+ 面板"已拔出：xxx"状态行 + 每动作即时反馈 toast
+  实现同一"我知道刚才发生了什么"诉求，且不占菜单空间——属有意
+  的等价实现而非缺失
+- **v1.1.1 L1/L2 扫描缓存的明确弃置**：1.x 的 path→disk / disk→bus
+  两级 LRU 是为 Python ctypes 往返开销设计的；C 直调 IOCTL 单次
+  µs 级，缓存收益归零——按"减去不必要的弯路"原则不移植并在此存档
+
 ### Changed — 测试与门禁全面升级
 
 - **新增 `tests/`（164 项断言）**：`ui_test`（112 项：布局/命中/状态
   机/主题/UTF-8 边界/聚合/分类）与 `enum_test`（52 项：采集层逻辑），
   在 Linux 上经 `tests/win32_shim.c`（最小 Win32 API 仿真层）端到端
   运行；`make strict` 一并严格编译，`make selftest` 运行
-- `tools/demo.ps1` 断言 15 → 20 项：新增**面板窗口创建**（类名
+- `tools/demo.ps1` 断言 15 → 24 项：新增**启动项 CLI 往返**（--startup-
+  status / --install-startup / --uninstall-startup：HKCU Run 键值出现/
+  消失 + 状态输出 未启用→已启用→未启用 翻转）、**异步安全弹出链**
+  （UMWM_TRAY_EJECT_TEST 驱动：工作线程 spawn → IOCTL → 结果 toast
+  封送回 GUI 线程 → 托盘日志记录，守护进程全程存活）、**面板窗口创建**（类名
   usbmonToast2 + PID 归属）、**面板内容转储**（标题/副标题/存储+拓展
   坞+手写笔三行）、**行点击与主按钮双路径打开动作**、**展开真实改变
   窗口几何**（SetWindowPos 而非重画）、**Esc 隐藏+动作日志**。CI 无
   USB 设备，经 `USBMON_PANEL_TEST` 固定 3 设备证据集走完整生产链路
   （守护线程建模 → 堆封送 → GUI 拷贝 → 窗口 → 命中 → 回调 → 托盘
   动作）——与托盘测试同一"注入真实窗口消息"方法论
+- `tools/demo.sh` 断言 11 → 18 项：新增 Linux 启动项 CLI 往返（隔离
+  HOME，XDG autostart 桌面文件出现/Exec 内容/移除 + 状态翻转）
 - `ci.yml`/`release.yml`：Linux job 新增 selftest 步骤；build-windows
   新增 SetupAPI/cfgmgr32 导入存在性断言（防采集层被误排除出链接）
 - `Makefile`：`windows` 目标纳入三个新源文件并链接 `-lsetupapi
