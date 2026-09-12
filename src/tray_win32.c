@@ -95,6 +95,16 @@ static void tray_log_result(const char *key, int ok)
     fclose(f);
 }
 
+/* Test-only free-form log line (USBMON_TRAY_TEST set); used by
+ * gui_win32.c to surface toast/panel diagnostics on headless runners. */
+void um_tray_test_log(const char *key, const char *detail)
+{
+    FILE *f = tray_test_out();
+    if (!f) return;
+    fprintf(f, "%s %s\n", key, detail ? detail : "");
+    fclose(f);
+}
+
 static void dump_level(FILE *f, HMENU m, int depth)
 {
     int n = GetMenuItemCount(m), i;

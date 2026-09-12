@@ -223,6 +223,9 @@ void um_gui_win_show(um_gui *g, const um_device *dev, int is_add);
 void um_tray_install(void *owner_hwnd, void *gui);
 void um_tray_uninstall(void);
 int  um_tray_filter(void *hwnd, unsigned msg, void *wparam, void *lparam);
+/* tray_win32.c: test-only free-form log line (USBMON_TRAY_TEST); gui_win32.c
+ * uses it to surface toast/panel diagnostics on headless CI runners. */
+void um_tray_test_log(const char *key, const char *detail);
 
 /* tray_win32.c: volume actions shared with the toast panel (gui_win32.c
  * wires the panel's Open/Reveal/Eject buttons to these).  GUI thread. */

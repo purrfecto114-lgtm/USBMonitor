@@ -48,10 +48,10 @@ jobs:
           ./usbmon-static --version
           ./usbmon-static --list
 
-      - name: "Hooks end-to-end regression (mock sysfs, 11 assertions)"
+      - name: "Hooks end-to-end regression (mock sysfs, 18 assertions)"
         run: bash tools/demo.sh
 
-      - name: "Hooks e2e regression — musl static build (11 assertions)"
+      - name: "Hooks e2e regression — musl static build (18 assertions)"
         run: USBMON=./usbmon-static bash tools/demo.sh
 
       - name: "GUI regression under Xvfb (toast popup, hot path, state)"

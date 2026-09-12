@@ -100,18 +100,20 @@ jobs:
           test "$(./usbmon-static --version)" = "usbmon ${{ needs.meta.outputs.version }}"
           ./usbmon --list
 
-      - name: "Hooks e2e regression — dynamic build (11 assertions)"
+      - name: "Hooks e2e regression — dynamic build (18 assertions)"
         run: bash tools/demo.sh
 
-      - name: "Hooks e2e regression — musl static build (11 assertions)"
+      - name: "Hooks e2e regression — musl static build (18 assertions)"
         run: USBMON=./usbmon-static bash tools/demo.sh
 
       - name: "Build toast helper on a glibc 2.31 baseline (debian:bullseye)"
         run: |
           set -eu
           docker run --rm -v "$PWD:/src" -w /src debian:bullseye bash -eu -c '
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends \
+              # oldstable mirrors can carry an expired Release file;
+              # the checksums still match, so skip the validity window.
+              apt-get -o Acquire::Check-Valid-Until=false update -qq
+              apt-get -o Acquire::Check-Valid-Until=false install -y -qq --no-install-recommends \
                   gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev
               gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
                   $(pkg-config --cflags x11 xft) src/gui_toast.c \

@@ -465,6 +465,15 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
     MSG msg;
     ATOM at, al;
 
+    /* Register the PANEL window class (usbmonToast2) BEFORE the loop:
+     * the first UMWM_PANEL creates the panel via um_toast_win_new, which
+     * needs the class + hinstance that um_toast_win_init provides.  The
+     * Linux selftest calls it itself; the Windows binary must too (first
+     * CI run caught it: panel never appeared, CreateWindowExW failed on
+     * an unregistered class).  NULL hinstance -> resolved to this exe. */
+    if (!um_toast_win_init(NULL))
+        um_tray_test_log("panel", "class register fail");
+
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = toast_proc;
     wc.hInstance = GetModuleHandleW(NULL);
@@ -522,7 +531,17 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
                         g_slot_win[td->slot] = t;
                     ShowWindow(t, SW_SHOWNOACTIVATE);
                     UpdateWindow(t);
+                    {
+                        char dbg[48];
+                        snprintf(dbg, sizeof dbg, "create ok slot=%d",
+                                 td->slot);
+                        um_tray_test_log("toast", dbg);
+                    }
                 } else {
+                    char dbg[48];
+                    snprintf(dbg, sizeof dbg, "create fail gle=%lu slot=%d",
+                             (unsigned long)GetLastError(), td->slot);
+                    um_tray_test_log("toast", dbg);
                     free(td);
                 }
             }
@@ -537,6 +556,8 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
                     um_theme th;
                     um_theme_resolve(&th, "auto", um_toast_system_dark());
                     g_panel = um_toast_win_new(m, &th, 1, panel_action_cb, g);
+                    if (!g_panel)
+                        um_tray_test_log("panel", "create fail");
                 }
                 if (g_panel) {
                     um_toast_win_update(g_panel, m);
@@ -704,8 +725,10 @@ void um_gui_win_post(unsigned long gui_tid, const char *title,
     }
     td->n_dim_from = 1;   /* title bright, body dim */
 
-    if (!PostThreadMessageW((DWORD)gui_tid, UMWM_TOAST, 1, (LPARAM)td))
+    if (!PostThreadMessageW((DWORD)gui_tid, UMWM_TOAST, 1, (LPARAM)td)) {
+        um_tray_test_log("toast", "post fail");
         free(td);
+    }
 }
 
 void um_gui_win_shutdown(um_gui *g)
