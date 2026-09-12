@@ -423,7 +423,10 @@ function Send-PanelClick([IntPtr]$Hwnd, [double]$X, [double]$Y, [double]$Scale) 
     $px = [int]([math]::Round($X * $Scale))
     $py = [int]([math]::Round($Y * $Scale))
     $lp = [IntPtr](((($py -band 0xFFFF) -shl 16) -bor ($px -band 0xFFFF)))
-    [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0201, [UIntPtr]::One, $lp) | Out-Null
+    # [UIntPtr]::One does not resolve in every pwsh build the runners use
+    # (evaluates to $null -> "cannot convert null to UIntPtr"); an explicit
+    # cast is portable everywhere.
+    [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0201, [UIntPtr][uint64]1, $lp) | Out-Null
     Start-Sleep -Milliseconds 60
     [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0202, [UIntPtr]::Zero, $lp) | Out-Null
 }

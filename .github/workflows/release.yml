@@ -110,8 +110,15 @@ jobs:
         run: |
           set -eu
           docker run --rm -v "$PWD:/src" -w /src debian:bullseye bash -eu -c '
-              # oldstable mirrors can carry an expired Release file;
-              # the checksums still match, so skip the validity window.
+              # bullseye left LTS (2026-08): deb.debian.org keeps serving its
+              # stale (expired) indexes while the pool has moved on -> 404s.
+              # archive.debian.org is frozen forever and its indexes match
+              # its pool; Release validity windows are expired by design.
+              printf "%s\n" \
+                "deb [check-valid-until=no] http://archive.debian.org/debian bullseye main" \
+                "deb [check-valid-until=no] http://archive.debian.org/debian-security bullseye-security main" \
+                > /etc/apt/sources.list
+              rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
               apt-get -o Acquire::Check-Valid-Until=false update -qq
               apt-get -o Acquire::Check-Valid-Until=false install -y -qq --no-install-recommends \
                   gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev
