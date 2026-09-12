@@ -58,64 +58,64 @@ ifeq ($(strip $(XFT_LIBS)),)
 XFT_LIBS := -lX11 -lXft
 endif
 HAVE_X11 := $(shell printf 'int main(void){return 0;}' > /tmp/usbmon-x11probe.c && \
-        $(CC) -std=c99 /tmp/usbmon-x11probe.c -o /tmp/usbmon-x11probe \
-        $(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
+	$(CC) -std=c99 /tmp/usbmon-x11probe.c -o /tmp/usbmon-x11probe \
+	$(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
 
 # --- targets ----------------------------------------------------------------
 .PHONY: all clean windows strict analyze asan gui dist dist-windows static \
-        selftest ui-test enum-test
+	selftest ui-test enum-test
 
 all: usbmon $(if $(HAVE_X11),usbmon-toast,)
 
 usbmon: $(SRC_LINUX) src/usbmon.h
-        $(CC) $(CFLAGS) $(SRC_LINUX) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(SRC_LINUX) -o $@ $(LDFLAGS)
 
 # popup helper (X11 + Xft; C99-pedantic clean)
 usbmon-toast: src/gui_toast.c src/usbmon.h
-        $(CC) $(CFLAGS) $(XFT_CFLAGS) src/gui_toast.c -o $@ $(XFT_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(XFT_CFLAGS) src/gui_toast.c -o $@ $(XFT_LIBS) $(LDFLAGS)
 
 ifeq ($(HAVE_X11),yes)
 gui: usbmon-toast
 else
 gui:
-        @echo "usbmon: X11/Xft dev files not found — toast helper not built"
-        @echo "        (install libx11-dev libxft-dev and re-run make)"
+	@echo "usbmon: X11/Xft dev files not found — toast helper not built"
+	@echo "        (install libx11-dev libxft-dev and re-run make)"
 endif
 
 # stricter build used before release (treats warnings as errors);
 # also compiles the panel-kernel tests with the same strictness.
 strict:
-        $(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_LINUX) -o usbmon $(LDFLAGS)
+	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_LINUX) -o usbmon $(LDFLAGS)
 ifneq ($(strip $(HAVE_X11)),)
-        $(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(XFT_CFLAGS) src/gui_toast.c -o usbmon-toast $(XFT_LIBS) $(LDFLAGS)
+	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(XFT_CFLAGS) src/gui_toast.c -o usbmon-toast $(XFT_LIBS) $(LDFLAGS)
 endif
-        $(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/ui_test $(UI_TST_SRC)
-        $(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/enum_test $(ENUM_TST_SRC)
+	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/ui_test $(UI_TST_SRC)
+	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/enum_test $(ENUM_TST_SRC)
 
 # run the panel UI-kernel + evidence-layer tests (built by `strict`)
 selftest: tests/ui_test tests/enum_test
-        ./tests/ui_test
-        ./tests/enum_test
+	./tests/ui_test
+	./tests/enum_test
 
 # convenience aliases
 ui-test: tests/ui_test
-        ./tests/ui_test
+	./tests/ui_test
 enum-test: tests/enum_test
-        ./tests/enum_test
+	./tests/enum_test
 
 tests/ui_test: $(UI_TST_SRC) $(TST_HDRS)
-        $(CC) $(CFLAGS) $(TST_FLAGS) -o $@ $(UI_TST_SRC)
+	$(CC) $(CFLAGS) $(TST_FLAGS) -o $@ $(UI_TST_SRC)
 
 tests/enum_test: $(ENUM_TST_SRC) $(TST_HDRS)
-        $(CC) $(CFLAGS) $(TST_FLAGS) -o $@ $(ENUM_TST_SRC)
+	$(CC) $(CFLAGS) $(TST_FLAGS) -o $@ $(ENUM_TST_SRC)
 
 # GCC static analyzer pass (gcc >= 10)
 analyze:
-        $(CC) -std=c99 -O2 -Wall -Wextra -fanalyzer $(SRC_LINUX) -o /dev/null $(LDFLAGS)
+	$(CC) -std=c99 -O2 -Wall -Wextra -fanalyzer $(SRC_LINUX) -o /dev/null $(LDFLAGS)
 
 # sanitizer build for the end-to-end demo
 asan:
-        $(CC) -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	$(CC) -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
               $(SRC_LINUX) -o usbmon-asan $(LDFLAGS)
 
 # fully static daemon via musl: no interpreter, no glibc symbol-version
@@ -125,12 +125,12 @@ asan:
 # such dlopen machinery in the first place.)
 usbmon-static: $(SRC_LINUX) src/usbmon.h
 ifneq ($(strip $(MUSL_CC)),)
-        $(MUSL_CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_LINUX) \
+	$(MUSL_CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_LINUX) \
                 -o $@ -static $(LDFLAGS)
 else
-        @echo "usbmon: musl-gcc not found — static build unavailable"
-        @echo "        (install musl-tools: sudo apt-get install musl-tools)"
-        @exit 1
+	@echo "usbmon: musl-gcc not found — static build unavailable"
+	@echo "        (install musl-tools: sudo apt-get install musl-tools)"
+	@exit 1
 endif
 
 static: usbmon-static
@@ -141,37 +141,37 @@ static: usbmon-static
 # glibc-baseline usbmon-toast is NEVER overwritten by a rebuild here.
 # usbmon-toast is built only if missing (requires X11/Xft dev files).
 dist: usbmon
-        @echo ">> packaging $(DIST_NAME) (version $(VERSION))"
-        @rm -rf dist
-        @mkdir -p dist/$(DIST_NAME)
-        @if [ -f usbmon-static ]; then \
+	@echo ">> packaging $(DIST_NAME) (version $(VERSION))"
+	@rm -rf dist
+	@mkdir -p dist/$(DIST_NAME)
+	@if [ -f usbmon-static ]; then \
                 cp usbmon-static dist/$(DIST_NAME)/usbmon; \
                 echo ">> daemon: musl STATIC build (self-contained, no interpreter)"; \
-        else \
+	else \
                 echo ">> WARNING: usbmon-static missing — shipping DYNAMIC daemon,"; \
                 echo ">>          glibc symbol baseline of this build host applies."; \
                 cp usbmon dist/$(DIST_NAME)/usbmon; \
-        fi
-        @if [ ! -f usbmon-toast ]; then \
+	fi
+	@if [ ! -f usbmon-toast ]; then \
                 echo ">> usbmon-toast missing — building it now (needs X11/Xft)"; \
                 $(MAKE) --no-print-directory usbmon-toast || true; \
-        fi
-        @if [ -f usbmon-toast ]; then \
+	fi
+	@if [ -f usbmon-toast ]; then \
                 cp usbmon-toast dist/$(DIST_NAME)/; \
                 echo ">> toast: dynamic (needs libX11/libXft/fontconfig at runtime)"; \
-        else \
+	else \
                 echo ">> toast: not packaged (X11/Xft dev files absent)"; \
-        fi
-        @cp README.md LICENSE dist/$(DIST_NAME)/
-        @strip dist/$(DIST_NAME)/usbmon \
+	fi
+	@cp README.md LICENSE dist/$(DIST_NAME)/
+	@strip dist/$(DIST_NAME)/usbmon \
                 $(if $(wildcard usbmon-toast),dist/$(DIST_NAME)/usbmon-toast,)
-        @tar -C dist --owner=0 --group=0 -czf dist/$(DIST_NAME).tar.gz $(DIST_NAME)
-        @cd dist && sha256sum "$(DIST_NAME).tar.gz" > SHA256SUMS.txt
-        @cd dist/$(DIST_NAME) && sha256sum usbmon \
+	@tar -C dist --owner=0 --group=0 -czf dist/$(DIST_NAME).tar.gz $(DIST_NAME)
+	@cd dist && sha256sum "$(DIST_NAME).tar.gz" > SHA256SUMS.txt
+	@cd dist/$(DIST_NAME) && sha256sum usbmon \
                 $(if $(wildcard usbmon-toast),usbmon-toast,) >> ../SHA256SUMS.txt
-        @echo ">> dist artifacts:"
-        @ls -la dist/
-        @cat dist/SHA256SUMS.txt
+	@echo ">> dist artifacts:"
+	@ls -la dist/
+	@cat dist/SHA256SUMS.txt
 
 # Windows exe: strict, fully static, GUI subsystem.  Requires mingw-w64:
 #   sudo apt-get install gcc-mingw-w64-x86-64
@@ -179,10 +179,10 @@ dist: usbmon
 # res/usbmon.ico (embedded tray/executable icon) is committed; regenerate
 # with tools/make_icon.py.  windres ships with the mingw binutils.
 res/usbmon.res.o: res/usbmon.rc res/usbmon.ico
-        $(CROSS)windres res/usbmon.rc -O coff -o $@
+	$(CROSS)windres res/usbmon.rc -O coff -o $@
 
 windows: $(SRC_WIN) src/usbmon.h res/usbmon.res.o
-        $(CROSS)gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_WIN) \
+	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_WIN) \
             res/usbmon.res.o -o usbmon.exe $(LDFLAGS) -mwindows -static \
             -luser32 -lgdi32 -lshell32 -ladvapi32 -lcfgmgr32 -lsetupapi
 
@@ -191,24 +191,24 @@ windows: $(SRC_WIN) src/usbmon.h res/usbmon.res.o
 # dist-windows only appends so one checksum file covers both platforms.
 DIST_NAME_WIN := usbmon-$(VERSION)-windows-amd64
 dist-windows: windows
-        @echo ">> packaging $(DIST_NAME_WIN) (version $(VERSION))"
-        @mkdir -p dist/$(DIST_NAME_WIN)
-        @cp usbmon.exe dist/$(DIST_NAME_WIN)/
-        @cp README.md LICENSE dist/$(DIST_NAME_WIN)/
-        @if command -v $(CROSS)strip >/dev/null 2>&1; then \
+	@echo ">> packaging $(DIST_NAME_WIN) (version $(VERSION))"
+	@mkdir -p dist/$(DIST_NAME_WIN)
+	@cp usbmon.exe dist/$(DIST_NAME_WIN)/
+	@cp README.md LICENSE dist/$(DIST_NAME_WIN)/
+	@if command -v $(CROSS)strip >/dev/null 2>&1; then \
                 $(CROSS)strip dist/$(DIST_NAME_WIN)/usbmon.exe; \
-        else \
+	else \
                 echo '>> NOTE: cross-strip missing, shipping unstripped exe'; \
-        fi
-        @cd dist && zip -q -r "$(DIST_NAME_WIN).zip" "$(DIST_NAME_WIN)"
-        @cd dist && sha256sum "$(DIST_NAME_WIN).zip" >> SHA256SUMS.txt
-        @echo ">> dist artifacts:"
-        @ls -la dist/
-        @cat dist/SHA256SUMS.txt
+	fi
+	@cd dist && zip -q -r "$(DIST_NAME_WIN).zip" "$(DIST_NAME_WIN)"
+	@cd dist && sha256sum "$(DIST_NAME_WIN).zip" >> SHA256SUMS.txt
+	@echo ">> dist artifacts:"
+	@ls -la dist/
+	@cat dist/SHA256SUMS.txt
 
 clean:
-        rm -f usbmon usbmon-toast usbmon-asan usbmon-static usbmon.exe
-        rm -f res/usbmon.res.o
-        rm -f tests/ui_test tests/enum_test
-        rm -f out-toast-*.svg
-        rm -rf dist
+	rm -f usbmon usbmon-toast usbmon-asan usbmon-static usbmon.exe
+	rm -f res/usbmon.res.o
+	rm -f tests/ui_test tests/enum_test
+	rm -f out-toast-*.svg
+	rm -rf dist
