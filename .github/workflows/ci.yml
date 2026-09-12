@@ -114,8 +114,15 @@ jobs:
             || { echo "usbmon.exe does not even import KERNEL32?"; exit 1; }
           echo "$IMPORTS" | grep -qi 'setupapi' \
             || { echo "SetupAPI not imported — um_enum.c evidence layer missing from the build?"; exit 1; }
-          echo "$IMPORTS" | grep -qi 'cfgmgr32' \
-            || { echo "cfgmgr32 not imported — has_usb_ancestor() parent-chain walk missing?"; exit 1; }
+          # CM_* (parent-chain walk) must be linked in: either bound directly
+          # to CFGMGR32.dll (our link order prefers -lcfgmgr32), or through
+          # setupapi.dll's cfgmgr32 forwarders — mingw's libsetupapi.a also
+          # provides CM_* stubs, so the binding library depends on toolchain.
+          # Either way the windows-latest job proves the imports resolve.
+          if ! echo "$IMPORTS" | grep -qi 'cfgmgr32'; then
+            x86_64-w64-mingw32-objdump -p usbmon.exe | grep -q 'CM_Locate_DevNodeW' \
+              || { echo "neither cfgmgr32 import nor CM_* entries — has_usb_ancestor() parent-chain walk missing?"; exit 1; }
+          fi
           BAD=$(echo "$IMPORTS" | grep -Ei 'libgcc|winpthread|libstdc|mingw' || true)
           if [ -n "$BAD" ]; then
             echo "usbmon.exe needs a non-system runtime DLL: $BAD"
