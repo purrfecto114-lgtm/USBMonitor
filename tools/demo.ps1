@@ -295,6 +295,20 @@ namespace UsbmonDemo {
             }, IntPtr.Zero);
             return pids;
         }
+        public static List<long> WindowsByClassAndPid(string className, uint pid) {
+            var hwnds = new List<long>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                var sb = new StringBuilder(64);
+                GetClassName(h, sb, 64);
+                if (sb.ToString() == className) {
+                    uint wpid;
+                    GetWindowThreadProcessId(h, out wpid);
+                    if (wpid == pid) hwnds.Add(h.ToInt64());
+                }
+                return true;
+            }, IntPtr.Zero);
+            return hwnds;
+        }
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool PostMessageW(IntPtr hWnd, uint msg,
             UIntPtr wParam, IntPtr lParam);
@@ -371,7 +385,11 @@ $procP = Start-Process -FilePath $ExePath `
 Start-Sleep -Seconds 2
 
 # 16) panel window exists and belongs to this daemon instance
-$panelHwnd = [UsbmonDemo.Win32]::FindWindowW("usbmonToast2", $null)
+$panelHwnd = [IntPtr]::Zero
+foreach ($h in [UsbmonDemo.Win32]::WindowsByClassAndPid("usbmonToast2", [uint32]$procP.Id)) {
+    $panelHwnd = [IntPtr]$h
+    break
+}
 if ($panelHwnd -ne [IntPtr]::Zero) {
     $panelOwner = [UsbmonDemo.Win32]::WindowPid($panelHwnd)
     if ($panelOwner -eq [uint32]$procP.Id) {
@@ -607,11 +625,14 @@ if ($hwnd -ne [IntPtr]::Zero) {
     } else {
         Bad "async eject chain left no result in the tray log"
     }
-    $toastHwnd = [UsbmonDemo.Win32]::FindWindowW("usbmonToast", $null)
-    if ($toastHwnd -ne [IntPtr]::Zero) {
-        Ok "eject progress/result toast window exists (class usbmonToast)"
+    $toastWnds = [UsbmonDemo.Win32]::WindowsByClassAndPid("usbmonToast", [uint32]$proc2.Id)
+    if ($toastWnds.Count -gt 0) {
+        Ok "eject progress/result toast window exists (class usbmonToast, pid $($proc2.Id))"
     } else {
-        Bad "no usbmonToast window after the eject test"
+        # surface the C-side toast diagnostics (um_tray_test_log lines) so
+        # CI failures are diagnosable from the run log alone
+        $toastDiag = (Read-TrayLog) -split "`n" | Where-Object { $_ -match '^toast ' } | Select-Object -Last 4
+        Bad "no usbmonToast window (pid $($proc2.Id)) after the eject test; C diagnostics: $($toastDiag -join ' | ')"
     }
     if (-not $proc2.HasExited) {
         Ok "daemon still alive after async eject (GUI thread never blocked)"
