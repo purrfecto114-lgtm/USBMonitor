@@ -271,8 +271,8 @@ ToastWindow 同源的**完整设备面板**：
 `.github/workflows/release.yml`）到默认分支时，`release.yml` 自动完成：
 
 1. 版本一致性校验（usbmon.h ↔ CHANGELOG 章节）+ 已存在 release 安全跳过
-2. Linux：严格构建 + musl 静态 + 18 断言回归（含启动项 CLI 往返）×2 + bullseye 基线
-   toast + Xvfb GUI 回归 → 打包 tarball
+2. Linux：严格构建 + musl 静态 + 18 断言回归（含启动项 CLI 往返）×2 + glibc 2.31
+   基线 toast（ubuntu:20.04 focal 容器）+ Xvfb GUI 回归 → 打包 tarball
 3. Windows：mingw-w64 静态构建（`-Werror` 零警告）+ PE import 自包含
    断言（不得出现 libgcc/libwinpthread 等运行时 DLL）
 4. **windows-latest 真机验证**：`tools/demo.ps1` 24 项断言门禁（CLI/日志/

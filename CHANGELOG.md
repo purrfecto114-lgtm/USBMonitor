@@ -90,6 +90,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   动作）——与托盘测试同一"注入真实窗口消息"方法论
 - `tools/demo.sh` 断言 11 → 18 项：新增 Linux 启动项 CLI 往返（隔离
   HOME，XDG autostart 桌面文件出现/Exec 内容/移除 + 状态翻转）
+- **toast 助手 glibc 2.31 基线构建从 `debian:bullseye` 迁至 `ubuntu:20.04
+  focal`**（同为 glibc 2.31，基线断言不变）：bullseye 于 2026-08 退出
+  LTS 后镜像持续腐化——过期且内部不一致的索引、被清空的 pool、
+  archive 无 bullseye-security、镜像预装版本高于冻结归档导致降级战；
+  focal 在 archive.ubuntu.com 上仍是活的一致套件，构建回归纯安装
 - `ci.yml`/`release.yml`：Linux job 新增 selftest 步骤；build-windows
   新增 SetupAPI/cfgmgr32 导入存在性断言（防采集层被误排除出链接）
 - `Makefile`：`windows` 目标纳入三个新源文件并链接 `-lsetupapi

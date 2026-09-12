@@ -106,28 +106,24 @@ jobs:
       - name: "Hooks e2e regression — musl static build (18 assertions)"
         run: USBMON=./usbmon-static bash tools/demo.sh
 
-      - name: "Build toast helper on a glibc 2.31 baseline (debian:bullseye)"
+      - name: "Build toast helper on a glibc 2.31 baseline (ubuntu:20.04 focal)"
         run: |
           set -eu
-          docker run --rm -v "$PWD:/src" -w /src debian:bullseye bash -eu -c '
-              # bullseye left LTS (2026-08) and its mirrors are rotting:
-              # deb.debian.org serves a stale expired bullseye-security index
-              # whose pool has been swept (package fetches 404), and
-              # archive.debian.org has no bullseye-security at all. The main
-              # archive, however, is frozen-and-consistent and carries every
-              # package this build needs (gcc/libc6-dev/libx11-dev/libxft-dev/
-              # libfontconfig1-dev) — so use ONLY archive bullseye main.
+          docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -eu -c '
+              # bullseye mirrors are rotting post-LTS (stale inconsistent
+              # indexes, swept pools, no archive-security) — the debian
+              # dance needed downgrade fights against the image packages.
+              # Ubuntu focal serves the same glibc 2.31 with LIVE, consistent
+              # suites on archive.ubuntu.com, so the build is a plain install.
+              # main+updates carry every package this build needs.
               printf "%s\n" \
-                "deb [check-valid-until=no] http://archive.debian.org/debian bullseye main" \
+                "deb http://archive.ubuntu.com/ubuntu focal main universe" \
+                "deb http://archive.ubuntu.com/ubuntu focal-updates main universe" \
                 > /etc/apt/sources.list
               rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
-              apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update -qq
-              # the debian:bullseye image ships security-era versions newer
-              # than the frozen archive (libc6 uX vs base) — allow apt to
-              # downgrade everything to the consistent archive set
-              apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 \
-                  install -y --no-install-recommends --allow-downgrades \
-                  gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev
+              apt-get -o Acquire::Retries=5 update -qq
+              apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                  gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev pkg-config
               gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
                   $(pkg-config --cflags x11 xft) src/gui_toast.c \
                   -o /src/usbmon-toast $(pkg-config --libs x11 xft)
