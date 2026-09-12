@@ -122,7 +122,11 @@ jobs:
                 > /etc/apt/sources.list
               rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
               apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update -qq
-              apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 install -y -qq --no-install-recommends \
+              # the debian:bullseye image ships security-era versions newer
+              # than the frozen archive (libc6 uX vs base) — allow apt to
+              # downgrade everything to the consistent archive set
+              apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 \
+                  install -y --no-install-recommends --allow-downgrades \
                   gcc libc6-dev libx11-dev libxft-dev libfontconfig1-dev
               gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror \
                   $(pkg-config --cflags x11 xft) src/gui_toast.c \
