@@ -62,10 +62,21 @@ typedef struct {
     DWORD dwFlags;
 } MONITORINFO;
 
+/* 跟踪尺寸：生产代码在 WM_GETMINMAXINFO 里放宽上下限，保证自绘窗口
+ * 可以任意 SetWindowPos 放大（DPI 缩放后尺寸可能超过样式派生上限）。 */
+typedef struct {
+    POINT ptReserved;
+    POINT ptMaxSize;
+    POINT ptMaxPosition;
+    POINT ptMinTrackSize;
+    POINT ptMaxTrackSize;
+} MINMAXINFO;
+
 #define WM_CREATE        0x0001
 #define WM_DESTROY       0x0002
 #define WM_PAINT         0x000F
 #define WM_ERASEBKGND    0x0014
+#define WM_GETMINMAXINFO 0x0024
 #define WM_TIMER         0x0113
 #define WM_MOUSEMOVE     0x0200
 #define WM_LBUTTONUP     0x0202
