@@ -12,7 +12,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - **多显示器与工作区钳制**：通知锚定在光标所在显示器的工作区右下角，自动避开任务栏。
 - **小屏 fit 收缩**：当设计尺寸超过工作区 70%（宽）/ 85%（高）时整体等比缩小，最低 0.05 倍，避免超出屏幕。
 - **推荐宽度 `um_toast_suggest_width`**：按标题 16px / 副标 12px / 摘要 13px 三种字号分别实测文本宽度推导窗口宽度，夹在 300–440px，文本不再被省略号截断。
-- **槽位布局 `um_toast_win_move_slot`**：同屏多条通知按 12px 间距向上堆叠并钳制在工作区内。
+- **槽位布局 `um_toast_win_move_slot` / `um_toast_win_move_slot_ex`**：同屏多条通知按 12px 间距向上堆叠并钳制在工作区内；设备面板可见时通知整体叠到面板上方（基线 `base_px = um_toast_win_pixel_height(panel)`，面板与首条通知之间再留 12px 间隙，两段间隙均按 fit 缩放），面板不可见时回右下角。
 
 ### Changed
 
