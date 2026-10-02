@@ -201,10 +201,12 @@ int um_toast_measure_height(const um_toast_model *m, const um_toast_state *s)
         }
     }
     h += rows_h;
-    /* 与 1.1.1 一致：min(max(自然高度, 205), 目标高度) */
+    /* 与 1.1.1 一致：min(max(自然高度, 205), 目标高度)。
+     * 0 行（纯文字通知 / 信息框）例外：205 的下限来自"至少放得下一行设备"
+     * 的经验值，对文字通知只会留出 57px 空行区 —— 按自然高度收缩。 */
     {
         int target = s->expanded ? UM_UI_EXPANDED_H : UM_UI_COLLAPSED_H;
-        if (h < 205) h = 205;
+        if (m->n_rows > 0 && h < 205) h = 205;
         if (h > target) h = target;
     }
     return h;
@@ -318,6 +320,20 @@ void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
             }
         }
         (void)clip_h;
+    }
+
+    /* ---- 0 行 = 纯文字信息框 ---- */
+    if (m->n_rows == 0) {
+        /* 不画 展开/关闭/打开：整窗点击即关闭（后端在 hit miss 时发 CLOSE），
+         * Esc 亦可。底部只留倒计时，于是宽度可以按文案实测收窄到 300，
+         * 不会出现倒计时压住"关闭"按钮的排版。 */
+        char cd[64];
+        if (s->paused) snprintf(cd, sizeof cd, "%s", "已暂停");
+        else if (m->status[0]) snprintf(cd, sizeof cd, "%s", "");
+        else um_ui_countdown(s->remaining_ms, cd, sizeof cd);
+        push_text(out, width - p * 2 - 130, btn_y + 13, 124, UM_F_SMALL,
+                  t->muted, UM_A_RIGHT, cd);
+        return;
     }
 
     /* ---- 底栏按钮 ---- */

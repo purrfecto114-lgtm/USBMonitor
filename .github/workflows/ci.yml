@@ -32,7 +32,7 @@ jobs:
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
 
-      - name: "Panel UI kernel + evidence layer tests (164 assertions, win32_shim)"
+      - name: "Panel UI kernel + evidence layer tests (win32_shim)"
         run: make selftest
 
       - name: "Smoke test (--version / --list)"

@@ -19,10 +19,13 @@
  *     GUI thread copies it into the panel, re-anchors bottom-right and
  *     restarts the fade/countdown.  Panel buttons call back into the
  *     SAME volume actions the tray menus use (tray_win32.c).
- *   - top-level TEXT toast windows (WS_POPUP | WS_EX_TOPMOST | tool
- *     window, class "usbmonToast"): tray action feedback (eject result,
- *     startup toggle) and the fallback when the evidence layer yields
- *     nothing, so an event is never silently dropped.
+ *   - 0-row NOTIFICATION panels (SAME window class and draw path as
+ *     the device panel, class "usbmonToast2", window title
+ *     "usbmon-toast"): tray action feedback (eject result, startup
+ *     toggle) and the fallback when the evidence layer yields
+ *     nothing, so an event is never silently dropped.  Since 2.5.0
+ *     these are no longer a separate GDI toast window: one renderer
+ *     means text can no longer overflow, overlap, or ignore DPI.
  *
  * user32/gdi32/setupapi/cfgmgr32 ship with every Windows install, so
  * unlike POSIX there is no reason to split rendering into a helper
@@ -43,43 +46,14 @@
 
 #include <windows.h>
 #include <dbt.h>           /* DEV_BROADCAST_*, DBT_* (device-change events) */
-#include <wchar.h>         /* wcslen, wcscpy_s */
 #include <string.h>
 #include <stdlib.h>
 
 /* UMWM_TOAST / UMWM_QUIT / UMWM_TRAY* come from usbmon.h (numeric,
  * WM_APP-based) so tray_win32.c and this file agree on every id. */
 
-/* ---------------------------------------------------------------- palette */
-
-#define TW_BG       RGB(0x22, 0x27, 0x2e)
-#define TW_BORDER   RGB(0x3a, 0x41, 0x50)
-#define TW_TITLE    RGB(0xf2, 0xf4, 0xf7)
-#define TW_BODY     RGB(0xc9, 0xce, 0xd6)
-#define TW_DIM      RGB(0x8b, 0x92, 0x9c)
-#define TW_ACC_ADD  RGB(0x35, 0xb4, 0x6a)
-#define TW_ACC_RM   RGB(0x8b, 0x92, 0x9c)
-
-#define TW_WIDTH        400
-#define TW_PAD          14
-#define TW_TITLE_H      26
-#define TW_LINE_H       18
-#define TW_MARGIN_R     24
-#define TW_MARGIN_B     48
-#define TW_SLOT_GAP     12
-
 /* ------------------------------------------------------------------ types */
 
-typedef struct {
-    int   is_add;
-    int   ttl;
-    int   slot;
-    wchar_t lines[6][192];
-    int   n_lines;
-    int   n_dim_from;       /* lines from this index on are dim-colored */
-} toast_data;
-
-static const wchar_t *g_class_toast  = L"usbmonToast";
 static const wchar_t *g_class_listen = L"usbmonListen";
 
 /* ------------------------------------------------------------------ panel -- */
@@ -90,7 +64,17 @@ static um_toast_win *g_panel;      /* single instance; events refresh it */
  * into an occupied slot replaces it in place — that is how the async-eject
  * "正在安全弹出" progress line is upgraded to the final result without
  * stacking a second window on top. */
-static HWND g_slot_win[UM_GUI_SLOTS];
+static um_toast_win *g_slot_win[UM_GUI_SLOTS];
+
+/* UMWM_TOAST marshaling envelope (same shape as UMWM_PANEL): the daemon
+ * / worker thread builds it on the heap, the GUI thread consumes and
+ * frees it (directly on post failure, or from toast_action_cb when the
+ * toast closes / auto-hides).  ttl_s == 0 -> backend default 10s. */
+typedef struct {
+    um_toast_model model;
+    int            slot;
+    int            ttl_s;
+} toast_carrier;
 
 /* USBMON_PANEL_TEST=path (test-only, same pattern as USBMON_TRAY_TEST):
  *   - evidence comes from a fixed 3-device set instead of the machine
@@ -282,153 +266,88 @@ static void panel_action_cb(um_toast_action act, int row, void *user)
 
 /* --------------------------------------------------------------- helpers -- */
 
-static void wcopy(const char *utf8, wchar_t *out, size_t n)
+/* ------------------------------------------- notification (0-row panel) -- */
+
+/* 0-row um_toast_model = pure-text notification: headline / subtitle / summary
+ * are the entire content, drawn by the panel kernel (rounded corners, fade,
+ * theme colors, ellipsis) so it cannot overflow or overlap. */
+static void toast_model_init(um_toast_model *m, const char *headline,
+                             const char *subtitle, const char *summary,
+                             int accent_kind)
 {
-    um_utf8_to_wide(utf8 ? utf8 : "", out, (int)n);
+    memset(m, 0, sizeof *m);
+    snprintf(m->headline, sizeof m->headline, "%s", headline ? headline : "");
+    snprintf(m->subtitle, sizeof m->subtitle, "%s", subtitle ? subtitle : "");
+    snprintf(m->summary,  sizeof m->summary,  "%s", summary  ? summary  : "");
+    m->accent_kind = accent_kind;
+    m->n_rows = 0;
 }
 
-/* Build the toast text (zh labels, same content as the Linux helper). */
-static toast_data *toast_data_make(const um_device *dev, int is_add, um_gui *g)
+/* Device add/remove fallback notification (used when the evidence layer
+ * yields nothing, i.e. the panel model would be empty).  Same content and
+ * wording as the pre-2.5.0 text toast: title + model(key) + size / mount /
+ * serial, joined into summary so the kernel lays it out. */
+static void toast_model_device(um_toast_model *m, const um_device *dev,
+                               int is_add, um_gui *g)
 {
-    toast_data *td = malloc(sizeof *td);
-    char buf[512];
-    wchar_t wbuf[192];
-    if (!td) return NULL;
-    memset(td, 0, sizeof *td);
-    td->is_add = is_add;
-    td->ttl = g->toast_ttl;
-    td->slot = g->slot_seq % UM_GUI_SLOTS;
-    g->slot_seq++;
+    char buf[512] = "";
+    char what[192];
+    const char *serial;
 
-    wcscpy_s(td->lines[td->n_lines], 192, is_add ? L"USB 设备已插入"
-                                                 : L"USB 设备已拔出");
-    td->n_lines++;
-
-    if (dev->model[0])
-        snprintf(buf, sizeof buf, "%s (%s)", dev->model, dev->key);
-    else
-        snprintf(buf, sizeof buf, "%s",
-                 dev->key[0] ? dev->key : "USB 存储设备");
-    wcopy(buf, wbuf, 192);
-    wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-    td->n_lines++;
-
-    if (is_add) {
-        if (dev->size_bytes > 0) {
-            char sz[32];
-            um_human_size(dev->size_bytes, sz, sizeof sz);
-            if (dev->partition_count > 0)
-                snprintf(buf, sizeof buf, "容量 %s · %d 个分区",
-                         sz, dev->partition_count);
-            else
-                snprintf(buf, sizeof buf, "容量 %s", sz);
-            wcopy(buf, wbuf, 192);
-            wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-            td->n_lines++;
-        }
-        if (dev->mount[0]) snprintf(buf, sizeof buf, "挂载点 %s", dev->mount);
-        else               snprintf(buf, sizeof buf, "%s", "未挂载");
-        wcopy(buf, wbuf, 192);
-        wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-        td->n_lines++;
-
-        {
-            const char *serial = (g->raw_serial && dev->serial[0])
-                                 ? dev->serial : dev->serial_fp;
-            if (serial[0]) {
-                snprintf(buf, sizeof buf, "序列 %s", serial);
-                wcopy(buf, wbuf, 192);
-                wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-                td->n_lines++;
-            }
-        }
+    snprintf(what, sizeof what, "%s",
+             dev->model[0] ? dev->model
+                            : (dev->key[0] ? dev->key : "USB 存储设备"));
+    toast_model_init(m, is_add ? "USB 设备已插入" : "USB 设备已拔出",
+                     what, "", is_add ? 1 : 3);
+    if (!is_add) return;
+    if (dev->model[0] && dev->key[0])
+        snprintf(m->subtitle, sizeof m->subtitle, "%s (%s)",
+                 dev->model, dev->key);
+    if (dev->size_bytes > 0) {
+        char sz[32], part[96];
+        um_human_size(dev->size_bytes, sz, sizeof sz);
+        if (dev->partition_count > 0)
+            snprintf(part, sizeof part, "容量 %s · %d 个分区",
+                     sz, dev->partition_count);
+        else
+            snprintf(part, sizeof part, "容量 %s", sz);
+        strncat(buf, part, sizeof buf - strlen(buf) - 1);
     }
-    td->n_dim_from = 2;      /* first two lines: title + model */
-    return td;
+    {
+        char part[192];
+        snprintf(part, sizeof part, "挂载点 %s",
+                 dev->mount[0] ? dev->mount : "未挂载");
+        if (buf[0]) strncat(buf, " · ", sizeof buf - strlen(buf) - 1);
+        strncat(buf, part, sizeof buf - strlen(buf) - 1);
+    }
+    serial = (g->raw_serial && dev->serial[0]) ? dev->serial : dev->serial_fp;
+    if (serial[0]) {
+        char part[192];
+        snprintf(part, sizeof part, "序列 %s", serial);
+        if (buf[0]) strncat(buf, " · ", sizeof buf - strlen(buf) - 1);
+        strncat(buf, part, sizeof buf - strlen(buf) - 1);
+    }
+    snprintf(m->summary, sizeof m->summary, "%s", buf);
 }
 
-/* ---------------------------------------------------------- toast window -- */
-
-static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
+/* Notification action: only CLOSE and AUTOHIDE ever fire (whole-window click
+ * on a 0-row model, Esc, or the countdown expiring).  Both mean the same
+ * thing here -- destroy the window and release the envelope.  Runs on the
+ * GUI thread, inside the backend's callback, so touching g_slot_win is safe. */
+static void toast_action_cb(um_toast_action act, int row, void *user)
 {
-    switch (msg) {
-    case WM_CREATE: {
-        CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
-        SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        SetTimer(hw, 1, ((toast_data *)cs->lpCreateParams)->ttl * 1000, NULL);
-        return 0;
-    }
-    case WM_PAINT: {
-        toast_data *td = (toast_data *)GetWindowLongPtrW(hw, GWLP_USERDATA);
-        PAINTSTRUCT ps;
-        HDC hdc;
-        RECT rc, rc_bar;
-        HBRUSH bg, bar;
-        HPEN border;
-        int i;
-
-        if (!td) return 0;
-        hdc = BeginPaint(hw, &ps);
-        GetClientRect(hw, &rc);
-
-        bg     = CreateSolidBrush(TW_BG);
-        bar    = CreateSolidBrush(td->is_add ? TW_ACC_ADD : TW_ACC_RM);
-        border = CreatePen(PS_SOLID, 1, TW_BORDER);
-        FillRect(hdc, &rc, bg);
-        rc_bar = rc;
-        rc_bar.right = 4;
-        FillRect(hdc, &rc_bar, bar);
-        SelectObject(hdc, border);
-        MoveToEx(hdc, rc.left, rc.top, NULL);
-        LineTo(hdc, rc.right - 1, rc.top);
-        LineTo(hdc, rc.right - 1, rc.bottom - 1);
-        LineTo(hdc, rc.left, rc.bottom - 1);
-        LineTo(hdc, rc.left, rc.top);
-
-        SetBkMode(hdc, TRANSPARENT);
-        for (i = 0; i < td->n_lines; i++) {
-            COLORREF col = TW_TITLE;
-            int h = TW_LINE_H;
-            if (i == 0) {
-                HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-                SelectObject(hdc, f);
-                h = TW_TITLE_H;
-            } else {
-                HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-                SelectObject(hdc, f);
-                col = (i < td->n_dim_from) ? TW_BODY : TW_DIM;
-            }
-            SetTextColor(hdc, col);
-            TextOutW(hdc, TW_PAD + 4, TW_PAD + i * h, td->lines[i],
-                     (int)wcslen(td->lines[i]));
+    toast_carrier *c = (toast_carrier *)user;
+    (void)row;
+    if (!c) return;
+    if (act == UM_ACT_CLOSE || act == UM_ACT_AUTOHIDE) {
+        if (c->slot >= 0 && c->slot < UM_GUI_SLOTS && g_slot_win[c->slot]) {
+            um_toast_win_destroy(g_slot_win[c->slot]);
+            g_slot_win[c->slot] = NULL;
         }
-
-        DeleteObject(bg);
-        DeleteObject(bar);
-        DeleteObject(border);
-        EndPaint(hw, &ps);
-        return 0;
+        free(c);
     }
-    case WM_LBUTTONDOWN:
-        DestroyWindow(hw);
-        return 0;
-    case WM_TIMER:
-        DestroyWindow(hw);
-        return 0;
-    case WM_DESTROY: {
-        toast_data *td = (toast_data *)GetWindowLongPtrW(hw, GWLP_USERDATA);
-        if (td) {
-            if (td->slot >= 0 && td->slot < UM_GUI_SLOTS &&
-                g_slot_win[td->slot] == hw)
-                g_slot_win[td->slot] = NULL;
-            free(td);
-        }
-        SetWindowLongPtrW(hw, GWLP_USERDATA, 0);
-        return 0;
-    }
-    }
-    return DefWindowProcW(hw, msg, wp, lp);
 }
+
 
 /* -------------------------------------------------------- listener window -- */
 
@@ -463,7 +382,7 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
     WNDCLASSW wc;
     HWND listener;
     MSG msg;
-    ATOM at, al;
+    ATOM al;
 
     /* Register the PANEL window class (usbmonToast2) BEFORE the loop:
      * the first UMWM_PANEL creates the panel via um_toast_win_new, which
@@ -473,15 +392,6 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
      * an unregistered class).  NULL hinstance -> resolved to this exe. */
     if (!um_toast_win_init(NULL))
         um_tray_test_log("panel", "class register fail");
-
-    memset(&wc, 0, sizeof wc);
-    wc.lpfnWndProc = toast_proc;
-    wc.hInstance = GetModuleHandleW(NULL);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = g_class_toast;
-    at = RegisterClassW(&wc);
-    (void)at;
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = listen_proc;
@@ -506,47 +416,66 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (msg.message == UMWM_TOAST) {
-            toast_data *td = (toast_data *)msg.lParam;
-            if (td) {
-                int sw = GetSystemMetrics(SM_CXSCREEN);
-                int sh = GetSystemMetrics(SM_CYSCREEN);
-                int h = TW_PAD + TW_TITLE_H +
-                        (td->n_lines - 1) * TW_LINE_H + TW_PAD;
-                int x = sw - TW_WIDTH - TW_MARGIN_R;
-                int y = sh - h - TW_MARGIN_B - td->slot * (h + TW_SLOT_GAP);
-                /* slot re-use replaces the previous toast in place */
-                if (td->slot >= 0 && td->slot < UM_GUI_SLOTS &&
-                    g_slot_win[td->slot]) {
-                    DestroyWindow(g_slot_win[td->slot]);
-                    g_slot_win[td->slot] = NULL;
+            /* Heap toast_carrier (0-row um_toast_model): destroy whatever
+             * occupies the slot, create the kernel window, show it, then
+             * offset it by the slot.  All geometry/anchoring is the
+             * backend's job now (work-area clamp + PerMonitorV2 DPI). */
+            toast_carrier *c = (toast_carrier *)msg.lParam;
+            if (c) {
+                um_theme th;
+                int slot = c->slot;
+                if (slot < 0 || slot >= UM_GUI_SLOTS) {
+                    free(c);
+                    continue;
                 }
-                HWND t = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                                         g_class_toast, L"usbmon-toast",
-                                         WS_POPUP,
-                                         x, y, TW_WIDTH, h,
-                                         NULL, NULL, GetModuleHandleW(NULL),
-                                         td);
-                if (t) {
-                    if (td->slot >= 0 && td->slot < UM_GUI_SLOTS)
-                        g_slot_win[td->slot] = t;
-                    ShowWindow(t, SW_SHOWNOACTIVATE);
-                    UpdateWindow(t);
-                    {
-                        char dbg[48];
-                        snprintf(dbg, sizeof dbg, "create ok slot=%d",
-                                 td->slot);
+                if (g_slot_win[slot]) {
+                    um_toast_win *old_w = g_slot_win[slot];
+                    void *old_user = um_toast_win_user(old_w);
+                    um_toast_win_destroy(old_w);
+                    g_slot_win[slot] = NULL;
+                    free(old_user);          /* the carrier was never fired: WM_DESTROY only kills timers */
+                }
+                um_theme_resolve(&th, "auto", um_toast_system_dark());
+                {
+                    um_toast_win *tw = um_toast_win_new(
+                        &c->model, &th, 1,
+                        um_toast_suggest_width(&c->model),
+                        (c->ttl_s > 0) ? c->ttl_s * 1000 : 0,
+                        toast_action_cb, c);
+                    if (tw) {
+                        g_slot_win[slot] = tw;
+                        um_toast_win_show(tw);
+                        {
+                            /* 设备面板可见时，通知整体叠到面板上方（基线 =
+                             * 面板当前物理高度 + 间隙）；否则回到原右下角。
+                             * 2.5.0 统一边距后面板 230px 会完全盖住 148px 的
+                             * 通知，这里显式让位。 */
+                            int base = 0;
+                            if (g_panel) {
+                                HWND ph = (HWND)um_toast_win_hwnd(g_panel);
+                                if (ph && IsWindowVisible(ph))
+                                    base = um_toast_win_pixel_height(g_panel);
+                            }
+                            um_toast_win_move_slot_ex(tw, slot, base);
+                        }
+                        {
+                            char dbg[48];
+                            snprintf(dbg, sizeof dbg, "create ok slot=%d",
+                                     slot);
+                            um_tray_test_log("toast", dbg);
+                        }
+                    } else {
+                        char dbg[64];
+                        snprintf(dbg, sizeof dbg, "create fail gle=%lu slot=%d",
+                                 (unsigned long)GetLastError(), slot);
                         um_tray_test_log("toast", dbg);
+                        free(c);
                     }
-                } else {
-                    char dbg[48];
-                    snprintf(dbg, sizeof dbg, "create fail gle=%lu slot=%d",
-                             (unsigned long)GetLastError(), td->slot);
-                    um_tray_test_log("toast", dbg);
-                    free(td);
                 }
             }
             continue;
         }
+
         if (msg.message == UMWM_PANEL) {
             /* heap um_toast_model built on the daemon thread; copy it in,
              * re-anchor, restart fade+countdown, then free the courier. */
@@ -555,7 +484,8 @@ static DWORD WINAPI gui_thread_main(LPVOID param)
                 if (!g_panel) {
                     um_theme th;
                     um_theme_resolve(&th, "auto", um_toast_system_dark());
-                    g_panel = um_toast_win_new(m, &th, 1, panel_action_cb, g);
+                    g_panel = um_toast_win_new(m, &th, 1, 0, 0,
+                                              panel_action_cb, g);
                     if (!g_panel)
                         um_tray_test_log("panel", "create fail");
                 }
@@ -617,13 +547,19 @@ int um_gui_win_init(um_gui *g)
 /* Fallback/feedback text toast (the pre-2.4 renderer), kept for tray
  * action feedback and for device events when the evidence layer yields
  * nothing (the panel model would be empty). */
-static void text_toast_post(um_gui *g, const um_device *dev, int is_add)
+static void text_toast_post(um_gui *g, const um_device *dev, int is_add,
+                            int slot, int ttl_s)
 {
-    toast_data *td = toast_data_make(dev, is_add, g);
-    if (!td) return;
+    toast_carrier *c = (toast_carrier *)malloc(sizeof *c);
+    if (!c) return;
+    toast_model_device(&c->model, dev, is_add, g);
+    c->slot = (slot >= 0 && slot < UM_GUI_SLOTS) ? slot
+                                                 : (g->slot_seq % UM_GUI_SLOTS);
+    g->slot_seq++;
+    c->ttl_s = (ttl_s > 0) ? ttl_s : g->toast_ttl;
     if (!PostThreadMessageW(g->gui_tid, UMWM_TOAST, (WPARAM)is_add,
-                            (LPARAM)td)) {
-        free(td);            /* GUI thread gone: drop the toast quietly */
+                            (LPARAM)c)) {
+        free(c);            /* GUI thread gone: drop the toast quietly */
     }
 }
 
@@ -647,7 +583,7 @@ void um_gui_win_show(um_gui *g, const um_device *dev, int is_add)
     n = panel_collect_evidence(evs, UM_EVID_MAX);
     if (n <= 0) {
         free(m);
-        text_toast_post(g, dev, is_add);
+        text_toast_post(g, dev, is_add, -1, 0);
         return;
     }
     um_enum_to_model(evs, n, m);
@@ -671,63 +607,36 @@ void um_gui_win_show(um_gui *g, const um_device *dev, int is_add)
 void um_gui_win_notify(um_gui *g, const char *title, const char *body,
                         int accent_ok)
 {
-    toast_data *td = malloc(sizeof *td);
-    wchar_t wbuf[192];
-
-    if (!td) return;
-    memset(td, 0, sizeof *td);
-    td->is_add = accent_ok ? 1 : 0;
-    td->ttl = g->toast_ttl;
-    td->slot = g->slot_seq % UM_GUI_SLOTS;
+    toast_carrier *c = (toast_carrier *)malloc(sizeof *c);
+    if (!c) return;
+    toast_model_init(&c->model, title, "", body, accent_ok ? 1 : 3);
+    c->slot = g->slot_seq % UM_GUI_SLOTS;
     g->slot_seq++;
-
-    wcopy(title, wbuf, 192);
-    wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-    td->n_lines++;
-    if (body && body[0]) {
-        wcopy(body, wbuf, 192);
-        wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-        td->n_lines++;
-    }
-    td->n_dim_from = 1;   /* title bright, body dim */
-
-    if (!PostThreadMessageW(g->gui_tid, UMWM_TOAST, 1, (LPARAM)td))
-        free(td);
+    c->ttl_s = g->toast_ttl;
+    if (!PostThreadMessageW(g->gui_tid, UMWM_TOAST, 1, (LPARAM)c))
+        free(c);
 }
 
 /* Thread-safe variant with EXPLICIT slot and ttl: reads no um_gui state,
- * so worker threads (async safe-eject) may call it — only the immutable
+ * so worker threads (async safe-eject) may call it -- only the immutable
  * gui_tid crosses the thread boundary.  Re-using a slot replaces the
- * previous toast in place (handled on the GUI thread by the message loop). */
+ * previous notification in place (handled on the GUI thread by the
+ * message loop). */
 void um_gui_win_post(unsigned long gui_tid, const char *title,
                      const char *body, int accent_ok, int slot, int ttl)
 {
-    toast_data *td = malloc(sizeof *td);
-    wchar_t wbuf[192];
-
-    if (!td) return;
+    toast_carrier *c = (toast_carrier *)malloc(sizeof *c);
+    if (!c) return;
     if (slot < 0 || slot >= UM_GUI_SLOTS || ttl < 1) {
-        free(td);
+        free(c);
         return;
     }
-    memset(td, 0, sizeof *td);
-    td->is_add = accent_ok ? 1 : 0;
-    td->ttl = ttl;
-    td->slot = slot;
-
-    wcopy(title, wbuf, 192);
-    wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-    td->n_lines++;
-    if (body && body[0]) {
-        wcopy(body, wbuf, 192);
-        wcscpy_s(td->lines[td->n_lines], 192, wbuf);
-        td->n_lines++;
-    }
-    td->n_dim_from = 1;   /* title bright, body dim */
-
-    if (!PostThreadMessageW((DWORD)gui_tid, UMWM_TOAST, 1, (LPARAM)td)) {
+    toast_model_init(&c->model, title, "", body, accent_ok ? 1 : 3);
+    c->slot = slot;
+    c->ttl_s = ttl;
+    if (!PostThreadMessageW((DWORD)gui_tid, UMWM_TOAST, 1, (LPARAM)c)) {
         um_tray_test_log("toast", "post fail");
-        free(td);
+        free(c);
     }
 }
 

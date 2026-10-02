@@ -152,7 +152,7 @@ int main(void)
     um_theme_resolve(&theme, "dark", 1);
     shim_window(NULL, 440, 230);
     CHECK(um_toast_win_init(NULL) == 1);
-    w = um_toast_win_new(&m, &theme, 1, on_action, NULL);
+    w = um_toast_win_new(&m, &theme, 1, 0, 0, on_action, NULL);
     CHECK(w != NULL);
     if (!w) { printf("fatal: no window\n"); return 1; }
     um_toast_win_show(w);
@@ -466,7 +466,7 @@ int main(void)
         mm.rows[0].pct = -1;
         mm.n_rows = 1;
 
-        w2 = um_toast_win_new(&mm, &theme, 1, on_action, NULL);
+        w2 = um_toast_win_new(&mm, &theme, 1, 0, 0, on_action, NULL);
         CHECK(w2 != NULL);
         g_last_act = -1;
         /* 点行：不应触发打开（无盘符设备没有「打开」语义） */
@@ -522,7 +522,7 @@ int main(void)
         }
         mm.n_rows = 10;
 
-        w2 = um_toast_win_new(&mm, &theme, 1, on_action, NULL);
+        w2 = um_toast_win_new(&mm, &theme, 1, 0, 0, on_action, NULL);
         CHECK(w2 != NULL);
         um_toast_win_show(w2);
         CHECK(um_toast_win_is_visible(w2) == 1);
@@ -567,6 +567,153 @@ int main(void)
             CHECK(um_toast_win_is_expanded(w2) == 1);
         }
         um_toast_win_destroy(w2);
+    }
+
+    /* ---- 2.5.0: 0-row notification = the panel kernel, at any DPI ---- */
+
+    printf("== 16. 0-row info box: natural height, no dead 57px band ==\n");
+    {
+        um_toast_model m0;
+        um_toast_state s;
+        memset(&m0, 0, sizeof m0);
+        snprintf(m0.headline, sizeof m0.headline, "%s", "\xe4\xb8\x8d\xe5\x8f\xa3\xe8\xa7\xa3");
+        snprintf(m0.subtitle, sizeof m0.subtitle, "%s", "Kingston DataTraveler (E:)");
+        m0.accent_kind = 3;
+        m0.n_rows = 0;
+        um_toast_state_init(&s, 10000);
+        CHECK(um_toast_measure_height(&m0, &s) == 148);
+        snprintf(m0.status, sizeof m0.status, "%s", "x");
+        CHECK(um_toast_measure_height(&m0, &s) == 166);
+        m0.status[0] = 0;
+
+        /* A row-bearing panel keeps the 205 floor (no regression). */
+        CHECK(um_toast_measure_height(&m, &s) >= 205);
+
+        /* Recommended width: clamped to [300, UM_UI_WIDTH], grows with text. */
+        {
+            um_toast_model m1 = m0;
+            char longline[UM_UI_MAX_TEXT];
+            int w_min = um_toast_suggest_width(&m0);
+            int w_max;
+            memset(longline, 'W', sizeof longline - 1);
+            longline[sizeof longline - 1] = 0;
+            snprintf(m1.summary, sizeof m1.summary, "%s", longline);
+            w_max = um_toast_suggest_width(&m1);
+            CHECK(w_min >= 300 && w_min <= UM_UI_WIDTH);
+            CHECK(w_max == UM_UI_WIDTH);
+            CHECK(w_max > w_min);
+        }
+    }
+
+    printf("== 17. 0-row info box: narrow width, click anywhere closes ==\n");
+    {
+        um_toast_model m0;
+        um_toast_win *wn;
+        int gx, gy, gw, gh;
+        memset(&m0, 0, sizeof m0);
+        snprintf(m0.headline, sizeof m0.headline, "%s", "USB");
+        snprintf(m0.subtitle, sizeof m0.subtitle, "%s", "SanDisk Ultra (Q:\\)");
+        m0.accent_kind = 3;
+        wn = um_toast_win_new(&m0, &theme, 1, 360, 0, on_action, NULL);
+        CHECK(wn != NULL);
+        um_toast_win_show(wn);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw == 360 && gh == 148);
+        /* No expand/close/open buttons on a 0-row model: every point misses,
+         * and a miss means "close" (2.4.0 text-toast semantics). */
+        g_last_act = -1;
+        shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(40 | (110 << 16)));
+        CHECK(g_last_act == UM_ACT_CLOSE);
+        um_toast_win_destroy(wn);
+    }
+
+    printf("== 18. work-area clamp: <=70%% wide / <=85%% tall, no hardcoded px ==\n");
+    {
+        um_toast_win *wc = um_toast_win_new(&m, &theme, 1, 0, 0,
+                                            on_action, NULL);
+        int gx, gy, gw, gh;
+        CHECK(wc != NULL);
+        um_toast_win_show(wc);
+        shim_set_workarea(500, 400);        /* 440x230 does not fit */
+        um_toast_win_show(wc);              /* recomputes fit + re-anchors */
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw <= 350 && gh <= 340);      /* 0.70*500 / 0.85*400 */
+        CHECK(gw < 440 && gh < 230);
+        CHECK(gx >= 0 && gy >= 0);
+        shim_set_workarea(1920, 1040);
+        um_toast_win_show(wc);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw == 440 && gh == 230);      /* back to design size */
+        CHECK(gx == 1920 - 440 - 18 && gy == 1040 - 230 - 18);
+        um_toast_win_destroy(wc);
+    }
+
+    printf("== 19. high DPI: 144dpi scales everything, WM_DPICHANGED live ==\n");
+    {
+        um_toast_win *wd;
+        int gx, gy, gw, gh;
+        shim_set_dpi(144);        /* sampled by GetDeviceCaps in _new */
+        wd = um_toast_win_new(&m, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(wd != NULL);
+        um_toast_win_show(wd);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw == 660 && gh == 345);      /* 440x230 x 144/96 */
+        shim_reset();
+        shim_paint(TEST_HWND);
+        CHECK(shim_font_log_px(0) == 24);   /* title 16px x 1.5 */
+        /* dragged onto a 100%-scale monitor: system sends WM_DPICHANGED */
+        shim_send(TEST_HWND, WM_DPICHANGED, (WPARAM)((96 << 16) | 96), 0);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw == 440 && gh == 230);
+        shim_reset();
+        shim_paint(TEST_HWND);
+        CHECK(shim_font_log_px(0) == 16);
+        /* 75% scale is a legal low dpi and must no longer be clamped to 96 */
+        shim_send(TEST_HWND, WM_DPICHANGED, (WPARAM)((72 << 16) | 72), 0);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw == 330 && gh == 173);      /* 440x230 x 72/96 */
+        um_toast_win_destroy(wd);
+        shim_reset();
+    }
+
+    printf("== 20. slot offset: move_slot stacks by the scaled height ==\n");
+    {
+        um_toast_win *ws = um_toast_win_new(&m, &theme, 1, 0, 0,
+                                            on_action, NULL);
+        int gx0, gy0, gx1, gy1, gw, gh;
+        um_toast_win_show(ws);
+        shim_window_geometry(&gx0, &gy0, &gw, &gh);
+        um_toast_win_move_slot(ws, 1);
+        shim_window_geometry(&gx1, &gy1, &gw, &gh);
+        CHECK(gx1 == gx0);
+        CHECK(gy1 == gy0 - (230 + 12));
+        um_toast_win_move_slot(ws, 0);      /* slot 0 = no-op, geometry untouched */
+        {
+            int gx2, gy2, gw2, gh2;
+            shim_window_geometry(&gx2, &gy2, &gw2, &gh2);
+            CHECK(gx2 == gx1 && gy2 == gy1 && gw2 == gw && gh2 == gh);
+        }
+        um_toast_win_destroy(ws);
+    }
+
+    printf("== 21. hit testing survives fit (physical coords -> design space) ==\n");
+    {
+        um_toast_win *wf;
+        int gx, gy, gw, gh;
+        shim_set_workarea(500, 400);
+        wf = um_toast_win_new(&m, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(wf != NULL);
+        um_toast_win_show(wf);
+        shim_window_geometry(&gx, &gy, &gw, &gh);
+        CHECK(gw < 440);                    /* clamped */
+        /* Click the bottom-right corner of the SHRUNK window: still the
+         * "open" button, because to_logical divides by the same factor. */
+        g_last_act = -1;
+        shim_send(TEST_HWND, WM_LBUTTONUP, 0,
+                  (LPARAM)((gw - UM_UI_PAD - 59) | ((gh - UM_UI_PAD - 21) << 16)));
+        CHECK(g_last_act == UM_ACT_OPEN);
+        um_toast_win_destroy(wf);
+        shim_set_workarea(1920, 1040);
     }
 
     um_toast_win_destroy(w);

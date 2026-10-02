@@ -26,6 +26,12 @@ static int  g_next_obj;
 static void *g_cur_brush;
 static void *g_cur_pen;
 
+/* 注入的"当前显示器"：默认 1920x1080 屏幕 / 1920x1040 工作区 / 96dpi。 */
+static int g_screen_w = 1920, g_screen_h = 1080;
+static int g_work_w = 1920, g_work_h = 1040;
+static int g_dpi = 96;
+static int g_font_px_log[16], g_font_log_n;
+
 #define SHIM_WINOBJ ((HWND)0x1234)
 
 static unsigned long obj_color(void *obj)
@@ -37,7 +43,15 @@ static unsigned long obj_color(void *obj)
 
 /* ------------------------------------------------------------ 仿真 API --- */
 
-void shim_reset(void) { g_ndraws = 0; }
+/* 清空绘制记录 + 恢复默认显示器/DPI 注入（等价"干净的开场"）。 */
+void shim_reset(void)
+{
+    g_ndraws = 0;
+    g_font_log_n = 0;
+    g_screen_w = 1920; g_screen_h = 1080;
+    g_work_w = 1920; g_work_h = 1040;
+    g_dpi = 96;
+}
 
 void shim_set_next_menu_result(int cmd) { g_next_menu_cmd = cmd; }
 
@@ -163,21 +177,76 @@ BOOL TrackMouseEvent(TRACKMOUSEEVENT *t) { (void)t; return 1; }
 
 BOOL ClientToScreen(HWND hw, POINT *p) { (void)hw; (void)p; return 1; }
 
+/* 注入的"当前显示器"：默认 1920x1080 屏幕 / 1920x1040 工作区 / 96dpi。 */
+void shim_set_workarea(int w, int h)
+{
+    if (w < 240) w = 240;
+    if (h < 200) h = 200;
+    g_screen_w = g_work_w = w;
+    g_screen_h = g_work_h = h;
+}
+
+void shim_set_dpi(int dpi) { g_dpi = (dpi >= 16) ? dpi : 96; }
+
+int shim_font_log_count(void) { return g_font_log_n; }
+
+int shim_font_log_px(int idx)
+{
+    return (idx >= 0 && idx < g_font_log_n) ? g_font_px_log[idx] : -1;
+}
+
 BOOL SystemParametersInfoW(UINT a, UINT b, void *c, UINT d)
 {
     (void)b; (void)d;
     if (a == SPI_GETWORKAREA && c) {
         RECT *r = (RECT *)c;
-        r->left = 0; r->top = 0; r->right = 1920; r->bottom = 1040;
+        r->left = 0; r->top = 0; r->right = g_work_w; r->bottom = g_work_h;
         return 1;
     }
     return 0;
 }
 
-int GetSystemMetrics(int i) { return i == SM_CXSCREEN ? 1920 : 1080; }
+int GetSystemMetrics(int i) { return i == SM_CXSCREEN ? g_screen_w : g_screen_h; }
 HDC GetDC(HWND hw) { (void)hw; return (HDC)1; }
 int ReleaseDC(HWND hw, HDC dc) { (void)hw; (void)dc; return 1; }
-int GetDeviceCaps(HDC dc, int idx) { (void)dc; (void)idx; return 96; }
+int GetDeviceCaps(HDC dc, int idx) { (void)dc; return (idx == LOGPIXELSY) ? g_dpi : 96; }
+
+/* 只有一块"屏"：MonitorFromPoint 命中工作区内的点，否则返回 NULL
+ * （生产代码据此回退 SPI_GETWORKAREA）。 */
+BOOL GetCursorPos(POINT *pt)
+{
+    if (!pt) return 0;
+    pt->x = 0; pt->y = 0;          /* headless：等价桌面 (0,0) */
+    return 1;
+}
+
+HMONITOR MonitorFromPoint(POINT pt, DWORD flags)
+{
+    (void)flags;
+    return ((pt.x >= 0 && pt.x < g_work_w && pt.y >= 0 && pt.y < g_work_h)
+            ? (HMONITOR)(LONG_PTR)1 : NULL);
+}
+
+BOOL GetMonitorInfoA(HMONITOR mon, MONITORINFO *mi)
+{
+    if (!mon || !mi || mi->cbSize != (DWORD)sizeof *mi) return 0;
+    mi->rcMonitor.left = 0; mi->rcMonitor.top = 0;
+    mi->rcMonitor.right = g_screen_w; mi->rcMonitor.bottom = g_screen_h;
+    mi->rcWork = mi->rcMonitor;
+    mi->rcWork.right = g_work_w; mi->rcWork.bottom = g_work_h;
+    mi->dwFlags = 0;
+    return 1;
+}
+
+BOOL GetWindowRect(HWND hw, RECT *rc)
+{
+    (void)hw;
+    if (!rc) return 0;
+    rc->left = g_win_x; rc->top = g_win_y;
+    rc->right = g_win_x + g_win_w; rc->bottom = g_win_y + g_win_h;
+    return 1;
+}
+
 BOOL DestroyWindow(HWND hw) { (void)hw; g_win_visible = 0; return 1; }
 
 LRESULT DefWindowProcW(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -212,6 +281,8 @@ HFONT CreateFontW(int h, int w, int esc, int orient, int weight, DWORD it,
     (void)face;
     g_font_px_arr[id] = h < 0 ? -h : h;
     g_font_bold_arr[id] = (weight >= 600);
+    /* 字号日志：paint_toast 里 UM_F_TITLE..UM_F_ROWTITLE 的创建顺序 = 索引。 */
+    if (g_font_log_n < 16) g_font_px_log[g_font_log_n++] = g_font_px_arr[id];
     return (HFONT)(LONG_PTR)(0x3000 + id);
 }
 
@@ -321,6 +392,22 @@ BOOL LineTo(HDC dc, int x, int y)
     d = new_draw(4);
     if (!d) return 0;
     d->x = x; d->y = y;
+    return 1;
+}
+
+/* 文本实测宽度：ASCII ≈ 0.55×px、CJK/全角 ≈ 1.0×px。够覆盖
+ * suggest_width 的夹取断言，且无需真字体。 */
+BOOL GetTextExtentPoint32W(HDC dc, const uint16_t *text, int len, SIZE *sz)
+{
+    int i, wid = 0;
+    (void)dc;
+    if (!sz) return 0;
+    sz->cy = g_font_px + g_font_px / 3;
+    if (text) {
+        for (i = 0; i < len && text[i]; i++)
+            wid += (text[i] >= 0x2E80) ? g_font_px : (g_font_px * 55 / 100);
+    }
+    sz->cx = wid;
     return 1;
 }
 

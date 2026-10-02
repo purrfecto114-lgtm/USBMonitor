@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.0] — 2026-10-02
+
+### Added
+
+- **0 行文字通知并入设备面板内核**（`um_toast_win32.c` / `um_toast_ui.c` / `gui_win32.c`）：纯文字通知不再走独立的简化窗口，改为与设备面板共用同一套渲染、主题、倒计时与命中测试内核，视觉完全一致。
+- **PerMonitorV2 DPI 感知**（`um_toast_win_enable_dpi_awareness`）：进程启动时按 PerMonitorV2 → PerMonitor → system-DPI 顺序降级声明，窗口跨显示器拖动时通过 `WM_DPICHANGED` 就地重排；不依赖内嵌 manifest，因此与任意工具链链接方式兼容。
+- **多显示器与工作区钳制**：通知锚定在光标所在显示器的工作区右下角，自动避开任务栏。
+- **小屏 fit 收缩**：当设计尺寸超过工作区 70%（宽）/ 85%（高）时整体等比缩小，最低 0.05 倍，避免超出屏幕。
+- **推荐宽度 `um_toast_suggest_width`**：按标题 16px / 副标 12px / 摘要 13px 三种字号分别实测文本宽度推导窗口宽度，夹在 300–440px，文本不再被省略号截断。
+- **槽位布局 `um_toast_win_move_slot`**：同屏多条通知按 12px 间距向上堆叠并钳制在工作区内。
+
+### Changed
+
+- 0 行模型的自然高度由固定 205px 改为 148px（有状态行时 166px）；205px 下限仅保留给多行设备面板。
+- 信息框窗口类仍为 `usbmonToast2`，标题改为 `usbmon-toast`（设备面板标题保持 `usbmon`）。
+- 信息框点击任意位置或按 Esc 关闭；与设备面板一致，鼠标悬停时暂停倒计时。
+
+### Fixed
+
+- 窗口跨显示器后 DPI 未及时更新——现由 `WM_DPICHANGED` 就地重排（此前版本仅在窗口创建时取一次 DPI）。
+- 2.5.0 新增槽位/销毁逻辑的开发期修正（未影响任何已发布版本）：同一槽位被新通知替换时旧通知数据未释放；窗口销毁后 `GWLP_USERDATA` 悬垂（点击与倒计时并发时可致 use-after-free）；槽位偏移锚点错误导致相邻通知相互重叠。
+
 ## [2.4.0] — 2026-09-10
 
 ### Added — v1.1.1 视觉/交互面板完整移植（设备通知浮层）

@@ -51,6 +51,17 @@ typedef const void *LPCVOID;
 typedef struct { long left, top, right, bottom; } RECT;
 typedef struct { long x, y; } POINT;
 
+/* 多显示器 / DPI 仿真：只有一块"屏"，但工作区与 DPI 可注入。 */
+typedef void *HMONITOR;
+typedef struct { long cx, cy; } SIZE;
+#define MONITOR_DEFAULTTONEAREST 2
+typedef struct {
+    DWORD cbSize;
+    RECT  rcMonitor;
+    RECT  rcWork;
+    DWORD dwFlags;
+} MONITORINFO;
+
 #define WM_CREATE        0x0001
 #define WM_DESTROY       0x0002
 #define WM_PAINT         0x000F
@@ -62,6 +73,7 @@ typedef struct { long x, y; } POINT;
 #define WM_MOUSEHOVER    0x02A1
 #define WM_MOUSELEAVE    0x02A3
 #define WM_KEYDOWN       0x0100
+#define WM_DPICHANGED    0x02E0
 #define WM_NULL          0x0000
 #define WM_MOUSEWHEEL    0x020A
 #define WHEEL_DELTA      120
@@ -170,6 +182,15 @@ void    shim_set_next_menu_result(int cmd);
 int     shim_menu_item_count(void);
 /* 查询仿真窗口几何（SetWindowPos 后生效；供几何/锚点回归断言）。 */
 void    shim_window_geometry(int *x, int *y, int *w, int *h);
+/* 注入"当前显示器"：屏幕 + 工作区尺寸（0,0,w,h）。默认 1920x1080 屏幕 /
+ * 1920x1040 工作区（40px 任务栏）/ 96dpi，与既有几何断言一致。 */
+void    shim_set_workarea(int w, int h);
+/* 注入 DPI（<16 视为无效 → 96；注意 75 是合法的低 dpi）。 */
+void    shim_set_dpi(int dpi);
+/* CreateFontW 字号日志（顺序 = paint_toast 的 UM_F_* 顺序：
+ * 0=标题16, 1=正文13, 2=小字12, 3=按钮13, 4=行标题13），px = -lfHeight。 */
+int     shim_font_log_count(void);
+int     shim_font_log_px(int idx);
 
 /* --------------------------------------------------------- Win32 API 仿真 -- */
 
@@ -199,6 +220,10 @@ int      GetSystemMetrics(int i);
 HDC      GetDC(HWND hw);
 int      ReleaseDC(HWND hw, HDC dc);
 int      GetDeviceCaps(HDC dc, int idx);
+BOOL     GetCursorPos(POINT *pt);
+HMONITOR MonitorFromPoint(POINT pt, DWORD flags);
+BOOL     GetMonitorInfoA(HMONITOR mon, MONITORINFO *mi);
+BOOL     GetWindowRect(HWND hw, RECT *rc);
 BOOL     DestroyWindow(HWND hw);
 LRESULT  DefWindowProcW(HWND h, UINT m, WPARAM w, LPARAM l);
 
@@ -218,6 +243,7 @@ BOOL     Rectangle(HDC dc, int x1, int y1, int x2, int y2);
 BOOL     MoveToEx(HDC dc, int x, int y, POINT *old);
 BOOL     LineTo(HDC dc, int x, int y);
 int      DrawTextW(HDC dc, const uint16_t *text, int len, RECT *rc, UINT fmt);
+BOOL     GetTextExtentPoint32W(HDC dc, const uint16_t *text, int len, SIZE *sz);
 HDC      CreateCompatibleDC(HDC dc);
 HBITMAP  CreateCompatibleBitmap(HDC dc, int w, int h);
 BOOL     BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy,

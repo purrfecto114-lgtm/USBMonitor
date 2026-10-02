@@ -50,8 +50,9 @@
 #       wake="hot" round (same path the menu item uses)
 #  14b. async safe-eject (v1.1.1 parity): UMWM_TRAY_EJECT_TEST drives the
 #       full worker chain headlessly — GUI thread returns immediately,
-#       worker runs the IOCTL, result toast is marshaled back and the tray
-#       log records the eject result; the daemon must stay alive
+#       worker runs the IOCTL, result toast (class usbmonToast2, title
+#       usbmon-toast) is marshaled back and the tray log records the
+#       eject result; the daemon must stay alive
 #  15.  tray quit: the tray quit message exits the daemon with code 0
 #       and a JSONL stop event whose reason is "tray-quit"
 #
@@ -62,12 +63,12 @@
 # are posted as the exact window messages real input delivers.
 #
 # Usage:
-#   pwsh tools/demo.ps1 [-ExePath .\usbmon.exe] [-Version 2.3.0]
+#   pwsh tools/demo.ps1 [-ExePath .\usbmon.exe] [-Version 2.5.0]
 # Exits non-zero when any assertion fails.
 
 param(
     [string]$ExePath = ".\usbmon.exe",
-    [string]$Version = ""
+    [string]$Version = "2.5.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -275,6 +276,8 @@ namespace UsbmonDemo {
         private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -304,6 +307,24 @@ namespace UsbmonDemo {
                     uint wpid;
                     GetWindowThreadProcessId(h, out wpid);
                     if (wpid == pid) hwnds.Add(h.ToInt64());
+                }
+                return true;
+            }, IntPtr.Zero);
+            return hwnds;
+        }
+        public static List<long> WindowsByClassTitleAndPid(string className, string title, uint pid) {
+            var hwnds = new List<long>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                var sb = new StringBuilder(64);
+                GetClassName(h, sb, 64);
+                if (sb.ToString() == className) {
+                    var tb = new StringBuilder(256);
+                    GetWindowText(h, tb, 256);
+                    if (tb.ToString() == title) {
+                        uint wpid;
+                        GetWindowThreadProcessId(h, out wpid);
+                        if (wpid == pid) hwnds.Add(h.ToInt64());
+                    }
                 }
                 return true;
             }, IntPtr.Zero);
@@ -628,14 +649,14 @@ if ($hwnd -ne [IntPtr]::Zero) {
     } else {
         Bad "async eject chain left no result in the tray log"
     }
-    $toastWnds = [UsbmonDemo.Win32]::WindowsByClassAndPid("usbmonToast", [uint32]$proc2.Id)
+    $toastWnds = [UsbmonDemo.Win32]::WindowsByClassTitleAndPid("usbmonToast2", "usbmon-toast", [uint32]$proc2.Id)
     if ($toastWnds.Count -gt 0) {
-        Ok "eject progress/result toast window exists (class usbmonToast, pid $($proc2.Id))"
+        Ok "eject progress/result toast window exists (class usbmonToast2 title usbmon-toast, pid $($proc2.Id))"
     } else {
         # surface the C-side toast diagnostics (um_tray_test_log lines) so
         # CI failures are diagnosable from the run log alone
         $toastDiag = (Read-TrayLog) -split "`n" | Where-Object { $_ -match '^toast ' } | Select-Object -Last 4
-        Bad "no usbmonToast window (pid $($proc2.Id)) after the eject test; C diagnostics: $($toastDiag -join ' | ')"
+        Bad "no usbmonToast2/usbmon-toast window (pid $($proc2.Id)) after the eject test; C diagnostics: $($toastDiag -join ' | ')"
     }
     if (-not $proc2.HasExited) {
         Ok "daemon still alive after async eject (GUI thread never blocked)"
