@@ -27,7 +27,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev musl-tools xvfb x11-utils
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools xvfb x11-utils linux-libc-dev
+          # musl-gcc ships only musl headers; hotpath.c needs kernel headers
+          # (linux/netlink.h). Copy them into the musl include dir.
+          sudo cp -a /usr/include/linux /usr/include/asm-generic \
+              /usr/include/x86_64-linux-musl/
+          sudo ln -sfn asm-generic /usr/include/x86_64-linux-musl/asm
 
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
@@ -96,7 +101,9 @@ jobs:
 
       - name: "Assert GUI subsystem + embedded icon + self-contained PE imports"
         run: |
-          file usbmon.exe | grep -q 'PE32+ executable (GUI)' \
+          # file >=5.41 prints "PE32+ executable for MS Windows 5.02 (GUI)";
+          # match the subsystem token instead of the whole old-format phrase
+          file usbmon.exe | grep -q '(GUI)' \
             || { echo "usbmon.exe is not a GUI-subsystem binary — double-click would flash a console window"; exit 1; }
           x86_64-w64-mingw32-objdump -h usbmon.exe | grep -q '\.rsrc' \
             || { echo "usbmon.exe lacks the .rsrc section — tray/executable icon not embedded"; exit 1; }
