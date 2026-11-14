@@ -1,631 +1,367 @@
-/* tray_win32.c — Windows system tray (Shell_NotifyIcon) + menus.
- *
- * Restores the 1.x PySide6 tray experience in native Win32, split the
- * same way the original TrayMenuController split it:
- *   left click  -> USB-device menu (per drive letter:
- *                  打开 / 在资源管理器中显示 / 安全弹出)
- *   right click -> application menu (状态 / 立即重新扫描 / 工具 /
- *                  随系统启动 / 退出)
- *
- * Everything runs on the GUI thread that already owns the invisible
- * WM_DEVICECHANGE listener, so menus and device-change wakeups share a
- * single message pump; TrackPopupMenu's modal loop can dispatch hot-path
- * messages while a menu is open and can never deadlock the daemon.
- *
- * The device list is a FRESH um_scan_platform() round at popup time —
- * no state shared with the main thread, no locks, always current.
- *
- * 安全弹出 uses IOCTL_STORAGE_EJECT_MEDIA, the primary path of the
- * Python original (Shell COM was only ever its fallback); the result is
- * confirmed by watching the drive letter disappear, surfaced as a toast.
- *
- * Testability: when USBMON_TRAY_TEST names a writable file, the tray
- * install result and every menu's full item list are appended there
- * (UTF-8, one line per item, submenu lines indented) and TrackPopupMenu
- * is skipped — tools/demo.ps1 asserts menu CONTENT on a headless CI
- * runner by posting the very same window messages a real click sends.
- */
-#ifdef _WIN32
+/* Native tray menus and volume actions. Inventory belongs to the GUI thread. */
+#include "win_app.h"
 
-#include "usbmon.h"
-
-#include <windows.h>
-#include <shellapi.h>     /* Shell_NotifyIconW, ShellExecuteW */
-#include <winioctl.h>
-#include <process.h>      /* _beginthreadex: async safe-eject worker */
-#include <wchar.h>
-#include <stdio.h>
+#include <cfgmgr32.h>
+#include <io.h>
+#include <process.h>
+#include <shellapi.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
-#ifndef FILE_DEVICE_MASS_STORAGE
-#define FILE_DEVICE_MASS_STORAGE 0x0000002d
-#endif
-#ifndef IOCTL_STORAGE_EJECT_MEDIA
-#define IOCTL_STORAGE_EJECT_MEDIA \
-    CTL_CODE(FILE_DEVICE_MASS_STORAGE, 0x0202, METHOD_BUFFERED, FILE_READ_ACCESS)
-#endif
-
-/* ---- menu command ids ---------------------------------------------------- */
-#define ID_RESCAN     1
-#define ID_OPEN_LOG   2
-#define ID_OPEN_CONF  3
-#define ID_STARTUP    4
-#define ID_QUIT       5
-#define IDB_OPEN      100   /* + entry index (per drive letter) */
-#define IDB_REVEAL    200
-#define IDB_EJECT     300
-#define TRAY_MAX_ENTRIES 32
+enum {
+    ID_PANEL = 1, ID_RESCAN, ID_LOG, ID_CONFIG, ID_STARTUP, ID_QUIT,
+    ID_OPEN = 100, ID_REVEAL = 130, ID_EJECT = 160
+};
 
 typedef struct {
-    char letter;                     /* 'E' — volume letter of the entry  */
-    char model[UM_MODEL_MAX];        /* for the eject feedback toast      */
+    int disk;
+    char instance[UM_EVID_ID_LEN];
 } tray_entry;
 
-static HWND       g_owner;
-static um_gui    *g_gui;
-static UINT       g_msg_taskbar;     /* "TaskbarCreated" (explorer restart) */
-static HICON      g_icon;
+static HWND owner;
+static um_gui *app;
+static UINT taskbar_created;
+static HICON icon;
+static int in_menu, eject_pending;
 
-/* ---- test log (USBMON_TRAY_TEST=path; absent in production) --------------- */
-
-static FILE *tray_test_out(void)
+FILE *um_win_test_output(const char *variable)
 {
-    const char *p = getenv("USBMON_TRAY_TEST");
+    const char *path = getenv(variable);
+    LARGE_INTEGER bytes;
     FILE *f;
-    long sz;
-    if (!p || !*p) return NULL;
-    f = fopen(p, "a");
-    if (!f) return NULL;
-    /* BOM once — only when the file is truly empty.  ftell() immediately
-     * after fopen("a") is implementation-defined (msvcrt vs glibc differ),
-     * so seek to end first: writes still land at the end in append mode. */
-    fseek(f, 0, SEEK_END);
-    sz = ftell(f);
-    if (sz == 0)
-        fwrite("\xEF\xBB\xBF", 1, 3, f);
+    if (!path || !*path || !(f = fopen(path, "ab"))) return NULL;
+    if (GetFileSizeEx((HANDLE)_get_osfhandle(_fileno(f)), &bytes) && bytes.QuadPart == 0)
+        fputs("\xef\xbb\xbf", f);
     return f;
 }
 
-static void tray_log_result(const char *key, int ok)
-{
-    FILE *f = tray_test_out();
-    if (!f) return;
-    fprintf(f, "%s %s\n", key, ok ? "ok" : "fail");
-    fclose(f);
-}
-
-/* Test-only free-form log line (USBMON_TRAY_TEST set); used by
- * gui_win32.c to surface toast/panel diagnostics on headless runners. */
 void um_tray_test_log(const char *key, const char *detail)
 {
-    FILE *f = tray_test_out();
+    FILE *f = um_win_test_output("USBMON_TRAY_TEST");
     if (!f) return;
-    fprintf(f, "%s %s\n", key, detail ? detail : "");
+    fprintf(f, "%s %s\n", key, detail);
     fclose(f);
 }
 
-static void dump_level(FILE *f, HMENU m, int depth)
+static void dump_menu(FILE *f, HMENU menu, int depth)
 {
-    int n = GetMenuItemCount(m), i;
-    for (i = 0; i < n; i++) {
-        MENUITEMINFOW mii;
-        wchar_t buf[256];
-        char u8[512];
-        memset(&mii, 0, sizeof mii);
-        mii.cbSize = sizeof mii;
-        mii.fMask = MIIM_STRING | MIIM_SUBMENU;
-        buf[0] = L'\0';
-        mii.dwTypeData = buf;
-        mii.cch = 256;
-        if (!GetMenuItemInfoW(m, (UINT)i, TRUE, &mii)) continue;
-        um_wide_to_utf8(buf, u8, sizeof u8);
-        fprintf(f, "%*s%s\n", depth * 2, "", u8);
-        if (mii.hSubMenu) dump_level(f, mii.hSubMenu, depth + 1);
-    }
-}
-
-static void tray_dump_menu(const char *tag, HMENU m)
-{
-    FILE *f = tray_test_out();
-    if (!f) return;
-    fprintf(f, "%s\n", tag);
-    dump_level(f, m, 0);
-    fclose(f);
-}
-
-/* ---- registry: HKCU Run key for 随系统启动 (no admin needed) ---------------- */
-
-static const WCHAR RUN_KEY[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const WCHAR RUN_VAL[] = L"usbmon";
-
-static int startup_enabled(void)
-{
-    HKEY k;
-    LONG r;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_QUERY_VALUE, &k)
-        != ERROR_SUCCESS)
-        return 0;
-    r = RegQueryValueExW(k, RUN_VAL, NULL, NULL, NULL, NULL);
-    RegCloseKey(k);
-    return r == ERROR_SUCCESS;
-}
-
-static void startup_set(int on)
-{
-    HKEY k;
-    if (on) {
-        wchar_t path[MAX_PATH], cmd[MAX_PATH + 4];
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0,
-                            KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
-            return;
-        GetModuleFileNameW(NULL, path, MAX_PATH);
-        _snwprintf_s(cmd, MAX_PATH + 4, _TRUNCATE, L"\"%s\"", path);
-        RegSetValueExW(k, RUN_VAL, 0, REG_SZ,
-                       (const BYTE *)cmd,
-                       (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
-        RegCloseKey(k);
-    } else {
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k)
-            != ERROR_SUCCESS)
-            return;
-        RegDeleteValueW(k, RUN_VAL);
-        RegCloseKey(k);
-    }
-}
-
-/* ---- volume actions ------------------------------------------------------- */
-
-static void tray_open_volume(char letter)
-{
-    wchar_t root[4];
-    _snwprintf_s(root, 4, _TRUNCATE, L"%c:\\", letter);
-    ShellExecuteW(g_owner, L"open", root, NULL, NULL, SW_SHOWNORMAL);
-}
-
-static void tray_reveal_volume(char letter)
-{
-    wchar_t params[16];
-    _snwprintf_s(params, 16, _TRUNCATE, L"/select,%c:\\", letter);
-    ShellExecuteW(g_owner, NULL, L"explorer.exe", params, NULL, SW_SHOWNORMAL);
-}
-
-/* 0 = ejected, 1 = request accepted but still mounted, -1 = refused.
- * Runs on the async-eject WORKER thread: plain Sleep only — message
- * pumping belongs to the thread that owns the windows. */
-static int eject_volume_sync(char letter)
-{
-    wchar_t vol[8];
-    HANDLE h;
-    DWORD br = 0;
     int i;
-
-    _snwprintf_s(vol, 8, _TRUNCATE, L"\\\\.\\%c:", letter);
-    h = CreateFileW(vol, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    if (!DeviceIoControl(h, IOCTL_STORAGE_EJECT_MEDIA, NULL, 0, NULL, 0,
-                         &br, NULL)) {
-        CloseHandle(h);
-        return -1;
-    }
-    CloseHandle(h);
-    for (i = 0; i < 75; i++) {              /* ~3 s for the letter to drop */
-        Sleep(40);
-        if (!(GetLogicalDrives() & (1UL << (letter - 'A')))) return 0;
-    }
-    return 1;
-}
-
-/* Everything the eject worker needs, heap-copied before the thread starts
- * (tray entries can be refreshed by a rescan mid-eject).  gui_tid/ttl/slot
- * are captured BY VALUE on the GUI thread — the worker never touches any
- * shared state, it only PostThreadMessageW's its result toast back. */
-typedef struct {
-    char          letter;
-    char          model[UM_MODEL_MAX];
-    unsigned long gui_tid;
-    int           ttl;
-    int           slot;
-} eject_job;
-
-static unsigned __stdcall eject_worker(void *arg)
-{
-    eject_job *j = (eject_job *)arg;
-    char title[64], body[256];
-    int r = eject_volume_sync(j->letter);
-
-    snprintf(title, sizeof title, "安全弹出 %c:", j->letter);
-    if (r == 0)
-        snprintf(body, sizeof body, "%s 已安全弹出，现在可以拔出。",
-                 j->model[0] ? j->model : "设备");
-    else if (r == 1)
-        snprintf(body, sizeof body,
-                 "已发送弹出请求，但 %c: 仍可访问。请关闭占用它的文件后重试。",
-                 j->letter);
-    else
-        snprintf(body, sizeof body,
-                 "无法弹出 %c:（设备被占用或系统拒绝）。请关闭相关文件后重试。",
-                 j->letter);
-    /* same slot as the "正在安全弹出" line -> replaces it in place */
-    um_gui_win_post(j->gui_tid, title, body, r == 0, j->slot, j->ttl);
-    tray_log_result("eject", r == 0);
-    free(j);
-    return 0;
-}
-
-/* v1.1.1 parity: eject runs on a worker thread so the GUI thread (message
- * pump for WM_DEVICECHANGE, tray menus, toasts) never stalls 1~10 s inside
- * DeviceIoControl.  The user sees "正在安全弹出…" immediately; the same
- * toast slot is then upgraded to the final result by the worker. */
-static void tray_do_eject(const tray_entry *e)
-{
-    eject_job *j;
-
-    if (!g_gui || !g_gui->gui_tid) return;
-    j = malloc(sizeof *j);
-    if (!j) return;
-    memset(j, 0, sizeof *j);
-    j->letter = e->letter;
-    snprintf(j->model, sizeof j->model, "%s", e->model);
-    j->gui_tid = g_gui->gui_tid;
-    j->ttl = g_gui->toast_ttl;
-    j->slot = (int)(g_gui->slot_seq++ % UM_GUI_SLOTS);
-
-    um_gui_win_post(j->gui_tid, "正在安全弹出", "正在安全弹出，请稍候…",
-                    1, j->slot, 12);
-    {
-        HANDLE th = (HANDLE)_beginthreadex(NULL, 0, eject_worker, j, 0, NULL);
-        if (th) {
-            CloseHandle(th);   /* thread keeps running on its own */
-        } else {
-            /* could not spawn (~never): run inline so the action is never
-             * lost — this is exactly the old blocking behavior */
-            eject_worker(j);
-        }
+    for (i = 0; i < GetMenuItemCount(menu); i++) {
+        wchar_t text[256];
+        char utf8[512];
+        MENUITEMINFOW info = {0};
+        info.cbSize = sizeof info;
+        info.fMask = MIIM_STRING | MIIM_SUBMENU;
+        info.dwTypeData = text;
+        info.cch = sizeof text / sizeof *text;
+        if (!GetMenuItemInfoW(menu, (UINT)i, TRUE, &info)) continue;
+        um_wide_to_utf8(text, utf8, sizeof utf8);
+        fprintf(f, "%*s%s\n", depth * 2, "", utf8);
+        if (info.hSubMenu) dump_menu(f, info.hSubMenu, depth + 1);
     }
 }
 
-static void tray_open_dir_utf8(const char *dir)
+static int popup(HMENU menu, const char *name)
 {
-    wchar_t w[512];
-    um_utf8_to_wide(dir, w, 512);
-    if (w[0]) ShellExecuteW(g_owner, L"open", w, NULL, NULL, SW_SHOWNORMAL);
-}
-
-static void tray_toggle_startup(void)
-{
-    int on = !startup_enabled();
-    startup_set(on);
-    if (g_gui)
-        um_gui_win_notify(g_gui, "随系统启动",
-                          on ? "已开启：登录时自动启动 usbmon。"
-                             : "已关闭：不再随登录启动。", on);
-}
-
-/* ---- menus ---------------------------------------------------------------- */
-
-static tray_entry g_entries[TRAY_MAX_ENTRIES];
-static int        g_entry_n;
-
-static void tray_dispatch(int cmd)
-{
-    if (cmd >= IDB_OPEN && cmd < IDB_OPEN + TRAY_MAX_ENTRIES) {
-        int idx = cmd - IDB_OPEN;
-        if (idx < g_entry_n) tray_open_volume(g_entries[idx].letter);
-    } else if (cmd >= IDB_REVEAL && cmd < IDB_REVEAL + TRAY_MAX_ENTRIES) {
-        int idx = cmd - IDB_REVEAL;
-        if (idx < g_entry_n) tray_reveal_volume(g_entries[idx].letter);
-    } else if (cmd >= IDB_EJECT && cmd < IDB_EJECT + TRAY_MAX_ENTRIES) {
-        int idx = cmd - IDB_EJECT;
-        if (idx < g_entry_n) tray_do_eject(&g_entries[idx]);
+    FILE *f = um_win_test_output("USBMON_TRAY_TEST");
+    int command = 0;
+    if (f) {
+        fprintf(f, "menu %s\n", name);
+        dump_menu(f, menu, 0);
+        fclose(f);
     } else {
-        switch (cmd) {
-        case ID_RESCAN:
-            if (g_gui && g_gui->wake_event)
-                SetEvent((HANDLE)g_gui->wake_event);
-            break;
-        case ID_OPEN_LOG: {
-            char d[512];
-            um_state_dir(d, sizeof d);
-            tray_open_dir_utf8(d);
-            break;
-        }
-        case ID_OPEN_CONF: {
-            char d[512];
-            um_config_dir(d, sizeof d);
-            tray_open_dir_utf8(d);
-            break;
-        }
-        case ID_STARTUP:
-            tray_toggle_startup();
-            break;
-        case ID_QUIT:
-            um_request_stop("tray-quit");
-            break;
-        default:
-            break;          /* 0 = menu dismissed without a choice */
-        }
-    }
-}
-
-/* Show (or, under test, dump) a menu and dispatch the picked command. */
-static void tray_run_menu(HMENU menu, const char *tag)
-{
-    const char *t = getenv("USBMON_TRAY_TEST");
-    int cmd = 0;
-
-    if (t && t[0]) {
-        tray_dump_menu(tag, menu);
-        DestroyMenu(menu);
-        return;
-    }
-
-    {
         POINT pt;
-        GetCursorPos(&pt);
-        SetForegroundWindow(g_owner);
-        cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                    (int)pt.x, (int)pt.y, g_owner, NULL);
-        PostMessageW(g_owner, WM_NULL, 0, 0);   /* the canonical dismiss fix */
+        if (GetCursorPos(&pt)) {
+            SetForegroundWindow(owner);
+            in_menu = 1;
+            command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                        pt.x, pt.y, owner, NULL);
+            in_menu = 0;
+            PostMessageW(owner, WM_NULL, 0, 0);
+        }
     }
     DestroyMenu(menu);
-    tray_dispatch(cmd);
+    return command;
 }
 
-/* Left click: the USB-device menu (per drive letter, like the original
- * volume menu; multi-letter sticks get one entry per letter). */
-static void tray_menu_devices(void)
+static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+int um_startup_enabled(void)
 {
-    um_snapshot snap;
-    HMENU menu = CreatePopupMenu();
-    int i, j, shown = 0;
-
-    g_entry_n = 0;
-    memset(&snap, 0, sizeof snap);
-    if (um_scan_platform(&snap, NULL) != 0) snap.count = 0;
-
-    for (i = 0; i < snap.count; i++) {
-        const um_device *d = &snap.devs[i];
-
-        if (d->partition_count > 0) {
-            for (j = 0; j < d->partition_count && g_entry_n < TRAY_MAX_ENTRIES;
-                 j++) {
-                char letter = d->partitions[j][0];
-                char txt[UM_MODEL_MAX + UM_MOUNT_MAX];
-                wchar_t wtxt[UM_MODEL_MAX + UM_MOUNT_MAX];
-                HMENU sub;
-                int idx = g_entry_n;
-                char sz[32];
-
-                if (d->size_bytes > 0) {
-                    um_human_size(d->size_bytes, sz, sizeof sz);
-                    snprintf(txt, sizeof txt, "%c: · %s (%s)", letter,
-                             d->model[0] ? d->model : "USB 存储设备", sz);
-                } else {
-                    snprintf(txt, sizeof txt, "%c: · %s", letter,
-                             d->model[0] ? d->model : "USB 存储设备");
-                }
-                um_utf8_to_wide(txt, wtxt,
-                                sizeof wtxt / sizeof(WCHAR));
-
-                g_entries[idx].letter = letter;
-                um_copy_str(g_entries[idx].model, sizeof g_entries[idx].model,
-                            d->model);
-                g_entry_n++;
-
-                sub = CreatePopupMenu();
-                AppendMenuW(sub, MF_STRING, IDB_OPEN + idx, L"打开");
-                AppendMenuW(sub, MF_STRING, IDB_REVEAL + idx,
-                            L"在资源管理器中显示");
-                AppendMenuW(sub, MF_STRING, IDB_EJECT + idx, L"安全弹出");
-                AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, wtxt);
-                shown++;
-            }
-        } else {
-            /* present but unmounted (raw disk / no filesystem) */
-            char txt[UM_MODEL_MAX + 32];
-            wchar_t wtxt[UM_MODEL_MAX + 32];
-            snprintf(txt, sizeof txt, "%s · 未挂载",
-                     d->model[0] ? d->model : "USB 存储设备");
-            um_utf8_to_wide(txt, wtxt, sizeof wtxt / sizeof(WCHAR));
-            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wtxt);
-            shown++;
-        }
-    }
-    if (!shown)
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
-                    L"当前没有检测到 USB 存储设备");
-
-    tray_run_menu(menu, "menu left");
+    DWORD type;
+    return RegGetValueW(HKEY_CURRENT_USER, run_key, L"usbmon", RRF_RT_REG_SZ,
+                        &type, NULL, NULL) == ERROR_SUCCESS;
 }
-
-/* Right click: the compact application menu (settings-oriented, no
- * device list — exactly the split the original documented). */
-static void tray_menu_app(void)
-{
-    um_snapshot snap;
-    HMENU menu, tools;
-    char st[96];
-    wchar_t wst[96];
-    int n = 0;
-
-    memset(&snap, 0, sizeof snap);
-    if (um_scan_platform(&snap, NULL) == 0) n = snap.count;
-
-    if (n > 0) snprintf(st, sizeof st, "状态：%d 台 USB 存储设备", n);
-    else       snprintf(st, sizeof st, "状态：未检测到 USB 存储设备");
-    um_utf8_to_wide(st, wst, sizeof wst / sizeof(WCHAR));
-
-    menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wst);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_RESCAN, L"立即重新扫描");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-
-    tools = CreatePopupMenu();
-    AppendMenuW(tools, MF_STRING, ID_OPEN_LOG, L"打开日志目录");
-    AppendMenuW(tools, MF_STRING, ID_OPEN_CONF, L"打开配置目录");
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)tools, L"工具");
-
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (startup_enabled() ? MF_CHECKED : 0),
-                ID_STARTUP, L"随系统启动");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_QUIT, L"退出");
-
-    tray_run_menu(menu, "menu right");
-}
-
-/* ---- public API (called from gui_win32.c on the GUI thread) ---------------- */
-
-static int tray_add_icon(int readd)
-{
-    NOTIFYICONDATAW nid;
-    char tip8[128];
-    wchar_t tip[128];
-    int ok;
-
-    memset(&nid, 0, sizeof nid);
-    nid.cbSize = sizeof nid;
-    nid.hWnd = g_owner;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = UMWM_TRAY;
-    nid.hIcon = g_icon;
-    snprintf(tip8, sizeof tip8, "usbmon %s — USB 存储监控", UM_VERSION);
-    um_utf8_to_wide(tip8, tip, 128);
-    wcscpy_s(nid.szTip, 128, tip);
-
-    ok = Shell_NotifyIconW(NIM_ADD, &nid) ? 1 : 0;
-    tray_log_result(readd ? "icon_readd" : "icon_add", ok);
-    return ok;
-}
-
-void um_tray_install(void *owner, void *gui)
-{
-    g_owner = (HWND)owner;
-    g_gui = (um_gui *)gui;
-    g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
-
-    g_icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-    if (!g_icon)
-        g_icon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-
-    if (!g_owner) {
-        tray_log_result("icon_add", 0);
-        return;
-    }
-    tray_add_icon(0);
-}
-
-void um_tray_uninstall(void)
-{
-    NOTIFYICONDATAW nid;
-    if (!g_owner) return;
-    memset(&nid, 0, sizeof nid);
-    nid.cbSize = sizeof nid;
-    nid.hWnd = g_owner;
-    nid.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
-    g_owner = NULL;
-}
-
-/* Returns 1 when the message was tray-related and fully handled.  Called
- * FIRST from the listener window procedure (gui_win32.c). */
-int um_tray_filter(void *hwnd, unsigned msg, void *wp, void *lp)
-{
-    size_t lpv = (size_t)lp;
-    size_t wpv = (size_t)wp;
-
-    (void)hwnd;
-
-    if (msg == UMWM_TRAY && g_owner) {
-        switch ((UINT)lpv) {
-        case WM_LBUTTONUP:
-            tray_menu_devices();
-            return 1;
-        case WM_RBUTTONUP:
-        case WM_CONTEXTMENU:
-            tray_menu_app();
-            return 1;
-        default:
-            return 1;              /* hover/move: swallow, nothing to do */
-        }
-    }
-    if (msg == UMWM_TRAY_RESCAN) {
-        if (g_gui && g_gui->wake_event)
-            SetEvent((HANDLE)g_gui->wake_event);
-        return 1;
-    }
-    if (msg == UMWM_TRAY_QUIT) {
-        um_request_stop("tray-quit");
-        return 1;
-    }
-    if (msg == UMWM_TRAY_EJECT_TEST && tray_test_out()) {
-        /* test-only (USBMON_TRAY_TEST set): drive the async eject chain —
-         * worker spawn -> IOCTL attempt -> result toast marshaled back —
-         * headlessly.  WPARAM packs the drive letter in the low byte. */
-        tray_entry e;
-        e.letter = (char)(wpv & 0xFF);
-        um_copy_str(e.model, sizeof e.model, "Test Stick");
-        tray_do_eject(&e);
-        return 1;
-    }
-    if (g_msg_taskbar && msg == g_msg_taskbar) {
-        if (g_owner) tray_add_icon(1);   /* explorer restarted: re-add */
-        return 1;
-    }
-    return 0;
-}
-
-/* ---- volume actions, shared with the device panel --------------------------
- * gui_win32.c wires the panel's 打开 / 在资源管理器中显示 / 安全弹出 buttons
- * to these, so the tray menus and the panel share ONE implementation of each
- * action (ShellExecuteW / explorer /select / IOCTL eject + confirmation +
- * feedback toast).  GUI thread only; the eject itself hops to a worker. */
-
-void um_tray_open_letter(char letter)
-{
-    tray_open_volume(letter);
-}
-
-void um_tray_reveal_letter(char letter)
-{
-    tray_reveal_volume(letter);
-}
-
-void um_tray_eject_letter(char letter, const char *model)
-{
-    tray_entry e;
-    e.letter = letter;
-    um_copy_str(e.model, sizeof e.model, model ? model : "");
-    tray_do_eject(&e);
-}
-
-/* ---- login autostart: HKCU Run (v1.1.1 --install-startup parity) ---------- */
 
 int um_startup_install(void)
 {
-    startup_set(1);
-    return startup_enabled() ? 0 : -1;
+    wchar_t path[MAX_PATH], command[MAX_PATH + 3];
+    HKEY key;
+    LONG result;
+    DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!len || len > MAX_PATH - 2) return -1;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, run_key, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &key, NULL) != ERROR_SUCCESS) return -1;
+    swprintf(command, sizeof command / sizeof *command, L"\"%ls\"", path);
+    result = RegSetValueExW(key, L"usbmon", 0, REG_SZ, (const BYTE *)command,
+                           (DWORD)((wcslen(command) + 1) * sizeof *command));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS ? 0 : -1;
 }
 
 int um_startup_uninstall(void)
 {
-    startup_set(0);
-    return startup_enabled() ? -1 : 0;
+    HKEY key;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, run_key, 0, KEY_SET_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) return 0;
+    if (result != ERROR_SUCCESS) return -1;
+    result = RegDeleteValueW(key, L"usbmon");
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND ? 0 : -1;
 }
 
-int um_startup_enabled(void)
+const char *um_startup_where(void) { return "注册表 HKCU Run\\usbmon"; }
+
+void um_tray_open(char letter, int disk, int reveal)
 {
-    return startup_enabled();
+    wchar_t path[] = L"A:\\";
+    HINSTANCE result;
+    if (disk < 0 || um_enum_letter_disk(letter) != disk) {
+        um_gui_win_notice("设备状态已变化", "请重新扫描后再打开卷。", 2);
+        return;
+    }
+    path[0] = (wchar_t)letter;
+    if (reveal) {
+        wchar_t explorer[MAX_PATH + 16], args[] = L"/select,A:\\";
+        UINT len = GetWindowsDirectoryW(explorer, MAX_PATH);
+        if (!len || len >= MAX_PATH) return;
+        wcscat(explorer, L"\\explorer.exe");
+        args[8] = path[0];
+        result = ShellExecuteW(owner, L"open", explorer, args, NULL, SW_SHOWNORMAL);
+    } else {
+        result = ShellExecuteW(owner, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+    }
+    if ((INT_PTR)result <= 32)
+        um_gui_win_notice("无法打开卷", "请检查卷是否可访问。", 2);
 }
 
-const char *um_startup_where(void)
+typedef struct {
+    HWND target;
+    char instance[UM_EVID_ID_LEN];
+} eject_job;
+
+static unsigned __stdcall eject_worker(void *arg)
 {
-    return "注册表 HKCU Run\\usbmon";
+    eject_job *job = arg;
+    unsigned long result = um_enum_eject(job->instance);
+    PostMessageW(job->target, UMWM_EJECT_DONE, result, 0);
+    free(job);
+    return 0;
 }
 
-#endif /* _WIN32 */
+void um_tray_eject(const char *instance)
+{
+    eject_job *job;
+    uintptr_t thread;
+    if (eject_pending) return;
+    job = malloc(sizeof *job);
+    if (!job) {
+        um_gui_win_notice("无法发起弹出", "请稍后再试。", 2);
+        return;
+    }
+    job->target = owner;
+    um_copy_str(job->instance, sizeof job->instance, instance);
+    thread = _beginthreadex(NULL, 0, eject_worker, job, 0, NULL);
+    if (!thread) {
+        free(job);
+        um_gui_win_notice("无法发起弹出", "请稍后再试。", 2);
+        return;
+    }
+    eject_pending = 1;
+    CloseHandle((HANDLE)thread);
+    um_gui_win_notice("正在安全弹出", "等待 Windows 完成设备移除请求。", 0);
+}
+
+void um_tray_finish_eject(unsigned long result)
+{
+    char detail[128];
+    if (!eject_pending) return;
+    eject_pending = 0;
+    if (result == CR_SUCCESS) {
+        um_gui_win_notice("设备已安全移除", "Windows 已完成设备移除。", 1);
+        SetEvent((HANDLE)app->wake_event);
+    } else {
+        snprintf(detail, sizeof detail, "Windows 未完成移除（错误 0x%lX）。", result);
+        um_gui_win_notice("无法安全移除", detail, 2);
+    }
+    um_tray_test_log("eject", result == CR_SUCCESS ? "ok" : "fail");
+}
+
+static void left_menu(void)
+{
+    const um_toast_model *model = um_gui_win_inventory();
+    tray_entry entries[26] = {{0}};
+    HMENU menu = CreatePopupMenu();
+    int i, cmd, storage = 0;
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, ID_PANEL, L"打开设备概览");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    for (i = 0; model && i < model->n_rows; i++) {
+        const um_volume *v = &model->rows[i];
+        int j;
+        if (v->disk_number < 0) continue;
+        storage++;
+        if (!v->n_letters) {
+            wchar_t title[192];
+            char text[240];
+            snprintf(text, sizeof text, "%s · 无盘符", v->title);
+            um_utf8_to_wide(text, title, sizeof title / sizeof *title);
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title);
+        }
+        for (j = 0; j < v->n_letters; j++) {
+            int index = v->letters[j][0] - 'A';
+            wchar_t title[192];
+            char text[160];
+            UINT open_flags;
+            HMENU sub;
+            if (index < 0 || index >= 26) continue;
+            sub = CreatePopupMenu();
+            if (!sub) continue;
+            snprintf(text, sizeof text, "%s · %s", v->letters[j], v->title);
+            um_utf8_to_wide(text, title, sizeof title / sizeof *title);
+            entries[index].disk = v->disk_number;
+            um_copy_str(entries[index].instance, sizeof entries[index].instance,
+                         v->instance_id);
+            open_flags = MF_STRING | ((v->accessible_letters & (1U << index)) ? 0 : MF_GRAYED);
+            AppendMenuW(sub, open_flags, ID_OPEN + index, L"打开");
+            AppendMenuW(sub, open_flags, ID_REVEAL + index, L"在资源管理器中显示");
+            AppendMenuW(sub, MF_STRING | (v->ejectable && !eject_pending ? 0 : MF_GRAYED),
+                        ID_EJECT + index, L"安全弹出");
+            if (!AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, title)) DestroyMenu(sub);
+        }
+    }
+    if (!storage)
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, model ?
+                    L"当前没有检测到 USB 存储设备" : L"正在扫描设备…");
+    cmd = popup(menu, "left");
+    if (cmd == ID_PANEL) um_gui_win_open_panel();
+    else if (cmd >= ID_OPEN && cmd < ID_OPEN + 26)
+        um_tray_open((char)('A' + cmd - ID_OPEN), entries[cmd - ID_OPEN].disk, 0);
+    else if (cmd >= ID_REVEAL && cmd < ID_REVEAL + 26)
+        um_tray_open((char)('A' + cmd - ID_REVEAL), entries[cmd - ID_REVEAL].disk, 1);
+    else if (cmd >= ID_EJECT && cmd < ID_EJECT + 26)
+        um_tray_eject(entries[cmd - ID_EJECT].instance);
+}
+
+static void open_directory(int log)
+{
+    char path[512];
+    wchar_t wide[512];
+    if (log) um_state_dir(path, sizeof path);
+    else um_config_dir(path, sizeof path);
+    um_utf8_to_wide(path, wide, sizeof wide / sizeof *wide);
+    if (wide[0]) ShellExecuteW(owner, L"open", wide, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void right_menu(void)
+{
+    const um_toast_model *model = um_gui_win_inventory();
+    HMENU menu = CreatePopupMenu();
+    wchar_t status[128];
+    if (!menu) return;
+    if (model) swprintf(status, 128, L"状态：已检测到 %d 个设备", model->n_rows);
+    else wcscpy(status, L"状态：正在扫描设备");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, ID_PANEL, L"打开设备概览");
+    AppendMenuW(menu, MF_STRING, ID_RESCAN, L"立即重新扫描");
+    AppendMenuW(menu, MF_STRING, ID_LOG, L"打开日志目录");
+    AppendMenuW(menu, MF_STRING, ID_CONFIG, L"打开配置目录");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (um_startup_enabled() ? MF_CHECKED : 0),
+                ID_STARTUP, L"随系统启动");
+    AppendMenuW(menu, MF_STRING, ID_QUIT, L"退出");
+
+    switch (popup(menu, "right")) {
+    case ID_PANEL: um_gui_win_open_panel(); break;
+    case ID_RESCAN: SetEvent((HANDLE)app->wake_event); break;
+    case ID_LOG: open_directory(1); break;
+    case ID_CONFIG: open_directory(0); break;
+    case ID_STARTUP: {
+        int enabled = um_startup_enabled();
+        if ((enabled ? um_startup_uninstall() : um_startup_install()) == 0)
+            um_gui_win_notice("随系统启动", enabled ? "已关闭登录自启动。" : "已开启登录自启动。", 1);
+        else
+            um_gui_win_notice("自启动设置未保存", "Windows 未能更新登录自启动项。", 2);
+        break;
+    }
+    case ID_QUIT: um_request_stop(); break;
+    }
+}
+
+static NOTIFYICONDATAW icon_data(void)
+{
+    NOTIFYICONDATAW data = {0};
+    data.cbSize = sizeof data;
+    data.hWnd = owner;
+    data.uID = 1;
+    return data;
+}
+
+static void add_icon(const char *tag)
+{
+    NOTIFYICONDATAW data = icon_data();
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = UMWM_TRAY;
+    data.hIcon = icon;
+    wcscpy(data.szTip, L"usbmon · USB 设备监控");
+    um_tray_test_log(tag, Shell_NotifyIconW(NIM_ADD, &data) ? "ok" : "fail");
+}
+
+void um_tray_install(HWND hwnd, um_gui *gui)
+{
+    owner = hwnd;
+    app = gui;
+    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    if (!icon) icon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    add_icon("icon_add");
+}
+
+void um_tray_uninstall(void)
+{
+    NOTIFYICONDATAW data = icon_data();
+    if (!owner) return;
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    owner = NULL;
+}
+
+int um_tray_filter(UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)wp;
+    if (!owner) return 0;
+    if (taskbar_created && msg == taskbar_created) {
+        add_icon("icon_readd");
+        return 1;
+    }
+    switch (msg) {
+    case UMWM_TRAY:
+        if (!in_menu) {
+            if (lp == WM_LBUTTONUP) left_menu();
+            if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) right_menu();
+        }
+        return 1;
+    case UMWM_TRAY_RESCAN:
+        SetEvent((HANDLE)app->wake_event);
+        return 1;
+    case UMWM_TRAY_QUIT:
+        um_request_stop();
+        return 1;
+    case UMWM_TRAY_EJECT_TEST:
+        if (getenv("USBMON_TRAY_TEST")) um_tray_eject("");
+        return 1;
+    default:
+        return 0;
+    }
+}

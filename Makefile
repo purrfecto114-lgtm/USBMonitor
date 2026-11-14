@@ -1,6 +1,6 @@
 # usbmon — native USB storage monitor (C99)
 #
-# Linux/macOS:   make            (daemon + usbmon-toast popup helper)
+# Linux:         make            (daemon + usbmon-toast popup helper)
 # Windows:       make CROSS=x86_64-w64-mingw32- windows
 #                (mingw-w64 cross-compile; -static: the exe imports only
 #                 Windows system DLLs — KERNEL32/msvcrt/user32/gdi32/
@@ -29,14 +29,14 @@ LDFLAGS ?=
 # CI installs musl-tools; locally musl-gcc may be absent, in which case
 # `make static` fails loudly and `make dist` falls back to the dynamic
 # daemon with a warning.
-MUSL_CC := $(shell command -v musl-gcc 2>/dev/null)
+MUSL_CC ?= $(shell command -v musl-gcc 2>/dev/null)
 
 VERSION   := $(shell sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
 DIST_NAME := usbmon-$(VERSION)-linux-amd64
 
 SRC_COMMON  = src/main.c src/util.c src/logjson.c src/json.c src/hook.c \
-              src/lock.c src/gui.c src/hotpath.c
-SRC_LINUX   = $(SRC_COMMON) src/scan_linux.c
+              src/lock.c src/state.c
+SRC_LINUX   = $(SRC_COMMON) src/scan_linux.c src/hotpath.c src/gui.c
 SRC_WIN     = $(SRC_COMMON) src/scan_win32.c src/gui_win32.c src/tray_win32.c \
               src/um_enum.c src/um_toast_ui.c src/um_toast_win32.c
 
@@ -45,11 +45,12 @@ SRC_WIN     = $(SRC_COMMON) src/scan_win32.c src/gui_win32.c src/tray_win32.c \
 # and the SetupAPI/volume-extents evidence flow both run on POSIX CI.
 UI_TST_SRC    = tests/ui_test.c src/um_toast_ui.c src/um_toast_win32.c \
                 tests/win32_shim.c
-ENUM_TST_SRC  = tests/enum_test.c src/um_enum.c src/um_toast_ui.c \
+CORE_TST_SRC  = tests/core_test.c src/hotpath.c src/json.c src/logjson.c src/util.c
+ENUM_TST_SRC  = tests/enum_test.c src/um_enum.c src/scan_win32.c src/util.c src/um_toast_ui.c \
                 tests/win32_shim.c
 TST_HDRS      = src/um_toast_ui.h src/um_toast_win32.h src/um_enum.h \
-                tests/win32_shim.h
-TST_FLAGS     = -Isrc -Itests
+                tests/win32_shim.h src/usbmon.h
+TST_FLAGS     = -DUM_WIN32_SHIM -Isrc -Itests
 
 # --- X11/Xft availability probe (for usbmon-toast only) ---------------------
 XFT_CFLAGS := $(shell pkg-config --cflags x11 xft 2>/dev/null)
@@ -57,13 +58,12 @@ XFT_LIBS   := $(shell pkg-config --libs x11 xft 2>/dev/null)
 ifeq ($(strip $(XFT_LIBS)),)
 XFT_LIBS := -lX11 -lXft
 endif
-HAVE_X11 := $(shell printf 'int main(void){return 0;}' > /tmp/usbmon-x11probe.c && \
-	$(CC) -std=c99 /tmp/usbmon-x11probe.c -o /tmp/usbmon-x11probe \
-	$(XFT_CFLAGS) $(XFT_LIBS) >/dev/null 2>&1 && echo yes)
+HAVE_X11 := $(shell printf '#include <X11/Xft/Xft.h>\nint main(void){return XOpenDisplay(0) != 0;}\n' | \
+	$(CC) -x c - $(XFT_CFLAGS) $(XFT_LIBS) -o /dev/null >/dev/null 2>&1 && echo yes)
 
 # --- targets ----------------------------------------------------------------
 .PHONY: all clean windows strict analyze asan gui dist dist-windows static \
-	selftest ui-test enum-test
+	selftest ui-test enum-test integration-test
 
 all: usbmon $(if $(HAVE_X11),usbmon-toast,)
 
@@ -91,11 +91,16 @@ ifneq ($(strip $(HAVE_X11)),)
 endif
 	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/ui_test $(UI_TST_SRC)
 	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/enum_test $(ENUM_TST_SRC)
+	$(CC) -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(TST_FLAGS) -o tests/core_test $(CORE_TST_SRC)
 
 # run the panel UI-kernel + evidence-layer tests (built by `strict`)
-selftest: tests/ui_test tests/enum_test
+selftest: tests/ui_test tests/enum_test tests/core_test
 	./tests/ui_test
 	./tests/enum_test
+	./tests/core_test
+
+integration-test: usbmon
+	python3 tests/daemon_test.py ./usbmon
 
 # convenience aliases
 ui-test: tests/ui_test
@@ -109,9 +114,12 @@ tests/ui_test: $(UI_TST_SRC) $(TST_HDRS)
 tests/enum_test: $(ENUM_TST_SRC) $(TST_HDRS)
 	$(CC) $(CFLAGS) $(TST_FLAGS) -o $@ $(ENUM_TST_SRC)
 
+tests/core_test: $(CORE_TST_SRC) src/usbmon.h
+	$(CC) $(CFLAGS) -Isrc -o $@ $(CORE_TST_SRC)
+
 # GCC static analyzer pass (gcc >= 10)
 analyze:
-	$(CC) -std=c99 -O2 -Wall -Wextra -fanalyzer $(SRC_LINUX) -o /dev/null $(LDFLAGS)
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -fanalyzer $(SRC_LINUX) -o /dev/null $(LDFLAGS)
 
 # sanitizer build for the end-to-end demo
 asan:
@@ -181,9 +189,9 @@ dist: usbmon
 res/usbmon.res.o: res/usbmon.rc res/usbmon.ico
 	$(CROSS)windres res/usbmon.rc -O coff -o $@
 
-windows: $(SRC_WIN) src/usbmon.h res/usbmon.res.o
+windows: $(SRC_WIN) src/usbmon.h src/win_app.h $(TST_HDRS) res/usbmon.res.o
 	$(CROSS)gcc -std=c99 -O2 -Wall -Wextra -pedantic -Werror $(SRC_WIN) \
-            res/usbmon.res.o -o usbmon.exe $(LDFLAGS) -mwindows -static \
+            res/usbmon.res.o -o usbmon.exe $(LDFLAGS) -mwindows -municode -static \
             -luser32 -lgdi32 -lshell32 -ladvapi32 -lcfgmgr32 -lsetupapi
 
 # Windows packaging: zip + append to dist/SHA256SUMS.txt.
@@ -209,6 +217,6 @@ dist-windows: windows
 clean:
 	rm -f usbmon usbmon-toast usbmon-asan usbmon-static usbmon.exe
 	rm -f res/usbmon.res.o
-	rm -f tests/ui_test tests/enum_test
+	rm -f tests/ui_test tests/enum_test tests/core_test
 	rm -f out-toast-*.svg
 	rm -rf dist

@@ -72,12 +72,25 @@ int um_hooks_load(um_hooks *hk, const char *path)
     if (!path || !*path) return 0;
     um_copy_str(hk->path, sizeof hk->path, path);
 
-    if (um_read_file_str(path, text, sizeof text) < 0) {
-        /* missing file = no hooks (not an error: hooks are opt-in) */
-        hk->count = 0;
-        return 0;
+    {
+        FILE *file = um_fopen(path, "rb");
+        size_t len;
+        int invalid;
+        if (!file) {
+            if (errno == ENOENT) return 0;
+            fprintf(stderr, "usbmon: cannot read hooks config %s\n", path);
+            return -1;
+        }
+        len = fread(text, 1, sizeof text, file);
+        invalid = ferror(file) || len == sizeof text || memchr(text, 0, len) != NULL;
+        fclose(file);
+        if (invalid) {
+            fprintf(stderr, "usbmon: invalid or oversized hooks config %s\n", path);
+            return -1;
+        }
+        if (!len) return 0;
+        text[len] = '\0';
     }
-    if (!text[0]) { hk->count = 0; return 0; }
 
     root = json_parse(text);
     if (!root) {
@@ -118,10 +131,11 @@ int um_hooks_load(um_hooks *hk, const char *path)
                 int ok = 1;
                 h->argc = 0;
                 for (j = 0; j < cmd->n; j++) {
-                    const char *s = json_str(cmd->items[j], "");
-                    const char *t = s;
-                    while (*t == ' ' || *t == '\t') t++;
-                    if (!*t || strlen(t) > UM_HOOK_ARG_MAX - 1) { ok = 0; break; }
+                    const char *t = json_str(cmd->items[j], NULL);
+                    if (!t || (!j && !*t) || strlen(t) >= UM_HOOK_ARG_MAX) {
+                        ok = 0;
+                        break;
+                    }
                     if (j == 0)
                         snprintf(h->command, sizeof h->command, "%s", t);
                     else
@@ -191,26 +205,17 @@ void um_hooks_shutdown(um_hooks *hk, int max_wait_ms)
 /* ------------------------------------------------------------ security --- */
 
 #ifdef _WIN32
-static const char *CMD_SUFFIXES[] = { ".bat", ".cmd", ".ps1", NULL };
-
 static const char *validate_command_win(char **argv, int argc)
 {
+    const char *exe = argv[0];
+    size_t len = strlen(exe);
     int i;
-    const char *exec_lower;
-    size_t el;
-    int s;
-
-    /* 1) shell-script executables implicitly invoke cmd.exe (BatBadBut,
-     * CVE-2024-24576: "This happens only if a batch file is explicitly
-     * specified in the command line passed to CreateProcess(), and it
-     * doesn't happen when a .exe file is specified.")  Reject them. */
-    exec_lower = argv[0];
-    el = strlen(exec_lower);
-    for (s = 0; CMD_SUFFIXES[s]; s++) {
-        size_t sl = strlen(CMD_SUFFIXES[s]);
-        if (el >= sl && _stricmp(exec_lower + el - sl, CMD_SUFFIXES[s]) == 0)
-            return "shell_script_executable";
-    }
+    if (len < 5 || _stricmp(exe + len - 4, ".exe") != 0)
+        return "executable_must_be_exe";
+    if (!((isalpha((unsigned char)exe[0]) && exe[1] == ':' &&
+           (exe[2] == '\\' || exe[2] == '/')) ||
+          (exe[0] == '\\' && exe[1] == '\\' && exe[2] != '.' && exe[2] != '?')))
+        return "executable_must_be_absolute";
     /* 2) embedded double quotes: the builder below does not escape
      * mid-string quotes (conservative posture inherited from the
      * original); everything else -- spaces, parentheses, %, ^ -- is
@@ -280,7 +285,7 @@ static void spawn_child(um_hooks *hk, const um_hook *h, char **argv, int argc,
     HANDLE nul = NULL;
     wchar_t wargv[UM_HOOK_MAX_ARGS][UM_HOOK_ARG_MAX];
     wchar_t cmdline[UM_HOOK_MAX_ARGS * (size_t)UM_HOOK_ARG_MAX];
-    const size_t CAP = sizeof cmdline / sizeof cmdline[0];
+    const size_t CAP = 32767;
     int i;
     size_t off = 0;
 
@@ -331,7 +336,7 @@ static void spawn_child(um_hooks *hk, const um_hook *h, char **argv, int argc,
         si.hStdError = nul;
     }
     memset(&pi, 0, sizeof pi);
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
+    if (!CreateProcessW(wargv[0], cmdline, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
         fprintf(stderr, "usbmon: hook '%s' spawn failed (CreateProcessW)\n", h->name);
@@ -382,7 +387,7 @@ void um_hooks_dispatch(um_hooks *hk, const um_device *dev, const char *path_hint
 {
     int i;
     char argvbuf[UM_HOOK_MAX_ARGS][UM_HOOK_ARG_MAX];
-    char *argv[UM_HOOK_MAX_ARGS];
+    char *argv[UM_HOOK_MAX_ARGS] = {0};
 
     if (hk->hooks_disabled || hk->count == 0) return;
 
@@ -405,6 +410,10 @@ void um_hooks_dispatch(um_hooks *hk, const um_device *dev, const char *path_hint
         }
         if (!matched) continue;
 
+        if (strchr(h->command, '{')) {
+            fprintf(stderr, "usbmon: hook '%s' executable cannot contain placeholders\n", h->name);
+            continue;
+        }
         if (fired_recently(hk, h->name, dev->key, h->debounce_s)) continue;
 
         /* substitute {key} {model} {path} placeholders, argv-array only */
@@ -435,12 +444,12 @@ void um_hooks_dispatch(um_hooks *hk, const um_device *dev, const char *path_hint
                 }
                 if (!ok || o >= sizeof token - 1) { matched = 0; break; }
                 token[o] = '\0';
-                if (strlen(token) >= sizeof argvbuf[0] - 1) {
+                if (o >= sizeof argvbuf[0]) {
                     /* expanded token no longer fits an argv slot: reject
                      * rather than silently truncate (review #19) */
                     matched = 0; break;
                 }
-                snprintf(argvbuf[j], sizeof argvbuf[0], "%s", token);
+                memcpy(argvbuf[j], token, o + 1);
                 argv[j] = argvbuf[j];
             }
             if (!matched || !ok) continue;

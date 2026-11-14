@@ -562,345 +562,337 @@ void shim_svg(const char *path, int width, int height, const char *bg)
             if (d->align == 1) tx = d->x + d->w;
             else if (d->align == 2) tx = d->x + d->w / 2;
             fprintf(f,
+                "<clipPath id=\"text%d\"><rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\"/>"
+                "</clipPath>\n"
                 "<text x=\"%d\" y=\"%d\" fill=\"%s\" font-family=\"Noto Sans CJK SC,"
-                "WenQuanYi Micro Hei,DejaVu Sans,sans-serif\" font-size=\"%d\" "
-                "font-weight=\"%d\" text-anchor=\"%s\" "
-                "style=\"dominant-baseline:hanging\">%s</text>\n",
-                tx, d->y + 2, c1, d->fontpx ? d->fontpx : 13,
-                d->bold ? 600 : 400, anchor, esc);
+                "WenQuanYi Zen Hei,DejaVu Sans,sans-serif\" font-size=\"%d\" "
+                "font-weight=\"%d\" text-anchor=\"%s\" clip-path=\"url(#text%d)\">%s</text>\n",
+                i, d->x, d->y, d->w, d->h,
+                tx, d->y + (d->fontpx ? d->fontpx : 13), c1, d->fontpx ? d->fontpx : 13,
+                d->bold ? 600 : 400, anchor, i, esc);
         }
     }
     fprintf(f, "</svg>\n");
     fclose(f);
 }
 
-/* ==========================================================================
- * 设备枚举仿真：让 src/um_enum.c 这份生产代码能在 Linux 上被真实驱动。
- * ========================================================================== */
+/* Device-world adapter. The inventory uses the same enumeration and IO code
+ * in these tests as in the Windows build. */
+#include "usbmon.h"
 
-#define SHIM_MAX_DEV 32
+#define SHIM_MAX_DEV 128
 
-static shim_dev g_world[SHIM_MAX_DEV];
-static int      g_world_n = 0;
+static shim_dev world[SHIM_MAX_DEV];
+static int world_n, enum_fails, eject_veto;
+static DWORD last_error;
+static DEVINST last_eject;
 
 void shim_set_world(const shim_dev *devs, int n)
 {
     if (n > SHIM_MAX_DEV) n = SHIM_MAX_DEV;
-    memcpy(g_world, devs, (size_t)n * sizeof(shim_dev));
-    g_world_n = n;
+    if (n) memcpy(world, devs, (size_t)n * sizeof *devs);
+    world_n = n;
+    last_eject = 0;
+    eject_veto = 0;
+    enum_fails = 0;
 }
 
-/* DevInfo 集合：用接口类过滤器 + 游标表示 */
-typedef struct {
-    int iface;
-    int cur;
-} shim_set;
-
-HDEVINFO SetupDiGetClassDevsW(const void *guid, const wchar_t *enumerator,
-                              void *hwnd, DWORD flags)
+void shim_enum_failure(int fail) { enum_fails = fail; }
+void shim_eject_veto(int veto) { eject_veto = veto; }
+DEVINST shim_last_eject(void) { return last_eject; }
+DWORD GetLastError(void) { return last_error; }
+BOOL SetThreadErrorMode(DWORD mode, DWORD *old)
 {
-    shim_set *s;
-    (void)enumerator; (void)hwnd; (void)flags;
-    s = (shim_set *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    s->iface = (int)(ULONG_PTR)guid;    /* 测试里用代号代替 GUID 指针 */
-    s->cur = 0;
-    return (HDEVINFO)s;
-}
-
-int SetupDiEnumDeviceInterfaces(HDEVINFO set, void *a,
-                                const void *guid, DWORD idx,
-                                SP_DEVICE_INTERFACE_DATA_SHIM *d)
-{
-    shim_set *s = (shim_set *)set;
-    int i, seen = 0;
-    (void)a; (void)guid;
-    if (!s) return 0;
-    for (i = 0; i < g_world_n; i++) {
-        if (g_world[i].iface != s->iface) continue;
-        if (seen++ == (int)idx) {
-            if (d) { d->cbSize = sizeof(*d); d->Flags = 0; }
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int SetupDiGetDeviceInterfaceDetailW(HDEVINFO set,
-                                     SP_DEVICE_INTERFACE_DATA_SHIM *d,
-                                     void *detail, DWORD sz,
-                                     DWORD *need, void *devinfo)
-{
-    shim_set *s = (shim_set *)set;
-    int i, seen = 0;
-    (void)d; (void)sz; (void)devinfo;
-    if (!s || !detail) return 0;
-    for (i = 0; i < g_world_n; i++) {
-        if (g_world[i].iface != s->iface) continue;
-        if (seen++ == s->cur) {
-            /* detail 布局：前 8 字节是 cbSize(DWORD)+pad，后接 wchar 路径 */
-            char *p = (char *)detail;
-            DWORD cb = 8;
-            memcpy(p, &cb, sizeof cb);
-            /* 用 UTF-8 直接放进宽字符缓冲（测试世界只含 ASCII 路径足够） */
-            {
-                wchar_t *wp = (wchar_t *)(p + 8);
-                const char *src = g_world[i].device_path;
-                int k = 0;
-                for (; src && src[k] && k < 250; k++) wp[k] = (wchar_t)src[k];
-                wp[k] = 0;
-            }
-            s->cur++;
-            if (need) *need = 8;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int SetupDiDestroyDeviceInfoList(HDEVINFO set)
-{
-    free(set);
+    (void)mode;
+    if (old) *old = 0;
     return 1;
 }
 
-/* 仿真里用"世界数组下标 + 1"充当 DEVINST（0 保留为无效） */
-CONFIGRET CM_Get_Parent(DEVINST *parent, DEVINST child, DWORD flags)
+void um_utf8_to_wide(const char *in, wchar_t *out, size_t n)
+{
+    size_t k;
+    for (k = 0; k + 1 < n && in[k]; k++) out[k] = (unsigned char)in[k];
+    if (n) out[k] = L'\0';
+}
+
+void um_wide_to_utf8(const wchar_t *in, char *out, size_t n)
+{
+    size_t k;
+    for (k = 0; k + 1 < n && in[k]; k++) out[k] = (char)in[k];
+    if (n) out[k] = '\0';
+}
+
+HDEVINFO SetupDiGetClassDevsW(const GUID *guid, const wchar_t *enumerator,
+                              HWND hwnd, DWORD flags)
+{
+    (void)enumerator; (void)hwnd; (void)flags;
+    return enum_fails ? INVALID_HANDLE_VALUE : (void *)guid;
+}
+
+BOOL SetupDiEnumDeviceInterfaces(HDEVINFO set, void *a, const GUID *guid,
+                                 DWORD idx, SP_DEVICE_INTERFACE_DATA *d)
 {
     int i;
-    (void)flags;
-    if (!parent || child == 0 || child > (DEVINST)g_world_n) return 1;
-    for (i = 0; i < g_world_n; i++) {
-        const shim_dev *p;
-        int j;
-        if (!g_world[i].parent_inst) continue;
-        /* 找到 child 对应的设备，再看它的 parent_inst 指向谁 */
-        if ((DEVINST)(i + 1) != child) continue;
-        p = &g_world[i];
-        for (j = 0; j < g_world_n; j++) {
-            if (strcmp(g_world[j].instance_id, p->parent_inst) == 0) {
-                *parent = (DEVINST)(j + 1);
-                return CR_SUCCESS;
-            }
+    (void)a; (void)guid;
+    for (i = 0; i < world_n; i++) {
+        if (world[i].iface == (int)(uintptr_t)set && idx-- == 0) {
+            d->index = i;
+            return 1;
         }
-        return 1;
     }
+    last_error = ERROR_NO_MORE_ITEMS;
+    return 0;
+}
+
+BOOL SetupDiGetDeviceInterfaceDetailW(HDEVINFO set, SP_DEVICE_INTERFACE_DATA *d,
+                                      SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail,
+                                      DWORD sz, DWORD *need, SP_DEVINFO_DATA *info)
+{
+    const char *path = world[d->index].device_path;
+    DWORD size = (DWORD)(sizeof *detail + strlen(path) * sizeof(wchar_t));
+    (void)set;
+    if (need) *need = size;
+    if (!detail || sz < size) {
+        last_error = ERROR_INSUFFICIENT_BUFFER;
+        return 0;
+    }
+    um_utf8_to_wide(path, detail->DevicePath, strlen(path) + 1);
+    if (info) info->DevInst = (DEVINST)d->index + 1;
     return 1;
+}
+
+BOOL SetupDiGetDeviceRegistryPropertyW(HDEVINFO set, SP_DEVINFO_DATA *info, DWORD prop,
+                                       DWORD *type, BYTE *buf, DWORD size, DWORD *need)
+{
+    (void)set; (void)info; (void)prop; (void)type; (void)buf; (void)size; (void)need;
+    return 0;
+}
+
+BOOL SetupDiDestroyDeviceInfoList(HDEVINFO set) { (void)set; return 1; }
+
+static DEVINST node_of(const char *id)
+{
+    int i;
+    for (i = 0; i < world_n; i++) {
+        if (world[i].instance_id && !strcmp(id, world[i].instance_id)) return (DEVINST)i + 1;
+    }
+    return 0;
+}
+
+CONFIGRET CM_Get_Parent(DEVINST *parent, DEVINST child, DWORD flags)
+{
+    (void)flags;
+    if (!child || child > (DEVINST)world_n || !world[child - 1].parent_inst)
+        return CR_NO_SUCH_DEVNODE;
+    *parent = node_of(world[child - 1].parent_inst);
+    return *parent ? CR_SUCCESS : CR_NO_SUCH_DEVNODE;
 }
 
 CONFIGRET CM_Get_Device_IDW(DEVINST inst, wchar_t *buf, DWORD n, DWORD flags)
 {
-    const char *src;
-    int k;
     (void)flags;
-    if (!buf || n == 0 || inst == 0 || inst > (DEVINST)g_world_n) return 1;
-    src = g_world[inst - 1].instance_id;
-    for (k = 0; src[k] && k < (int)n - 1; k++) buf[k] = (wchar_t)src[k];
-    buf[k] = 0;
+    if (!inst || inst > (DEVINST)world_n) return CR_NO_SUCH_DEVNODE;
+    um_utf8_to_wide(world[inst - 1].instance_id, buf, n);
     return CR_SUCCESS;
 }
 
-/* 供 um_enum 反查：按实例 ID 找 DEVINST */
-DEVINST shim_devnode_of(const char *instance_id)
+CONFIGRET CM_Locate_DevNodeW(DEVINST *inst, wchar_t *id, DWORD flags)
 {
-    int i;
-    if (!instance_id) return 0;
-    for (i = 0; i < g_world_n; i++)
-        if (strcmp(g_world[i].instance_id, instance_id) == 0)
-            return (DEVINST)(i + 1);
-    return 0;
+    char utf8[MAX_DEVICE_ID_LEN];
+    (void)flags;
+    um_wide_to_utf8(id, utf8, sizeof utf8);
+    *inst = node_of(utf8);
+    return *inst ? CR_SUCCESS : CR_NO_SUCH_DEVNODE;
 }
 
-/* --- 卷枚举：把世界里 IF_VOLUME 的设备当作卷返回 --- */
-
-typedef struct { int cur; } shim_volfind;
-
-void *FindFirstVolumeW(wchar_t *buf, DWORD n)
+CONFIGRET CM_Get_DevNode_Registry_PropertyW(DEVINST inst, DWORD prop, DWORD *type,
+                                           void *out, DWORD *size, DWORD flags)
 {
-    shim_volfind *f = (shim_volfind *)calloc(1, sizeof *f);
+    (void)type; (void)flags;
+    if (!inst || inst > (DEVINST)world_n || prop != CM_DRP_CAPABILITIES || *size < sizeof(DWORD))
+        return CR_NO_SUCH_DEVNODE;
+    *(DWORD *)out = world[inst - 1].removable ? CM_DEVCAP_REMOVABLE : 0;
+    *size = sizeof(DWORD);
+    return CR_SUCCESS;
+}
+
+CONFIGRET CM_Request_Device_EjectW(DEVINST inst, void *type, wchar_t *name, DWORD n, DWORD flags)
+{
+    (void)type; (void)name; (void)n; (void)flags;
+    last_eject = inst;
+    return eject_veto ? CR_REMOVE_VETOED : CR_SUCCESS;
+}
+
+static int volume_path(const wchar_t *path, int slash)
+{
+    char utf8[MAX_PATH];
     int i;
-    (void)n;
-    if (!f) return INVALID_HANDLE_VALUE;
-    /* 定位第一个卷类设备 */
-    for (i = 0; i < g_world_n; i++) {
-        if (g_world[i].iface == IF_VOLUME) {
-            f->cur = i;
-            if (buf) {
-                int k;
-                for (k = 0; g_world[i].device_path[k] && k < 250; k++)
-                    buf[k] = (wchar_t)g_world[i].device_path[k];
-                buf[k] = 0;
-            }
-            return (void *)f;
-        }
+    um_wide_to_utf8(path, utf8, sizeof utf8);
+    for (i = 0; i < world_n; i++) {
+        size_t len;
+        if (world[i].iface != IF_VOLUME) continue;
+        len = strlen(world[i].device_path);
+        if (strncmp(utf8, world[i].device_path, len)) continue;
+        if (slash ? (!strcmp(utf8 + len, "\\")) : !utf8[len]) return i;
     }
-    free(f);
-    return INVALID_HANDLE_VALUE;
+    return -1;
 }
 
-int FindNextVolumeW(void *h, wchar_t *buf, DWORD n)
+BOOL FindNextVolumeW(HANDLE h, wchar_t *buf, DWORD n)
 {
-    shim_volfind *f = (shim_volfind *)h;
-    int i;
-    (void)n;
-    if (!f || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = f->cur + 1; i < g_world_n; i++) {
-        if (g_world[i].iface == IF_VOLUME) {
-            f->cur = i;
-            if (buf) {
-                int k;
-                for (k = 0; g_world[i].device_path[k] && k < 250; k++)
-                    buf[k] = (wchar_t)g_world[i].device_path[k];
-                buf[k] = 0;
-            }
+    int *index = h;
+    while (++*index < world_n) {
+        if (world[*index].iface == IF_VOLUME) {
+            size_t len;
+            um_utf8_to_wide(world[*index].device_path, buf, n);
+            len = wcslen(buf);
+            if (len + 1 >= n) return 0;
+            buf[len] = L'\\';
+            buf[len + 1] = L'\0';
             return 1;
         }
     }
     return 0;
 }
 
-int FindVolumeClose(void *h)
+HANDLE FindFirstVolumeW(wchar_t *buf, DWORD n)
 {
-    free(h);
-    return 1;
-}
-
-int GetVolumePathNamesForVolumeNameW(const wchar_t *vol,
-                                     wchar_t *names, DWORD n, DWORD *ret)
-{
-    int i, o = 0;
-    (void)n;
-    if (!vol || !names) return 0;
-    for (i = 0; i < g_world_n; i++) {
-        const shim_dev *d = &g_world[i];
-        int match = 1, j;
-        if (d->iface != IF_VOLUME) continue;
-        for (j = 0; d->device_path[j]; j++) {
-            if ((wchar_t)d->device_path[j] != vol[j]) { match = 0; break; }
-        }
-        if (!match || vol[j]) continue;
-        /* 生成 "E:\0F:\0G:\0\0" 形式 */
-        for (j = 0; d->letters && d->letters[j]; j += 2) {
-            if (o + 4 >= (int)n) break;
-            names[o++] = (wchar_t)d->letters[j];
-            names[o++] = (wchar_t)':';
-            names[o++] = (wchar_t)'\\';
-            names[o++] = 0;
-        }
-        names[o++] = 0;
-        if (ret) *ret = (DWORD)o;
-        return 1;
-    }
-    return 0;
-}
-
-/* --- 设备 I/O：按路径里的盘符 / 磁盘号查世界 --- */
-
-typedef struct { int dev; int is_phys; } shim_handle;
-
-void *CreateFileW(const wchar_t *path, DWORD access, DWORD share,
-                  void *sa, DWORD disp, DWORD flags, void *tmpl)
-{
-    shim_handle *h;
-    int i;
-    char p8[256];
-    int k;
-    (void)access; (void)share; (void)sa; (void)disp; (void)flags; (void)tmpl;
-
-    for (k = 0; path && path[k] && k < 255; k++) p8[k] = (char)path[k];
-    p8[k] = 0;
-
-    /* \\.\PhysicalDriveN */
-    if (strstr(p8, "PhysicalDrive")) {
-        int dn = atoi(strstr(p8, "PhysicalDrive") + 13);
-        for (i = 0; i < g_world_n; i++) {
-            if (g_world[i].disk_number == dn) {
-                h = (shim_handle *)calloc(1, sizeof *h);
-                if (!h) return INVALID_HANDLE_VALUE;
-                h->dev = i; h->is_phys = 1;
-                return (void *)h;
-            }
-        }
-        return INVALID_HANDLE_VALUE;
-    }
-    /* 设备接口路径精确匹配（disk / hid / net / hub 接口） */
-    for (i = 0; i < g_world_n; i++) {
-        if (strcmp(p8, g_world[i].device_path) == 0) {
-            h = (shim_handle *)calloc(1, sizeof *h);
-            if (!h) return INVALID_HANDLE_VALUE;
-            h->dev = i; h->is_phys = 1;
-            return (void *)h;
-        }
-    }
-    /* \\?\Volume{...} 或 \\.\X: */
-    for (i = 0; i < g_world_n; i++) {
-        if (g_world[i].iface != IF_VOLUME) continue;
-        if (strstr(p8, g_world[i].device_path) ||
-            (strlen(p8) >= 2 && p8[strlen(p8) - 1] == ':')) {
-            const char *L = g_world[i].letters;
-            int want = (strlen(p8) >= 2) ? p8[strlen(p8) - 2] : 0;
-            if (strstr(p8, g_world[i].device_path) ||
-                (want && L && strchr(L, want))) {
-                h = (shim_handle *)calloc(1, sizeof *h);
-                if (!h) return INVALID_HANDLE_VALUE;
-                h->dev = i; h->is_phys = 0;
-                return (void *)h;
-            }
-        }
-    }
+    int *index = malloc(sizeof *index);
+    if (!index) return INVALID_HANDLE_VALUE;
+    *index = -1;
+    if (FindNextVolumeW(index, buf, n)) return index;
+    free(index);
     return INVALID_HANDLE_VALUE;
 }
 
-int DeviceIoControl(void *h, DWORD code, void *in, DWORD in_sz,
-                    void *out, DWORD out_sz, DWORD *ret, void *ov)
-{
-    shim_handle *sh = (shim_handle *)h;
-    (void)in; (void)in_sz; (void)ov;
-    if (!sh || h == INVALID_HANDLE_VALUE || !out) return 0;
+BOOL FindVolumeClose(HANDLE h) { free(h); return 1; }
 
-    if (code == IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS) {
-        /* out: NumberOfDiskExtents(DWORD) + DISK_EXTENT{DiskNumber,...} */
-        DWORD n = 1;
-        int   dn = g_world[sh->dev].disk_number;
-        if (dn < 0) return 0;
-        if (out_sz < sizeof(DWORD) + 24) return 0;
-        memcpy(out, &n, sizeof n);
-        memcpy((char *)out + sizeof(DWORD), &dn, sizeof dn);
-        if (ret) *ret = (DWORD)(sizeof(DWORD) + 24);
-        return 1;
-    }
-    if (code == IOCTL_STORAGE_GET_DEVICE_NUMBER) {
-        /* out: STORAGE_DEVICE_NUMBER{DeviceType(4) DeviceNumber(4) PartitionNumber(4)} */
-        int dn = g_world[sh->dev].disk_number;
-        int zero = 0;
-        if (dn < 0) return 0;
-        if (out_sz < 12) return 0;
-        memset(out, 0, out_sz);
-        memcpy((char *)out + 4, &dn, sizeof dn);
-        memcpy((char *)out + 8, &zero, sizeof zero);
-        if (ret) *ret = 12;
-        return 1;
-    }
-    if (code == IOCTL_STORAGE_QUERY_PROPERTY) {
-        /* out: STORAGE_DEVICE_DESCRIPTOR 简化：BusType 在偏移 28 */
-        int bus = g_world[sh->dev].bus_type;
-        int rem = g_world[sh->dev].removable;
-        if (out_sz < 40) return 0;
-        memset(out, 0, out_sz);
-        /* 偏移必须与 STORAGE_DEVICE_DESCRIPTOR 一致：
-         *   BusType        @ 28 (uint32)
-         *   RemovableMedia @ 10 (uint8)  —— 之前错写成 32，读到了
-         *                                   RawPropertiesLength 的位置 */
-        memcpy((char *)out + 28, &bus, sizeof bus);
-        ((unsigned char *)out)[10] = (unsigned char)(rem ? 1 : 0);
-        if (ret) *ret = 40;
-        return 1;
-    }
-    return 0;
-}
-
-int CloseHandleShim(void *h)
+BOOL GetVolumePathNamesForVolumeNameW(const wchar_t *vol, wchar_t *names, DWORD n, DWORD *ret)
 {
-    free(h);
+    int index = volume_path(vol, 1);
+    size_t used = 0;
+    const char *path;
+    if (index < 0 || !n) return 0;
+    path = world[index].letters;
+    if (path && strlen(path) > 2 && path[2] == '\\') {
+        used = strlen(path) + 1;
+        if (used + 1 > n) {
+            last_error = ERROR_MORE_DATA;
+            if (ret) *ret = (DWORD)used + 1;
+            return 0;
+        }
+        um_utf8_to_wide(path, names, n);
+    } else {
+        while (path && *path && used + 4 < n) {
+            names[used++] = (wchar_t)*path;
+            names[used++] = L':';
+            names[used++] = L'\\';
+            names[used++] = L'\0';
+            path += 2;
+        }
+    }
+    names[used++] = L'\0';
+    if (ret) *ret = (DWORD)used;
     return 1;
 }
+
+static int volume_at_letter(char letter)
+{
+    int i;
+    for (i = 0; i < world_n; i++) {
+        const char *p = world[i].letters;
+        if (world[i].iface != IF_VOLUME || !p) continue;
+        if (strlen(p) > 2 && p[2] == '\\') continue;
+        for (; *p; p += 2) if (*p == letter) return i;
+    }
+    return -1;
+}
+
+BOOL GetDiskFreeSpaceExW(const wchar_t *path, ULARGE_INTEGER *available,
+                         ULARGE_INTEGER *total, ULARGE_INTEGER *free_bytes)
+{
+    int index = wcslen(path) == 3 ? volume_at_letter((char)path[0]) : -1;
+    if (index < 0) {
+        char utf8[MAX_PATH];
+        int i;
+        um_wide_to_utf8(path, utf8, sizeof utf8);
+        for (i = 0; i < world_n; i++)
+            if (world[i].iface == IF_VOLUME && world[i].letters && !strcmp(world[i].letters, utf8)) {
+                index = i;
+                break;
+            }
+    }
+    if (index < 0 || !world[index].unlocked) return 0;
+    if (available) available->QuadPart = 100000;
+    if (total) total->QuadPart = 200000;
+    if (free_bytes) free_bytes->QuadPart = 100000;
+    return 1;
+}
+
+HANDLE CreateFileW(const wchar_t *path, DWORD access, DWORD share,
+                   void *sa, DWORD disp, DWORD flags, void *tmpl)
+{
+    char utf8[MAX_PATH];
+    int index, i;
+    (void)access; (void)share; (void)sa; (void)disp; (void)flags; (void)tmpl;
+    um_wide_to_utf8(path, utf8, sizeof utf8);
+    index = volume_path(path, 0);
+    if (index < 0 && strlen(utf8) == 6 && !strncmp(utf8, "\\\\.\\", 4))
+        index = volume_at_letter(utf8[4]);
+    for (i = 0; index < 0 && i < world_n; i++)
+        if (world[i].iface != IF_VOLUME && !strcmp(utf8, world[i].device_path)) index = i;
+    if (index < 0) return INVALID_HANDLE_VALUE;
+    return &world[index];
+}
+
+BOOL DeviceIoControl(HANDLE h, DWORD code, void *in, DWORD in_sz,
+                      void *out, DWORD out_sz, DWORD *ret, void *ov)
+{
+    const shim_dev *dev = h;
+    (void)in; (void)in_sz; (void)ov;
+    if (h == INVALID_HANDLE_VALUE || dev->disk_number < 0) return 0;
+    *ret = 0;
+    switch (code) {
+    case IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: {
+        VOLUME_DISK_EXTENTS ext = {0};
+        if (dev->iface != IF_VOLUME || out_sz < sizeof ext) return 0;
+        ext.NumberOfDiskExtents = dev->media_present == 2 ? 2 : 1;
+        ext.Extents[0].DiskNumber = (DWORD)dev->disk_number;
+        memcpy(out, &ext, sizeof ext);
+        *ret = sizeof ext;
+        return 1;
+    }
+    case IOCTL_STORAGE_GET_DEVICE_NUMBER: {
+        STORAGE_DEVICE_NUMBER num = {0, (DWORD)dev->disk_number, 0};
+        if (out_sz < sizeof num) return 0;
+        memcpy(out, &num, sizeof num);
+        *ret = sizeof num;
+        return 1;
+    }
+    case IOCTL_STORAGE_QUERY_PROPERTY: {
+        STORAGE_DEVICE_DESCRIPTOR desc = {0};
+        if (out_sz < sizeof desc) return 0;
+        desc.Size = sizeof desc;
+        desc.RemovableMedia = dev->removable != 0;
+        desc.BusType = (DWORD)dev->bus_type;
+        memcpy(out, &desc, sizeof desc);
+        *ret = sizeof desc;
+        return 1;
+    }
+    case IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: {
+        DISK_GEOMETRY_EX geo = {0};
+        if (!dev->media_present || out_sz < sizeof geo) return 0;
+        geo.DiskSize.QuadPart = 640000;
+        memcpy(out, &geo, sizeof geo);
+        *ret = sizeof geo;
+        return 1;
+    }
+    case IOCTL_STORAGE_CHECK_VERIFY2:
+        if (dev->media_present) return 1;
+        last_error = ERROR_NO_MEDIA_IN_DRIVE;
+        return 0;
+    default: return 0;
+    }
+}
+
+BOOL CloseHandle(HANDLE h) { (void)h; return 1; }

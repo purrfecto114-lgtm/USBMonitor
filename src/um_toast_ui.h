@@ -27,18 +27,17 @@
 extern "C" {
 #endif
 
-#define UM_UI_MAX_ROWS   16
+#define UM_UI_MAX_ROWS   64
 #define UM_UI_MAX_TEXT   256
-#define UM_UI_MAX_LETTER 8
+#define UM_UI_MAX_LETTER 26
 
 /* ------------------------------------------------------------------ 主题 -- */
 
 typedef struct {
     const char *name;      /* "dark" / "light"                       */
     unsigned long panel, panel2, text, muted, border;
-    unsigned long accent, accent_hover, progress;
+    unsigned long accent, accent_hover, on_accent, progress;
     unsigned long ok, warn, error;
-    unsigned long shadow;  /* 0xAARRGGBB                              */
 } um_theme;
 
 /* requested: "auto" / "dark" / "light"；system_dark = 系统是否深色（auto 时用） */
@@ -80,57 +79,26 @@ typedef enum {
 um_dev_kind um_ui_classify(unsigned tags, int has_letter, int bus_is_usb,
                            int removable, int media_present, int unlocked);
 
-/* 能力判定：非存储设备一律不可打开/不可弹出（对网卡、笔、拓展坞弹介质
- * 既无意义也会失败）。 */
-int um_ui_can_open(um_dev_kind kind);
-int um_ui_can_eject(um_dev_kind kind, int removable);
-
-/* 行提示文案（无盘符 / 无存储 / 读卡器空槽 / 未解锁…） */
 void um_ui_device_notice(um_dev_kind kind, char *out, size_t n);
-
-/* 1.1.1 原文：remove 事件但没有卷变化时 → "该设备可能尚未分配盘符。" */
-void um_ui_remove_notice(char *out, size_t n);
 
 /* ------------------------------------------------------------------ 模型 -- */
 
 typedef struct {
+    char  instance_id[256];
+    unsigned accessible_letters;
     char  path[16];        /* "E:\\"                                   */
     char  title[96];       /* "Kingston DataTraveler 3.0 (E:)"         */
     char  subtitle[160];   /* "可移动磁盘 · E:\\"                       */
     char  capacity[128];   /* "容量 62.7 GB · 可用 20.1 GB · 68%"      */
-    char  tooltip[256];    /* 进度条 tooltip                           */
     unsigned long long total, used, free;
     int   pct;             /* 0..100，-1 = 未知（不确定进度条）        */
-    unsigned     tags;     /* UM_TAG_* 位掩码                          */
     um_dev_kind  kind;
     int   disk_number;     /* 物理磁盘号（多分区聚合键），-1 = 未知    */
     int   n_letters;       /* 该物理磁盘上的盘符数（多分区）           */
     char  letters[UM_UI_MAX_LETTER][4];   /* "E:" "F:" "G:"            */
-    int   removable;       /* RemovableMedia / CM_DEVCAP_REMOVABLE     */
     int   ejectable;       /* 可安全弹出                               */
     int   openable;        /* 可打开（有盘符且文件系统可用）           */
 } um_volume;
-
-/* 按物理磁盘聚合后的"设备行"（多分区 U 盘只显示一行） */
-typedef struct {
-    int   disk_number;
-    char  title[96];
-    int   n_letters;
-    char  letters[UM_UI_MAX_LETTER][4];
-    unsigned long long total, used, free;
-    int   pct;
-    unsigned     tags;
-    um_dev_kind  kind;
-    int   ejectable, openable;
-} um_device_row;
-
-/* 多分区聚合：以 DiskNumber 为键，把同一物理磁盘上的多个卷合成一行。
- * 返回写入 rows 的数量。 */
-int  um_ui_group_by_disk(const um_volume *vols, int n_vols,
-                         um_device_row *rows, int max_rows);
-
-/* 生成设备行副标题："可移动磁盘 · E:、F:、G:（3 个分区）" */
-void um_ui_row_subtitle(const um_device_row *row, char *out, size_t n);
 
 typedef struct {
     char       headline[UM_UI_MAX_TEXT];   /* "USB 设备监控" / "USB 已连接"  */
@@ -141,6 +109,7 @@ typedef struct {
     int        accent_kind;                /* 0=accent 1=ok 2=warn 3=error   */
     um_volume  rows[UM_UI_MAX_ROWS];
     int        n_rows;
+    int        overview;
 } um_toast_model;
 
 /* -------------------------------------------------------------- 交互状态 -- */
@@ -216,15 +185,14 @@ typedef struct {
 /* 逻辑像素（96 DPI）下的窗口尺寸常量，取自 1.1.1（px(v) = v * 0.88 * scale）。 */
 #define UM_UI_WIDTH          440
 #define UM_UI_PAD            16
-#define UM_UI_ROW_H          62
+#define UM_UI_ROW_H          84
 #define UM_UI_BTN_H          42
 #define UM_UI_COLLAPSED_H    230
 #define UM_UI_EXPANDED_H     430
-#define UM_UI_ROWS_MAX_H     285
-#define UM_UI_ROWS_COLLAPSED_H 105
 #define UM_UI_MARGIN         18   /* 距屏幕工作区边缘 */
 
 /* 计算窗口内容高度（未乘缩放）。 */
+int  um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int height);
 int  um_toast_measure_height(const um_toast_model *m, const um_toast_state *s);
 
 /* 生成绘制图元。width/height 为逻辑尺寸；scale 为 DPI 缩放分子（96=1x）。 */

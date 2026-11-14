@@ -24,7 +24,7 @@ typedef void *HFONT;
 typedef void *HMENU;
 typedef void *HMODULE;
 typedef void *HKEY;
-typedef unsigned long DWORD;
+typedef uint32_t DWORD;
 typedef unsigned char BYTE;
 typedef int BOOL;
 typedef unsigned int UINT;
@@ -74,6 +74,7 @@ typedef struct {
 
 #define WM_CREATE        0x0001
 #define WM_DESTROY       0x0002
+#define WM_CLOSE         0x0010
 #define WM_PAINT         0x000F
 #define WM_ERASEBKGND    0x0014
 #define WM_GETMINMAXINFO 0x0024
@@ -268,92 +269,115 @@ BOOL     AppendMenuW(HMENU m, UINT f, unsigned long long id, LPCWSTR t);
 BOOL     DestroyMenu(HMENU m);
 int      TrackPopupMenuEx(HMENU m, UINT f, int x, int y, HWND hw, void *p);
 
-#endif /* WIN32_SHIM_H */
-
-/* ==========================================================================
- * 设备枚举 / SetupAPI / CM_* 仿真（供 src/um_enum.c 在 Linux 上被真实驱动）
- * ========================================================================== */
-
+/* SetupAPI and disk IO used by the shared Windows inventory. */
 typedef void *HDEVINFO;
-typedef unsigned long ULONG_PTR;
-typedef unsigned long DEVINST;
-typedef unsigned long CONFIGRET;
-typedef void *PHANDLE;
-typedef unsigned long long ULONGLONG;
+typedef void *HANDLE;
+typedef uint32_t DEVINST;
+typedef uint32_t CONFIGRET;
+typedef struct { int dummy; } GUID;
+typedef union { uint64_t QuadPart; } ULARGE_INTEGER;
+typedef struct { int64_t QuadPart; } LARGE_INTEGER;
+typedef struct { DWORD cbSize; DEVINST DevInst; } SP_DEVINFO_DATA;
+typedef struct { DWORD cbSize; int index; } SP_DEVICE_INTERFACE_DATA;
+typedef struct { DWORD cbSize; wchar_t DevicePath[1]; } SP_DEVICE_INTERFACE_DETAIL_DATA_W;
 
-#define MAX_PATH        260
+#define MAX_PATH 260
 #define MAX_DEVICE_ID_LEN 200
 #define INVALID_HANDLE_VALUE ((void *)-1)
-
-typedef struct { DWORD cbSize; void *Reserved; } SP_DEVINFO_DATA_SHIM;
-typedef struct { DWORD cbSize; DWORD Flags; } SP_DEVICE_INTERFACE_DATA_SHIM;
-
-/* 接口类（仿真用代号，真机上为 GUID） */
-#define IF_DISK   1
+#define IF_DISK 1
 #define IF_VOLUME 2
-#define IF_HID    3
-#define IF_NET    4
-#define IF_HUB    5
+#define IF_HID 3
+#define IF_NET 4
+#define IF_HUB 5
 
-/* bus types */
+enum { BusTypeUsb = 7, BusTypeSd = 12, BusTypeMmc = 13 };
 #define BUS_TYPE_UNKNOWN 0
-#define BUS_TYPE_USB     7
-#define BUS_TYPE_SD      12
-#define BUS_TYPE_MMC     13
-#define BUS_TYPE_SATA    11
+#define BUS_TYPE_USB BusTypeUsb
+#define BUS_TYPE_SD BusTypeSd
+#define BUS_TYPE_MMC BusTypeMmc
+#define BUS_TYPE_SATA 11
 
-#define CR_SUCCESS 0
-
-/* IOCTL codes（仿真） */
+enum { CR_SUCCESS, CR_NO_SUCH_DEVNODE, CR_REMOVE_VETOED };
+enum { ERROR_NO_MORE_ITEMS = 259, ERROR_INSUFFICIENT_BUFFER = 122,
+       ERROR_MORE_DATA = 234, ERROR_NO_SUCH_DEVICE = 433, ERROR_DEVICE_NOT_CONNECTED = 1167,
+       ERROR_NOT_READY = 21, ERROR_NO_MEDIA_IN_DRIVE = 1112 };
+#define ERROR_NO_SUCH_DEVINST 0xE000020Bu
+#define DIGCF_PRESENT 2
+#define DIGCF_DEVICEINTERFACE 16
+#define SPDRP_FRIENDLYNAME 12
+#define SPDRP_DEVICEDESC 0
+#define CM_DRP_CAPABILITIES 16
+#define CM_LOCATE_DEVNODE_NORMAL 0
+#define CM_DEVCAP_REMOVABLE 4
+#define CM_DEVCAP_DOCKDEVICE 8
+#define SEM_FAILCRITICALERRORS 1
+#define FILE_SHARE_READ 1
+#define FILE_SHARE_WRITE 2
+#define FILE_SHARE_DELETE 4
+#define OPEN_EXISTING 3
 #define IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS 0x560000
-#define IOCTL_STORAGE_QUERY_PROPERTY         0x2D1400
-#define IOCTL_STORAGE_GET_DEVICE_NUMBER      0x2D1080
+#define IOCTL_STORAGE_QUERY_PROPERTY 0x2D1400
+#define IOCTL_STORAGE_GET_DEVICE_NUMBER 0x2D1080
+#define IOCTL_DISK_GET_DRIVE_GEOMETRY_EX 0x700A0
+#define IOCTL_STORAGE_CHECK_VERIFY2 0x2D0800
 
-/* 可注入的"设备世界"，由测试编排 */
+typedef struct { DWORD DeviceType, DeviceNumber, PartitionNumber; } STORAGE_DEVICE_NUMBER;
+typedef struct { DWORD PropertyId, QueryType; BYTE AdditionalParameters[1]; } STORAGE_PROPERTY_QUERY;
 typedef struct {
-    const char *instance_id;    /* 设备实例 ID（同 ID 视为同一物理设备） */
-    const char *device_path;    /* 接口路径 */
-    int         iface;          /* IF_DISK / IF_VOLUME / IF_HID / IF_NET / IF_HUB */
-    int         disk_number;    /* 物理磁盘号，-1 = 非存储 */
-    int         bus_type;       /* BUS_TYPE_* */
-    int         removable;      /* RemovableMedia */
-    int         media_present;  /* 介质就绪（读卡器空槽 = 0） */
-    int         unlocked;       /* 卷已解锁 */
-    const char *letters;        /* "E:F:G:" 或 ""（未分配盘符） */
-    const char *parent_inst;    /* 父设备实例 ID（NULL = 无父）USB 笔/网卡的
-                                   父节点通常是 USB\VID_xxx 或 USB 集线器 */
+    DWORD Version, Size;
+    BYTE DeviceType, DeviceTypeModifier, RemovableMedia, CommandQueueing;
+    DWORD VendorIdOffset, ProductIdOffset, ProductRevisionOffset, SerialNumberOffset;
+    DWORD BusType, RawPropertiesLength;
+    BYTE RawDeviceProperties[1];
+} STORAGE_DEVICE_DESCRIPTOR;
+typedef struct { DWORD DiskNumber; LARGE_INTEGER Offset, Length; } DISK_EXTENT;
+typedef struct { DWORD NumberOfDiskExtents; DISK_EXTENT Extents[1]; } VOLUME_DISK_EXTENTS;
+typedef struct { int64_t geometry[3]; LARGE_INTEGER DiskSize; BYTE Data[1]; } DISK_GEOMETRY_EX;
+
+typedef struct {
+    const char *instance_id;
+    const char *device_path;
+    int iface;
+    int disk_number;
+    int bus_type;
+    int removable;
+    int media_present;
+    int unlocked;
+    const char *letters;       /* E:F: or a directory path */
+    const char *parent_inst;
 } shim_dev;
 
 void shim_set_world(const shim_dev *devs, int n);
+void shim_enum_failure(int fail);
+void shim_eject_veto(int veto);
+DEVINST shim_last_eject(void);
+DWORD GetLastError(void);
+BOOL SetThreadErrorMode(DWORD mode, DWORD *old);
+HANDLE FindFirstVolumeW(wchar_t *buf, DWORD n);
+BOOL FindNextVolumeW(HANDLE h, wchar_t *buf, DWORD n);
+BOOL FindVolumeClose(HANDLE h);
+BOOL GetVolumePathNamesForVolumeNameW(const wchar_t *vol, wchar_t *names, DWORD n, DWORD *ret);
+BOOL GetDiskFreeSpaceExW(const wchar_t *path, ULARGE_INTEGER *available,
+                        ULARGE_INTEGER *total, ULARGE_INTEGER *free_bytes);
+HDEVINFO SetupDiGetClassDevsW(const GUID *guid, const wchar_t *enumerator, HWND hwnd, DWORD flags);
+BOOL SetupDiEnumDeviceInterfaces(HDEVINFO set, void *a, const GUID *guid,
+                                 DWORD idx, SP_DEVICE_INTERFACE_DATA *d);
+BOOL SetupDiGetDeviceInterfaceDetailW(HDEVINFO set, SP_DEVICE_INTERFACE_DATA *d,
+                                      SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail,
+                                      DWORD sz, DWORD *need, SP_DEVINFO_DATA *devinfo);
+BOOL SetupDiGetDeviceRegistryPropertyW(HDEVINFO set, SP_DEVINFO_DATA *info, DWORD prop,
+                                       DWORD *type, BYTE *buf, DWORD size, DWORD *need);
+BOOL SetupDiDestroyDeviceInfoList(HDEVINFO set);
+CONFIGRET CM_Get_Parent(DEVINST *parent, DEVINST child, DWORD flags);
+CONFIGRET CM_Get_Device_IDW(DEVINST inst, wchar_t *buf, DWORD n, DWORD flags);
+CONFIGRET CM_Locate_DevNodeW(DEVINST *inst, wchar_t *id, DWORD flags);
+CONFIGRET CM_Get_DevNode_Registry_PropertyW(DEVINST inst, DWORD prop, DWORD *type,
+                                           void *out, DWORD *size, DWORD flags);
+CONFIGRET CM_Request_Device_EjectW(DEVINST inst, void *type, wchar_t *name, DWORD n, DWORD flags);
+HANDLE CreateFileW(const wchar_t *path, DWORD access, DWORD share,
+                   void *sa, DWORD disp, DWORD flags, void *tmpl);
+BOOL DeviceIoControl(HANDLE h, DWORD code, void *in, DWORD in_sz,
+                      void *out, DWORD out_sz, DWORD *ret, void *ov);
+BOOL CloseHandle(HANDLE h);
 
-/* --- 卷枚举 --- */
-void        *FindFirstVolumeW(wchar_t *buf, DWORD n);
-int          FindNextVolumeW(void *h, wchar_t *buf, DWORD n);
-int          FindVolumeClose(void *h);
-int          GetVolumePathNamesForVolumeNameW(const wchar_t *vol,
-                                              wchar_t *names, DWORD n,
-                                              DWORD *ret);
-
-/* --- SetupAPI --- */
-HDEVINFO     SetupDiGetClassDevsW(const void *guid, const wchar_t *enumerator,
-                                  void *hwnd, DWORD flags);
-int          SetupDiEnumDeviceInterfaces(HDEVINFO set, void *a,
-                                         const void *guid, DWORD idx,
-                                         SP_DEVICE_INTERFACE_DATA_SHIM *d);
-int          SetupDiGetDeviceInterfaceDetailW(HDEVINFO set,
-                                              SP_DEVICE_INTERFACE_DATA_SHIM *d,
-                                              void *detail, DWORD sz,
-                                              DWORD *need, void *devinfo);
-int          SetupDiDestroyDeviceInfoList(HDEVINFO set);
-
-/* --- CM_* --- */
-CONFIGRET    CM_Get_Parent(DEVINST *parent, DEVINST child, DWORD flags);
-CONFIGRET    CM_Get_Device_IDW(DEVINST inst, wchar_t *buf, DWORD n, DWORD flags);
-DEVINST      shim_devnode_of(const char *instance_id);
-
-/* --- 设备 I/O --- */
-void        *CreateFileW(const wchar_t *path, DWORD access, DWORD share,
-                         void *sa, DWORD disp, DWORD flags, void *tmpl);
-int          DeviceIoControl(void *h, DWORD code, void *in, DWORD in_sz,
-                             void *out, DWORD out_sz, DWORD *ret, void *ov);
-int          CloseHandleShim(void *h);
+#endif /* WIN32_SHIM_H */

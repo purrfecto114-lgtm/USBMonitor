@@ -1,7 +1,7 @@
 /* main.c — CLI, snapshot diff, round loop, GUI + hot-path wakeups.
  *
  *   usbmon                  daemon, one scan round per hour (default);
- *                           plug/unplug wake it instantly (inotify /
+ *                           plug/unplug wake it instantly (uevent /
  *                           WM_DEVICECHANGE) and a toast pops up
  *   usbmon --once           single round (cron / Task Scheduler mode)
  *   usbmon --list           print current devices, exit
@@ -17,6 +17,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "um_enum.h"
 #else
 #include <signal.h>
 #include <time.h>
@@ -26,23 +27,21 @@
 /* ---------------------------------------------------------------- signals */
 
 #ifndef _WIN32
-static volatile sig_atomic_t g_stop = 0;
-static volatile sig_atomic_t g_reload_hooks = 0;
+static volatile sig_atomic_t g_stop;
+static volatile sig_atomic_t g_reload_hooks;
+#define stop_requested() (g_stop != 0)
+#define stop_reason() "signal"
 #else
-static volatile int g_stop = 0;          /* set by the console ctrl handler */
-static volatile int g_reload_hooks = 0;  /* Windows has no SIGHUP: never set */
-#endif
+static volatile LONG g_stop;
+static int g_reload_hooks;
+#define stop_requested() (InterlockedCompareExchange(&g_stop, 0, 0) != 0)
+#define stop_reason() (InterlockedCompareExchange(&g_stop, 0, 0) == 2 ? "tray-quit" : "signal")
 
-/* Why the daemon is stopping ("signal" / "tray-quit"): recorded in the
- * JSONL stop event so the log explains every shutdown. */
-static char g_stop_reason[32] = "signal";
-
-void um_request_stop(const char *reason)
+void um_request_stop(void)
 {
-    g_stop = 1;
-    snprintf(g_stop_reason, sizeof g_stop_reason, "%s",
-             (reason && reason[0]) ? reason : "signal");
+    InterlockedCompareExchange(&g_stop, 2, 0);
 }
+#endif
 
 #ifndef _WIN32
 static void on_signal(int sig)
@@ -66,11 +65,10 @@ static BOOL WINAPI on_ctrl(DWORD type)
 {
     if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT ||
         type == CTRL_BREAK_EVENT || type == CTRL_SHUTDOWN_EVENT ||
-        type == CTRL_LOGOFF_EVENT) g_stop = 1;
+        type == CTRL_LOGOFF_EVENT) InterlockedCompareExchange(&g_stop, 1, 0);
     return TRUE;
 }
 static void install_signals(void) { SetConsoleCtrlHandler(on_ctrl, TRUE); }
-static void sleep_ms(int ms) { Sleep(ms); }   /* POSIX sleeps in um_hot_wait */
 
 /* Windows GUI-subsystem build (-mwindows): the process owns no console,
  * so double-clicking usbmon.exe never flashes a black window.  When a
@@ -87,21 +85,13 @@ static void win_cli_console_attach(void)
         if (ft == FILE_TYPE_PIPE || ft == FILE_TYPE_DISK) return;
     }
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONERR$", "w", stderr);
+        if (!freopen("CONOUT$", "w", stdout)) return;
+        if (!freopen("CONERR$", "w", stderr)) return;
     }
 }
 #endif
 
 /* ---------------------------------------------------------------- helpers */
-
-int um_snapshot_find(const um_snapshot *s, const char *key)
-{
-    int i;
-    for (i = 0; i < s->count; i++)
-        if (strcmp(s->devs[i].key, key) == 0) return i;
-    return -1;
-}
 
 static void path_hint_for(const um_device *d, char *out, size_t n)
 {
@@ -119,10 +109,13 @@ static void path_hint_for(const um_device *d, char *out, size_t n)
 
 static void emit_add(um_logger *lg, const um_device *d, int baseline)
 {
-    char e_model[UM_MODEL_MAX * 8], e_key[UM_KEY_MAX * 4], e_mount[UM_MOUNT_MAX * 4];
-    char e_serial[128];
-    char parts[UM_MAX_PARTITIONS * (UM_NAME_MAX * 4 + 4)];
-    char e_bus[32];
+    char e_model[UM_MODEL_MAX * 6], e_key[UM_KEY_MAX * 6];
+    char e_mount[UM_MOUNT_MAX * 6], e_serial[UM_SERIAL_MAX * 6];
+    char e_bus[sizeof d->bus * 6], parts[UM_MAX_PARTITIONS * (UM_NAME_MAX * 6 + 3) + 1];
+    char ts[40];
+    char full[sizeof parts + sizeof e_model + sizeof e_key + sizeof e_mount +
+              sizeof e_serial + sizeof e_bus + 320];
+    size_t used = 0;
     int i;
 
     um_json_escape(d->model, e_model, sizeof e_model);
@@ -131,42 +124,26 @@ static void emit_add(um_logger *lg, const um_device *d, int baseline)
     um_json_escape(d->bus, e_bus, sizeof e_bus);
     um_json_escape(lg->raw && d->serial[0] ? d->serial : d->serial_fp,
                    e_serial, sizeof e_serial);
-
     parts[0] = '\0';
     for (i = 0; i < d->partition_count; i++) {
-        char ep[UM_NAME_MAX * 4 + 8];
-        um_json_escape(d->partitions[i], ep + 1, sizeof ep - 8);
-        ep[0] = '"';
-        strcat(ep, "\"");
-        if (i) strcat(parts, ",");
-        strcat(parts, ep);
+        char part[UM_NAME_MAX * 6];
+        um_json_escape(d->partitions[i], part, sizeof part);
+        used += (size_t)snprintf(parts + used, sizeof parts - used, "%s\"%s\"",
+                                 i ? "," : "", part);
     }
-
-    {
-        char ts[40];
-        char full[6144];
-        um_now_utc_iso(ts, sizeof ts);
-        if (baseline)
-            snprintf(full, sizeof full,
-                "{\"ts\":\"%s\",\"ev\":\"add\",\"baseline\":1,\"key\":\"%s\",\"bus\":\"%s\",\"model\":\"%s\","
-                "\"serial\":\"%s\",\"size_bytes\":%llu,\"partitions\":[%s],"
-                "\"mount\":\"%s\",\"fs_total_bytes\":%llu,\"fs_free_bytes\":%llu}",
-                ts, e_key, e_bus, e_model, e_serial,
-                d->size_bytes, parts, e_mount, d->fs_total, d->fs_free);
-        else
-            snprintf(full, sizeof full,
-                "{\"ts\":\"%s\",\"ev\":\"add\",\"key\":\"%s\",\"bus\":\"%s\",\"model\":\"%s\","
-                "\"serial\":\"%s\",\"size_bytes\":%llu,\"partitions\":[%s],"
-                "\"mount\":\"%s\",\"fs_total_bytes\":%llu,\"fs_free_bytes\":%llu}",
-                ts, e_key, e_bus, e_model, e_serial,
-                d->size_bytes, parts, e_mount, d->fs_total, d->fs_free);
-        um_log_line(lg, full);
-    }
+    um_now_utc_iso(ts, sizeof ts);
+    snprintf(full, sizeof full,
+             "{\"ts\":\"%s\",\"ev\":\"add\",%s\"key\":\"%s\",\"bus\":\"%s\",\"model\":\"%s\","
+             "\"serial\":\"%s\",\"size_bytes\":%llu,\"partitions\":[%s],"
+             "\"mount\":\"%s\",\"fs_total_bytes\":%llu,\"fs_free_bytes\":%llu}",
+             ts, baseline ? "\"baseline\":1," : "", e_key, e_bus, e_model, e_serial,
+             d->size_bytes, parts, e_mount, d->fs_total, d->fs_free);
+    um_log_line(lg, full);
 }
 
 static void emit_remove(um_logger *lg, const um_device *d)
 {
-    char e_key[UM_KEY_MAX * 4];
+    char e_key[UM_KEY_MAX * 6];
     char full[512];
     char ts[40];
     um_json_escape(d->key, e_key, sizeof e_key);
@@ -202,134 +179,87 @@ static void emit_meta(um_logger *lg, const char *what, const char *detail)
     um_log_line(lg, full);
 }
 
-/* --------------------------------------------------------------- state --- */
-
-/* Persist the last seen device keys so `--once` runs (cron mode) can diff
- * across invocations.  Only keys are stored: that is all the diff needs.
- * File format: one key per line, plain text, atomically replaced. */
-static void state_path(char *buf, size_t n)
+static int list_devices(const char *sys_root)
 {
-    char dir[512];
-    um_state_dir(dir, sizeof dir);
-#ifdef _WIN32
-    snprintf(buf, n, "%s\\last-snapshot.txt", dir);
-#else
-    snprintf(buf, n, "%s/last-snapshot.txt", dir);
-#endif
-}
-
-static void state_save(const um_snapshot *s)
-{
-    char path[600], tmp[640];
-    FILE *f;
+    um_snapshot snap;
     int i;
-    state_path(path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    f = fopen(tmp, "w");
-    if (!f) return;
-    for (i = 0; i < s->count; i++) fprintf(f, "%s\n", s->devs[i].key);
-    fclose(f);
-    (void)rename(tmp, path);
-}
-
-static int state_load(um_snapshot *s)
-{
-    char path[600];
-    FILE *f;
-    char line[256];
-    state_path(path, sizeof path);
-    f = fopen(path, "r");
-    if (!f) return 0;
-    s->count = 0;
-    while (fgets(line, sizeof line, f)) {
-        size_t l = strlen(line);
-        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
-        if (!l || s->count >= UM_MAX_DEV) continue;
-        memset(&s->devs[s->count], 0, sizeof s->devs[0]);
-        um_copy_str(s->devs[s->count].key, sizeof s->devs[s->count].key, line);
-        s->count++;
+    if (um_scan_platform(&snap, sys_root) != 0) {
+        fprintf(stderr, "usbmon: device scan failed\n");
+        return 1;
     }
-    fclose(f);
-    return 1;
+    printf("%-8s %-9s %-24s %10s  %s\n", "KEY", "BUS", "MODEL", "SIZE", "MOUNT");
+    for (i = 0; i < snap.count; i++) {
+        const um_device *dev = &snap.devs[i];
+        char size[32], key[UM_KEY_MAX], model[UM_MODEL_MAX], mount[UM_MOUNT_MAX];
+        um_display_text(dev->key, key, sizeof key);
+        um_display_text(dev->model, model, sizeof model);
+        um_display_text(dev->mount, mount, sizeof mount);
+        um_human_size(dev->size_bytes, size, sizeof size);
+        printf("%-8s %-9s %-24s %10s  %s\n", key, dev->bus, model, size, mount[0] ? mount : "-");
+    }
+    if (!snap.count) printf("(no external storage devices)\n");
+    return 0;
 }
 
-/* ---------------------------------------------------------------- rounds -- */
-
-static um_snapshot g_prev;
-static int g_have_prev = 0;
+static um_snapshot previous;
+static int have_previous;
 
 static int do_round(um_logger *lg, um_hooks *hk, um_gui *gui, const char *sys_root,
-                    int interval_s, int round_no, int is_list, const char *wake)
+                    const char *state_path, int interval, int number, const char *wake)
 {
-    um_snapshot cur;
+    um_snapshot current;
     int i;
-    double t0 = um_monotonic();
+    double start = um_monotonic(), scan_ms;
+#ifdef _WIN32
+    um_evidence evidence[UM_EVID_MAX];
+    int n = um_scan_windows(&current, evidence, UM_EVID_MAX);
     int added = 0, removed = 0;
-
-    memset(&cur, 0, sizeof cur);
-    if (um_scan_platform(&cur, sys_root) != 0) {
+    (void)sys_root;
+    if (n < 0) {
+#else
+    if (um_scan_platform(&current, sys_root) != 0) {
+#endif
         emit_meta(lg, "error", "scan_failed");
         return -1;
     }
 
-    if (g_have_prev) {
-        for (i = 0; i < cur.count; i++) {
-            if (um_snapshot_find(&g_prev, cur.devs[i].key) < 0) {
-                emit_add(lg, &cur.devs[i], 0);
-                added++;
-                if (!is_list) {   /* --list is read-only: never fire user hooks */
-                    char hint[UM_MOUNT_MAX];
-                    path_hint_for(&cur.devs[i], hint, sizeof hint);
-                    um_hooks_dispatch(hk, &cur.devs[i], hint);
-                    um_gui_show_add(gui, &cur.devs[i]);
-                }
-            }
+    scan_ms = (um_monotonic() - start) * 1000.0;
+    if (have_previous) {
+        for (i = 0; i < previous.count; i++) {
+            const um_device *dev = &previous.devs[i];
+            if (um_snapshot_match(&current, dev)) continue;
+            emit_remove(lg, dev);
+#ifdef _WIN32
+            removed++;
+#else
+            um_gui_show_remove(gui, dev);
+#endif
         }
-        for (i = 0; i < g_prev.count; i++) {
-            if (um_snapshot_find(&cur, g_prev.devs[i].key) < 0) {
-                emit_remove(lg, &g_prev.devs[i]);
-                removed++;
-                if (!is_list)
-                    um_gui_show_remove(gui, &g_prev.devs[i]);
-            }
-        }
-    } else {
-        /* first round: baseline — every present device is an "add" event
-         * (auditors want to know what was already plugged in at start).
-         * Baseline adds are flagged and do NOT pop up a toast: a desktop
-         * session start should not be greeted by a pile of windows.   */
-        for (i = 0; i < cur.count; i++) {
-            emit_add(lg, &cur.devs[i], 1);
+    }
+    for (i = 0; i < current.count; i++) {
+        const um_device *dev = &current.devs[i];
+        char hint[UM_MOUNT_MAX];
+        if (have_previous && um_snapshot_match(&previous, dev)) continue;
+        emit_add(lg, dev, !have_previous);
+        path_hint_for(dev, hint, sizeof hint);
+        um_hooks_dispatch(hk, dev, hint);
+        if (have_previous) {
+#ifdef _WIN32
             added++;
-            if (!is_list) {   /* --list is read-only: never fire user hooks */
-                char hint[UM_MOUNT_MAX];
-                path_hint_for(&cur.devs[i], hint, sizeof hint);
-                um_hooks_dispatch(hk, &cur.devs[i], hint);
-            }
+#else
+            um_gui_show_add(gui, dev);
+#endif
         }
     }
-
-    {
-        double ms = (um_monotonic() - t0) * 1000.0;
-        emit_round(lg, round_no, cur.count, interval_s, ms, wake);
-        if (is_list) {
-            printf("%-8s %-9s %-24s %10s  %s\n", "KEY", "BUS", "MODEL", "SIZE", "MOUNT");
-            for (i = 0; i < cur.count; i++) {
-                char sz[32];
-                um_human_size(cur.devs[i].size_bytes, sz, sizeof sz);
-                printf("%-8s %-9s %-24s %10s  %s\n",
-                       cur.devs[i].key, cur.devs[i].bus, cur.devs[i].model, sz,
-                       cur.devs[i].mount[0] ? cur.devs[i].mount : "-");
-            }
-            if (cur.count == 0)
-                printf("(no external storage devices)\n");
-        }
-    }
-    (void)removed;
-
-    g_prev = cur;
-    g_have_prev = 1;
-    return added;
+#ifdef _WIN32
+    if (gui->enabled) um_gui_win_refresh(gui, evidence, n, added, removed);
+#endif
+    emit_round(lg, number, current.count, interval, scan_ms, wake);
+    previous = current;
+    have_previous = 1;
+    if (um_state_save(state_path, &current) != 0)
+        emit_meta(lg, "error", "state_save_failed");
+    return 0;
 }
 
 /* ---------------------------------------------------------------- usage --- */
@@ -372,7 +302,7 @@ static void usage(FILE *out)
 
 /* ---------------------------------------------------------------- main ---- */
 
-int main(int argc, char **argv)
+static int run(int argc, char **argv)
 {
     int i;
     int interval_s = 3600;          /* 1h 一轮 (guaranteed max cadence) */
@@ -384,9 +314,9 @@ int main(int argc, char **argv)
     um_logger lg;
     static um_hooks hk;          /* ~1.5 MB: keep off the stack */
     static um_gui gui;           /* GUI state; helper pids tracked here */
-    char statebuf[512], confbuf[512], lockbuf[600];
+    char statebuf[512], confbuf[512], lockbuf[600], statefile[600];
     char defaultlog[600];
-    int round_no = 0;
+    int round_no = 0, round_result, hot_available = 0;
 
     gui.requested = -1;          /* auto */
     gui.toast_ttl = UM_GUI_TOAST_TTL_S;
@@ -454,17 +384,34 @@ int main(int argc, char **argv)
         }
     }
 
-    /* default paths */
-    if (!log_path) {
-        um_state_dir(statebuf, sizeof statebuf);
+    if (list_only) {
+        win_cli_console_attach();
+        return list_devices(sys_root);
+    }
+
+    um_state_dir(statebuf, sizeof statebuf);
 #ifdef _WIN32
-        if (list_only) snprintf(defaultlog, sizeof defaultlog, "NUL");
-        else snprintf(defaultlog, sizeof defaultlog, "%s\\events.jsonl", statebuf);
+#define STATE_SEP "\\"
 #else
-        if (list_only) snprintf(defaultlog, sizeof defaultlog, "/dev/null");
-        else snprintf(defaultlog, sizeof defaultlog, "%s/events.jsonl", statebuf);
+#define STATE_SEP "/"
 #endif
+    snprintf(statefile, sizeof statefile, "%s" STATE_SEP "last-snapshot.txt", statebuf);
+    snprintf(lockbuf, sizeof lockbuf, "%s" STATE_SEP "usbmon.lock", statebuf);
+    if (!log_path) {
+        snprintf(defaultlog, sizeof defaultlog, "%s" STATE_SEP "events.jsonl", statebuf);
         log_path = defaultlog;
+    }
+    {
+        int locked = um_single_instance_acquire(lockbuf);
+        if (locked != 0) {
+            win_cli_console_attach();
+            if (locked > 0) {
+                fprintf(stderr, "usbmon: another instance is already running\n");
+                return 3;
+            }
+            fprintf(stderr, "usbmon: cannot acquire state lock %s\n", lockbuf);
+            return 1;
+        }
     }
     if (!hooks_path) {
         um_config_dir(confbuf, sizeof confbuf);
@@ -480,6 +427,7 @@ int main(int argc, char **argv)
     if (um_log_open(&lg, log_path, raw, verbose) != 0) {
         win_cli_console_attach();
         fprintf(stderr, "usbmon: cannot open log %s: %s\n", log_path, strerror(errno));
+        um_single_instance_release();
         return 1;
     }
 
@@ -495,98 +443,43 @@ int main(int argc, char **argv)
         hk.count = 0;
     }
 
-    /* single-instance lock BEFORE any GUI/thread work: a refused
-     * duplicate must exit fast without ever spawning a listener window
-     * or a tray icon.  The old order (GUI first) meant a refused second
-     * instance briefly created both -- and left a ghost tray icon behind,
-     * because this early-return path never ran um_gui_shutdown. */
-    if (!once && !list_only) {
-        um_state_dir(statebuf, sizeof statebuf);
-        snprintf(lockbuf, sizeof lockbuf,
-#ifdef _WIN32
-                 "%s\\usbmon.lock", statebuf);
-#else
-                 "%s/usbmon.lock", statebuf);
-#endif
-        if (um_single_instance_acquire(lockbuf) != 0) {
-            win_cli_console_attach();
-            fprintf(stderr, "usbmon: another instance is already running\n");
-            emit_meta(&lg, "error", "already_running");
-            um_log_close(&lg);
-            return 3;
-        }
-    }
-
-    /* GUI: auto-on for the daemon when a display exists, off for --once
-     * (cron context) and always off for --list (read-only). */
-    if (gui.requested == -1)
-        gui.requested = (!once && !list_only) ? 1 : 0;
-    if (list_only) gui.requested = 0;
+    if (gui.requested == -1) gui.requested = !once;
     gui.raw_serial = raw;
+#ifdef _WIN32
+    gui.watch_devices = !once && !no_hotpath;
+#endif
     um_gui_init(&gui);
-    if (verbose) {
-        if (gui.requested == 1 && !gui.enabled)
-            fprintf(stderr, "usbmon: GUI unavailable (no DISPLAY or no "
-                            "usbmon-toast helper next to the daemon) — "
-                            "headless mode\n");
-        else if (gui.enabled)
-            fprintf(stderr, "usbmon: GUI on — toast pops up on insert/remove\n");
-    }
-
-    if (list_only) {
-        win_cli_console_attach();
-        (void)do_round(&lg, &hk, &gui, sys_root, interval_s, 0, 1, "list");
-        um_log_close(&lg);
-        return 0;
-    }
+#ifndef _WIN32
+    hot_available = !once && !no_hotpath && um_hot_init(sys_root) >= 0;
+#else
+    hot_available = gui.watch_devices && gui.wake_event != NULL;
+#endif
+    if (verbose && !once && !no_hotpath && !hot_available)
+        fprintf(stderr, "usbmon: device notifications unavailable; using interval scans\n");
+    if (verbose && gui.requested && !gui.enabled)
+        fprintf(stderr, "usbmon: GUI unavailable; continuing headless\n");
 
     install_signals();
     {
         char detail[256];
         snprintf(detail, sizeof detail, "usbmon %s interval=%ds hooks=%d gui=%d hotpath=%d",
-                 UM_VERSION, interval_s, no_hooks ? 0 : hk.count,
-                 gui.enabled, !no_hotpath);
+                 UM_VERSION, interval_s, hk.count, gui.enabled, hot_available);
         emit_meta(&lg, "start", detail);
     }
-
-    /* hot path: watch <sys_root>/block so a plug wakes us within ms
-     * (POSIX).  Windows gets the same effect from WM_DEVICECHANGE on
-     * the GUI thread.  Failure is silent: pure interval mode remains. */
-#ifndef _WIN32
-    if (!once && !no_hotpath) {
-        if (um_hot_init(sys_root) < 0 && verbose)
-            fprintf(stderr, "usbmon: hot path unavailable (inotify watch on "
-                            "%s/block failed) — interval-only mode\n",
-                            sys_root && *sys_root ? sys_root : "/sys");
+    if (!force_baseline) {
+        int loaded = um_state_load(statefile, &previous);
+        have_previous = loaded > 0;
+        if (loaded < 0) emit_meta(&lg, "error", "state_load_failed");
     }
-#else
-    (void)sys_root;
-#endif
+    round_result = do_round(&lg, &hk, &gui, sys_root, statefile, interval_s, ++round_no, "start");
 
-    /* Diff against the persisted state unless a baseline is requested:
-     * a daemon restart (or a --once cron run before it) must not re-emit
-     * add events / re-fire hooks for devices that never moved.  */
-    if (!force_baseline && state_load(&g_prev)) g_have_prev = 1;
-
-    do_round(&lg, &hk, &gui, sys_root, interval_s, ++round_no, 0, "start");
-    if (!once) state_save(&g_prev);
-
-    if (once) {
-        state_save(&g_prev);
-        emit_meta(&lg, "stop", "once-complete");
-        /* --once: let freshly spawned hooks finish (full timeout budget) */
-        um_hooks_shutdown(&hk, (int)(UM_HOOK_TIMEOUT_S * 1000));
-        um_log_close(&lg);
-        return 0;
-    }
-
-    {
-        double last_round = 0;      /* monotonic ts of the last round */
-        int    hot_pending = 0;
+    if (!once) {
+        double last_round = um_monotonic();
         double hot_deadline = 0;
-
-        while (!g_stop) {
+        while (!stop_requested()) {
             int woke = 0;
+            double now;
+            const char *wake = NULL;
 
             if (g_reload_hooks) {
                 g_reload_hooks = 0;
@@ -599,54 +492,63 @@ int main(int argc, char **argv)
             }
             um_hooks_reap(&hk);
             um_gui_reap(&gui);
-
-            /* block on the inotify fd (or plain sleep) until next tick */
 #ifndef _WIN32
             woke = um_hot_wait(UM_SLEEP_TICK_MS);
 #else
-            if (gui.enabled && gui.wake_event) {
-                DWORD wr = WaitForSingleObject((HANDLE)gui.wake_event,
-                                               UM_SLEEP_TICK_MS);
-                if (wr == WAIT_OBJECT_0) woke = 1;
-            } else {
-                sleep_ms(UM_SLEEP_TICK_MS);
-            }
+            if (gui.wake_event)
+                woke = WaitForSingleObject((HANDLE)gui.wake_event, UM_SLEEP_TICK_MS) == WAIT_OBJECT_0;
+            else
+                Sleep(UM_SLEEP_TICK_MS);
 #endif
-            if (woke && !no_hotpath) {
-                if (!hot_pending) {
-                    hot_pending = 1;
-                    hot_deadline = um_monotonic() +
-                                   (double)UM_HOT_SETTLE_MS / 1000.0;
-                }
+            if (stop_requested()) break;
+            now = um_monotonic();
+            if (woke && hot_deadline == 0) hot_deadline = now + UM_HOT_SETTLE_MS / 1000.0;
+            if (hot_deadline > 0 && now >= hot_deadline) {
+                hot_deadline = 0;
+                wake = "hot";
+            } else if (now - last_round >= interval_s) {
+                hot_deadline = 0;
+                wake = "tick";
             }
-
-            {
-                double now = um_monotonic();
-                if (last_round == 0) last_round = now;
-                if (hot_pending && now >= hot_deadline) {
-                    hot_pending = 0;
-                    last_round = now;
-                    do_round(&lg, &hk, &gui, sys_root, interval_s,
-                             ++round_no, 0, "hot");
-                    state_save(&g_prev);
-                } else if (now - last_round >= (double)interval_s) {
-                    last_round = now;
-                    do_round(&lg, &hk, &gui, sys_root, interval_s,
-                             ++round_no, 0, "tick");
-                    state_save(&g_prev);
-                }
+            if (wake) {
+                do_round(&lg, &hk, &gui, sys_root, statefile, interval_s, ++round_no, wake);
+                last_round = now;
             }
         }
     }
 
-    um_hooks_reap(&hk);
-    emit_meta(&lg, "stop", g_stop_reason);
-    um_hooks_shutdown(&hk, 10000);   /* responsive exit, then kill stragglers */
-    um_gui_shutdown(&gui);           /* toasts: brief grace, then kill */
+    emit_meta(&lg, "stop", once ? (round_result == 0 ? "once-complete" : "scan-failed")
+                                : stop_reason());
+    um_hooks_shutdown(&hk, once ? (int)(UM_HOOK_TIMEOUT_S * 1000) : 10000);
+    um_gui_shutdown(&gui);
 #ifndef _WIN32
     um_hot_close();
 #endif
     um_log_close(&lg);
     um_single_instance_release();
-    return 0;
+    return once && round_result != 0 ? 1 : 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **wide)
+{
+    char **argv = calloc((size_t)argc + 1, sizeof *argv);
+    int i, result = 1;
+    if (!argv) return 1;
+    for (i = 0; i < argc; i++) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        if (!n || !(argv[i] = malloc((size_t)n))) break;
+        um_wide_to_utf8(wide[i], argv[i], (size_t)n);
+    }
+    if (i == argc) result = run(argc, argv);
+    while (i > 0) free(argv[--i]);
+    free(argv);
+    return result;
+}
+#else
+int main(int argc, char **argv)
+{
+    um_set_executable(argv[0]);
+    return run(argc, argv);
+}
+#endif

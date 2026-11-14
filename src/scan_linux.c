@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -24,24 +25,61 @@ static int read_int_file(const char *root, const char *dev, const char *leaf, lo
     char path[1024], buf[64];
     snprintf(path, sizeof path, "%s/block/%s/%s", root, dev, leaf);
     if (um_read_file_str(path, buf, sizeof buf) < 0) return -1;
-    *out = strtoll(buf, NULL, 10);
+    {
+        char *end;
+        errno = 0;
+        *out = strtoll(buf, &end, 10);
+        return (errno || end == buf || *end || *out < 0) ? -1 : 0;
+    }
+}
+
+/* Walk canonical sysfs parents and inspect their subsystem links. */
+static int usb_parent(const char *root, const char *dev, char *serial, size_t n)
+{
+    char path[PATH_MAX], resolved[PATH_MAX];
+    const size_t root_len = strlen(root);
+
+    snprintf(path, sizeof path, "%s/block/%s", root, dev);
+    if (!realpath(path, resolved)) return 0;
+    if (strncmp(resolved, root, root_len) ||
+        strncmp(resolved + root_len, "/devices/", 9)) {
+        /* Older mock trees and the legacy sysfs layout expose a device link. */
+        snprintf(path, sizeof path, "%s/block/%s/device", root, dev);
+        if (!realpath(path, resolved)) return 0;
+    }
+    if (strncmp(resolved, root, root_len) ||
+        strncmp(resolved + root_len, "/devices/", 9)) return 0;
+
+    while (strlen(resolved) > root_len + 8) {
+        char link[PATH_MAX], *base;
+        int written = snprintf(path, sizeof path, "%s/subsystem", resolved);
+        ssize_t len;
+        if (written < 0 || (size_t)written >= sizeof path) return 0;
+        len = readlink(path, link, sizeof link - 1);
+        if (len > 0 && (size_t)len < sizeof link - 1) {
+            link[len] = '\0';
+            base = strrchr(link, '/');
+            if (!strcmp(base ? base + 1 : link, "usb")) {
+                written = snprintf(path, sizeof path, "%s/serial", resolved);
+                if (written > 0 && (size_t)written < sizeof path)
+                    um_read_file_str(path, serial, n);
+                return 1;
+            }
+        }
+        base = strrchr(resolved, '/');
+        *base = '\0';
+    }
     return 0;
 }
 
-/* True when /sys/block/<dev>/device resolves through a USB hub. */
-static int device_is_usb(const char *root, const char *dev)
+static int is_partition(const char *disk, const char *name)
 {
-    char path[1024], resolved[4096];
-    ssize_t n;
-    snprintf(path, sizeof path, "%s/block/%s/device", root, dev);
-    n = readlink(path, resolved, sizeof resolved - 1);
-    if (n < 0) {
-        /* No symlink: try realpath (works for directories). */
-        if (!realpath(path, resolved)) return 0;
-    } else {
-        resolved[n] = '\0';
-    }
-    return strstr(resolved, "/usb") != NULL;
+    size_t len = strlen(disk);
+    const char *suffix;
+    if (strncmp(disk, name, len)) return 0;
+    suffix = name + len;
+    if (*suffix == 'p') suffix++;
+    return *suffix && suffix[strspn(suffix, "0123456789")] == '\0';
 }
 
 static void read_trim(const char *root, const char *dev, const char *leaf,
@@ -53,53 +91,45 @@ static void read_trim(const char *root, const char *dev, const char *leaf,
 }
 
 /* Find the first mount point of `dev` or any of its partitions. */
-static void find_mount(const char *dev, char *out, size_t out_n,
-                       unsigned long long *total, unsigned long long *freeb)
+static void find_mount(um_device *dev)
 {
-    FILE *f = fopen("/proc/mounts", "r");
-    char line[1024];
-    char want[128];
-    out[0] = '\0';
-    *total = *freeb = 0;
+    FILE *f = fopen("/proc/self/mounts", "r");
+    char *line = NULL;
+    size_t capacity = 0;
     if (!f) return;
 
-    snprintf(want, sizeof want, "/dev/%s", dev);
-    while (fgets(line, sizeof line, f)) {
-        char src[512], mnt[512], fs[64];
-        if (sscanf(line, "%511s %511s %63s", src, mnt, fs) != 3) continue;
-        int match = strcmp(src, want) == 0;
-        if (!match) {
-            /* partition: /dev/sdb1 vs dev sdb; /dev/mmcblk0p1 vs dev mmcblk0 */
-            size_t wl = strlen(want);
-            if (strncmp(src, want, wl) == 0) {
-                const char *sfx = src + wl;
-                if (isdigit((unsigned char)sfx[0])) match = 1;             /* sdb1   */
-                else if (sfx[0] == 'p' && isdigit((unsigned char)sfx[1]))  /* mmcblk0p1 */
-                    match = 1;
+    while (getline(&line, &capacity, f) >= 0) {
+        char src[512], mnt[PATH_MAX];
+        const char *p;
+        size_t used = 0;
+        struct statvfs vfs;
+        int i;
+        if (sscanf(line, "%511s %4095s", src, mnt) != 2 || strncmp(src, "/dev/", 5))
+            continue;
+        for (i = 0; i < dev->partition_count; i++) {
+            if (!strcmp(src + 5, dev->partitions[i])) break;
+        }
+        if (strcmp(src + 5, dev->key) && i == dev->partition_count) continue;
+        for (p = mnt; *p && used < sizeof dev->mount - 1; p++) {
+            if (p[0] == '\\' && strspn(p + 1, "01234567") >= 3) {
+                dev->mount[used++] = (char)((p[1]-'0') * 64 + (p[2]-'0') * 8 + p[3]-'0');
+                p += 3;
+            } else {
+                dev->mount[used++] = *p;
             }
         }
-        if (match) {
-            /* decode octal escapes (\040 for space) in the mount point */
-            const char *p = mnt;
-            char *w = out;
-            while (*p && (size_t)(w - out) < out_n - 1) {
-                if (p[0] == '\\' && p[1] >= '0' && p[1] <= '7' &&
-                    p[2] >= '0' && p[2] <= '7' && p[3] >= '0' && p[3] <= '7') {
-                    *w++ = (char)((p[1]-'0')*64 + (p[2]-'0')*8 + (p[3]-'0'));
-                    p += 4;
-                } else {
-                    *w++ = *p++;
-                }
-            }
-            *w = '\0';
-            struct statvfs vfs;
-            if (statvfs(out, &vfs) == 0) {
-                *total = (unsigned long long)vfs.f_frsize * vfs.f_blocks;
-                *freeb = (unsigned long long)vfs.f_frsize * vfs.f_bavail;
-            }
-            break;
+        if (*p) {   /* A truncated path cannot be handed to a hook. */
+            dev->mount[0] = '\0';
+            continue;
         }
+        dev->mount[used] = '\0';
+        if (statvfs(dev->mount, &vfs) == 0) {
+            dev->fs_total = (unsigned long long)vfs.f_frsize * vfs.f_blocks;
+            dev->fs_free = (unsigned long long)vfs.f_frsize * vfs.f_bavail;
+        }
+        break;
     }
+    free(line);
     fclose(f);
 }
 
@@ -118,36 +148,49 @@ int um_scan_platform(um_snapshot *snap, const char *sys_root)
     };
     static const char *const removable_prefixes[] = { "sd", "mmcblk", NULL };
 
-    char root[512];
+    char root[512], canonical[PATH_MAX];
     char blockdir[1024];
     DIR *d;
     struct dirent *ent;
 
     snap->count = 0;
     if (!sys_root || !*sys_root) sys_root = "/sys";
-    snprintf(root, sizeof root, "%s", sys_root);
+    if (!realpath(sys_root, canonical) || strlen(canonical) >= sizeof root) return -1;
+    um_copy_str(root, sizeof root, canonical);
     snprintf(blockdir, sizeof blockdir, "%s/block", root);
 
     d = opendir(blockdir);
     if (!d) return -1;
 
-    while ((ent = readdir(d)) != NULL) {
-        const char *dev = ent->d_name;
+    for (;;) {
+        const char *dev;
+        char usb_serial[UM_SERIAL_MAX] = "";
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) {
+            int failed = errno != 0;
+            closedir(d);
+            return failed ? -1 : 0;
+        }
+        dev = ent->d_name;
         long long removable = 0, sectors = 0;
         int is_usb;
         um_device *dv;
 
-        if (dev[0] == '.') continue;
+        if (dev[0] == '.' || strlen(dev) >= UM_KEY_MAX) continue;
         if (str_prefix_in(dev, skip_prefixes)) continue;
-        if (snap->count >= UM_MAX_DEV) break;
 
-        read_int_file(root, dev, "removable", &removable);
+        if (read_int_file(root, dev, "removable", &removable) < 0) removable = 0;
         if (read_int_file(root, dev, "size", &sectors) != 0) continue; /* gone */
 
-        is_usb = device_is_usb(root, dev);
+        is_usb = usb_parent(root, dev, usb_serial, sizeof usb_serial);
         if (!is_usb && !(removable == 1 && str_prefix_in(dev, removable_prefixes)))
             continue;
 
+        if (snap->count >= UM_MAX_DEV || (unsigned long long)sectors > ULLONG_MAX / 512) {
+            closedir(d);
+            return -1;
+        }
         dv = &snap->devs[snap->count];
         memset(dv, 0, sizeof *dv);
         um_copy_str(dv->key, sizeof dv->key, dev);
@@ -160,23 +203,17 @@ int um_scan_platform(um_snapshot *snap, const char *sys_root)
             read_trim(root, dev, "vendor", vendor, sizeof vendor);
             read_trim(root, dev, "model", model, sizeof model);
             read_trim(root, dev, "serial", serial, sizeof serial);
-            /* trim trailing spaces SCSI descriptors are famous for */
-            {
-                size_t l = strlen(model);
-                while (l > 0 && model[l-1] == ' ') model[--l] = '\0';
-                l = strlen(vendor);
-                while (l > 0 && vendor[l-1] == ' ') vendor[--l] = '\0';
-            }
             if (vendor[0] && model[0])
-                snprintf(dv->model, sizeof dv->model, "%s %s", vendor, model);
+                snprintf(dv->model, sizeof dv->model, "%.30s %.32s", vendor, model);
             else
                 um_copy_str(dv->model, sizeof dv->model, model);
-            um_copy_str(dv->serial, sizeof dv->serial, serial);
+            um_copy_str(dv->serial, sizeof dv->serial, serial[0] ? serial : usb_serial);
             snprintf(dv->display, sizeof dv->display, "%.60s (%.40s)",
                      dv->model[0] ? dv->model : "USB storage", dev);
         }
         um_fingerprint(dv->serial[0] ? dv->serial : dv->key, dv->serial_fp,
                        sizeof dv->serial_fp);
+        if (dv->serial[0]) um_copy_str(dv->identity, sizeof dv->identity, dv->serial_fp);
 
         /* partitions */
         {
@@ -186,12 +223,9 @@ int um_scan_platform(um_snapshot *snap, const char *sys_root)
             snprintf(pdir, sizeof pdir, "%s/block/%s", root, dev);
             pd = opendir(pdir);
             if (pd) {
-                size_t dl = strlen(dev);
                 while ((pe = readdir(pd)) != NULL) {
-                    if (strncmp(pe->d_name, dev, dl) == 0 && dv->partition_count < UM_MAX_PARTITIONS &&
-                    (isdigit((unsigned char)pe->d_name[dl]) ||                       /* sdb1        */
-                     (pe->d_name[dl] == 'p' && isdigit((unsigned char)pe->d_name[dl + 1]))) /* mmcblk0p1 */
-                    ) {
+                    if (dv->partition_count < UM_MAX_PARTITIONS &&
+                        is_partition(dev, pe->d_name)) {
                         um_copy_str(dv->partitions[dv->partition_count],
                                     sizeof dv->partitions[0], pe->d_name);
                         dv->partition_count++;
@@ -201,9 +235,7 @@ int um_scan_platform(um_snapshot *snap, const char *sys_root)
             }
         }
 
-        find_mount(dev, dv->mount, sizeof dv->mount, &dv->fs_total, &dv->fs_free);
+        find_mount(dv);
         snap->count++;
     }
-    closedir(d);
-    return 0;
 }

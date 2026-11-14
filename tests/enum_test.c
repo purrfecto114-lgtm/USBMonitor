@@ -98,14 +98,14 @@ int main(void)
         um_evidence *e = find_by_disk(evs, n, 2);
         CHECK(e != NULL);
         if (e) {
-            CHECK(e->n_letters == 3);
-            CHECK(strcmp(e->letters[0], "E:") == 0);
-            CHECK(strcmp(e->letters[1], "F:") == 0);
-            CHECK(strcmp(e->letters[2], "G:") == 0);
+            CHECK(e->letters == ((1U << 4) | (1U << 5) | (1U << 6)));
+            CHECK(e->accessible_letters == e->letters);
+            CHECK(e->volumes == 3);
+            CHECK(!strcmp(e->mount, "E:\\"));
             CHECK(e->kind == UM_KIND_USB_STORAGE);
-            CHECK(e->bus_is_usb == 1);
+            CHECK(e->bus_type == BusTypeUsb);
             CHECK(e->removable == 1);
-            CHECK(um_ui_can_eject(e->kind, e->removable) == 1);
+            CHECK(e->ejectable == 1);
         }
     }
 
@@ -114,12 +114,12 @@ int main(void)
         um_evidence *e = find_by_disk(evs, n, 5);
         CHECK(e != NULL);
         if (e) {
-            CHECK(e->n_letters == 0);
+            CHECK(e->letters == 0);
             CHECK(e->kind == UM_KIND_STORAGE_NO_LETTER);
-            CHECK(e->bus_is_usb == 1);
+            CHECK(e->bus_type == BusTypeUsb);
             /* 无盘符不能"打开"，但可以安全弹出 */
-            CHECK(um_ui_can_open(e->kind) == 0);
-            CHECK(um_ui_can_eject(e->kind, e->removable) == 1);
+            CHECK(e->accessible_letters == 0);
+            CHECK(e->ejectable == 1);
         }
     }
 
@@ -130,8 +130,8 @@ int main(void)
         if (e) {
             CHECK((e->tags & UM_TAG_HID) != 0);
             CHECK((e->tags & UM_TAG_STORAGE) == 0);
-            CHECK(um_ui_can_open(e->kind) == 0);
-            CHECK(um_ui_can_eject(e->kind, e->removable) == 0);
+            CHECK(e->accessible_letters == 0);
+            CHECK(e->ejectable == 0);
         }
     }
 
@@ -141,8 +141,8 @@ int main(void)
         CHECK(e != NULL);
         if (e) {
             CHECK((e->tags & UM_TAG_NET) != 0);
-            CHECK(um_ui_can_open(e->kind) == 0);
-            CHECK(um_ui_can_eject(e->kind, e->removable) == 0);
+            CHECK(e->accessible_letters == 0);
+            CHECK(e->ejectable == 0);
         }
     }
 
@@ -152,7 +152,7 @@ int main(void)
         CHECK(e != NULL);
         if (e) {
             CHECK((e->tags & UM_TAG_HUB) != 0);
-            CHECK(um_ui_can_eject(e->kind, e->removable) == 0);
+            CHECK(e->ejectable == 0);
         }
     }
 
@@ -167,24 +167,35 @@ int main(void)
         int m;
         shim_set_world(cdrom, 2);
         m = um_enum_collect(evs, UM_EVID_MAX);
-        CHECK(m >= 1);
-        if (m >= 1) {
-            CHECK(evs[0].kind != UM_KIND_USB_STORAGE);
-            CHECK(um_ui_can_eject(evs[0].kind, evs[0].removable) == 0);
-        }
+        CHECK(m == 0);
     }
 
-    printf("== 8. 归并键提取：同一设备不同接口共享 instance ==\n");
+    printf("== 8. Shared inventory: CLI, panel and eject use one disk identity ==\n");
     {
-        char inst[128];
-        um_enum_instance_id("USB\\VID_0951&PID_1666\\001B1C\\disk", inst, sizeof inst);
-        CHECK(strcmp(inst, "USB\\VID_0951&PID_1666\\001B1C") == 0);
-        um_enum_instance_id("USB\\VID_0951&PID_1666\\001B1C\\volume", inst, sizeof inst);
-        CHECK(strcmp(inst, "USB\\VID_0951&PID_1666\\001B1C") == 0);
-        um_enum_instance_id("", inst, sizeof inst);
-        CHECK(inst[0] == '\0');
-        um_enum_instance_id("no-separator", inst, sizeof inst);
-        CHECK(strcmp(inst, "no-separator") == 0);
+        um_snapshot snap;
+        shim_set_world(k_world, (int)(sizeof k_world / sizeof k_world[0]));
+        CHECK(um_scan_windows(&snap, evs, UM_EVID_MAX) == 5);
+        CHECK(snap.count == 2);
+        CHECK(!strcmp(snap.devs[0].key, "disk2"));
+        CHECK(!strcmp(snap.devs[1].key, "disk5"));
+        CHECK(snap.devs[0].partition_count == 3);
+        CHECK(snap.devs[1].partition_count == 0);
+        CHECK(snap.devs[0].size_bytes == 640000);
+        CHECK(snap.devs[0].fs_total == 200000 && snap.devs[0].fs_free == 100000);
+        CHECK(snap.devs[0].identity[0] && strcmp(snap.devs[0].identity, snap.devs[1].identity));
+        CHECK(um_enum_letter_disk('E') == 2);
+        CHECK(um_enum_letter_disk('Q') == -1);
+        CHECK(um_enum_eject(k_world[0].instance_id) == CR_SUCCESS);
+        CHECK(shim_last_eject() == 1);
+        shim_eject_veto(1);
+        CHECK(um_enum_eject(k_world[4].instance_id) == CR_REMOVE_VETOED);
+        CHECK(shim_last_eject() == 5);
+        CHECK(um_enum_eject("USB\\VID_0000&PID_0000\\absent") != CR_SUCCESS);
+        CHECK(shim_last_eject() == 5);
+        shim_enum_failure(1);
+        CHECK(um_scan_windows(&snap, evs, UM_EVID_MAX) < 0);
+        CHECK(snap.count == 2);
+        shim_enum_failure(0);
     }
 
     printf("== 9. 证据 → UI 模型（端到端打通）==\n");
@@ -204,7 +215,7 @@ int main(void)
                 for (i = 0; i < m.n_rows; i++) {
                     if (m.rows[i].n_letters == 3) {
                         found = 1;
-                        CHECK(strstr(m.rows[i].subtitle, "3 个分区") != NULL);
+                        CHECK(strstr(m.rows[i].subtitle, "3 个盘符") != NULL);
                         CHECK(m.rows[i].openable == 1);
                         CHECK(m.rows[i].ejectable == 1);
                     }
@@ -271,6 +282,59 @@ int main(void)
             int rows = um_enum_to_model(evs, n, &m);
             CHECK(rows >= 0 && rows <= UM_UI_MAX_ROWS);
         }
+    }
+
+    printf("== 11. Folder mount, inaccessible letter, empty reader, SD and spanned volume ==\n");
+    {
+        const shim_dev devices[] = {
+            { "USB\\VID_1234&PID_0001\\folder", "disk-a", IF_DISK, 20, BUS_TYPE_USB, 1, 1, 1, "", NULL },
+            { "folder-vol", "\\\\?\\Volume{folder}", IF_VOLUME, 20, BUS_TYPE_USB, 1, 1, 1,
+              "C:\\mnt\\drive\\", NULL },
+            { "multi-vol", "\\\\?\\Volume{multi}", IF_VOLUME, 20, BUS_TYPE_USB, 1, 2, 1, "M:", NULL },
+            { "USB\\VID_1234&PID_0002\\locked", "disk-b", IF_DISK, 21, BUS_TYPE_USB, 1, 1, 1, "", NULL },
+            { "locked-vol", "\\\\?\\Volume{locked}", IF_VOLUME, 21, BUS_TYPE_USB, 1, 1, 0, "L:", NULL },
+            { "USB\\VID_1234&PID_0003\\empty", "disk-c", IF_DISK, 22, BUS_TYPE_USB, 1, 0, 1, "", NULL },
+            { "SD\\CARD\\sd", "disk-d", IF_DISK, 23, BUS_TYPE_SD, 0, 1, 1, "", NULL },
+            { "SCSI\\DISK\\bridge", "disk-e", IF_DISK, 24, BUS_TYPE_SATA, 0, 1, 1, "",
+              "USB\\VID_1234&PID_0004&MI_02\\interface" },
+            { "USB\\VID_1234&PID_0004&MI_02\\interface", "composite-iface", 0, -1, 0, 0, 1, 1,
+              "", "USB\\VID_1234&PID_0004\\device" },
+            { "USB\\VID_1234&PID_0004\\device", "composite", 0, -1, 0, 1, 1, 1, "", NULL },
+        };
+        um_snapshot snap;
+        um_toast_model model;
+        shim_set_world(devices, (int)(sizeof devices / sizeof devices[0]));
+        n = um_scan_windows(&snap, evs, UM_EVID_MAX);
+        CHECK(n == 5);
+        CHECK(snap.count == 4);
+        CHECK(!strcmp(snap.devs[0].mount, "C:\\mnt\\drive\\"));
+        CHECK(snap.devs[0].partition_count == 0);
+        CHECK(um_enum_letter_disk('M') == -1);
+        CHECK(!strcmp(snap.devs[2].bus, "sd"));
+        CHECK(um_enum_to_model(evs, n, &model) == 5);
+        CHECK(model.rows[0].kind == UM_KIND_STORAGE_NO_LETTER);
+        CHECK(strstr(model.rows[0].subtitle, "目录挂载") != NULL);
+        CHECK(model.rows[1].kind == UM_KIND_LOCKED_VOLUME && !model.rows[1].openable);
+        CHECK(model.rows[2].kind == UM_KIND_EMPTY_SLOT && !model.rows[2].ejectable);
+        CHECK(!model.rows[4].ejectable);
+        CHECK(um_enum_eject(devices[7].instance_id) != CR_SUCCESS);
+        CHECK(shim_last_eject() == 0);
+        CHECK(um_enum_collect(evs, 1) < 0); /* Partial storage snapshots cannot commit. */
+    }
+
+    printf("== 12. Unrelated devices do not consume the inventory budget ==\n");
+    {
+        shim_dev many[81];
+        static char ids[80][48];
+        int i;
+        for (i = 0; i < 80; i++) {
+            snprintf(ids[i], sizeof ids[i], "HID\\OTHER\\%d", i);
+            many[i] = (shim_dev){ ids[i], ids[i], IF_HID, -1, 0, 0, 1, 1, "", NULL };
+        }
+        many[80] = k_world[9];
+        shim_set_world(many, 81);
+        CHECK(um_enum_collect(evs, 1) == 1);
+        CHECK(evs[0].kind == UM_KIND_DOCK_HUB);
     }
 
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
