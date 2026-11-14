@@ -135,7 +135,7 @@ function Read-JsonLines {
 
 # --- 1) --version ------------------------------------------------------------
 $r = Invoke-Usbmon @("--version")
-if ($r.Code -eq 0 -and $r.Out.Count -ge 1 -and $r.Out[0] -match '^usbmon \d+\.\d+\.\d+$') {
+if ($r.Code -eq 0 -and $r.Out.Count -ge 1 -and $r.Out[0] -match '^usbmon \d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
     Ok ("--version prints 'usbmon <semver>' (exit 0): " + $r.Out[0])
 } else {
     Bad ("--version: exit=" + $r.Code + " out=" + ($r.Out -join "|"))
