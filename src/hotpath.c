@@ -1,115 +1,120 @@
-/* hotpath.c — event-driven wakeup for the round loop (Linux/POSIX).
- *
- * Watches <sys_root>/block with inotify.  A create/delete there means a
- * block device appeared or vanished, which is exactly when a scan round
- * is interesting — so instead of waiting for the hourly tick the daemon
- * reacts within UM_HOT_SETTLE_MS (settling lets udev finish symlinks,
- * partitions and mounts before we scan).
- *
- * The hourly interval remains the guaranteed *maximum* cadence; this file
- * only makes reaction time near-instant.  Costs nothing while idle: the
- * main loop blocks in poll() on the inotify fd instead of sleeping.
- *
- * If the watch cannot be established (very old kernel, exotic sysfs),
- * um_hot_init returns -1 and the daemon silently degrades to pure
- * interval mode — no failure path, no polling fallback storm.
- */
-#define _XOPEN_SOURCE 700
+/* Linux: kernel uevents in production, inotify for a mock sysfs tree. */
+#define _GNU_SOURCE
 #include "usbmon.h"
 
-#ifndef _WIN32
-
 #include <errno.h>
+#include <linux/netlink.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/inotify.h>
-#include <sys/select.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
-static int g_ifd = -1;      /* inotify fd                       */
-static int g_wd  = -1;      /* watch descriptor on <root>/block */
-static char g_blockdir[1024];
+static int hot_fd = -1;
+static int mock_watch = -1;
+static char mock_block[1024];
+static const uint32_t mock_mask = IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM |
+                                  IN_DELETE_SELF | IN_MOVE_SELF;
+
+/* The kernel sends an action@path header followed by NUL-delimited fields. */
+int um_hot_block_event(const char *data, size_t len)
+{
+    int block = 0, change = 0;
+    while (len) {
+        const char *end = memchr(data, '\0', len);
+        size_t field;
+        if (!end) return 0;
+        field = (size_t)(end - data);
+        if (field == sizeof "SUBSYSTEM=block" - 1 && !strcmp(data, "SUBSYSTEM=block"))
+            block = 1;
+        if (!strcmp(data, "ACTION=add") || !strcmp(data, "ACTION=remove") ||
+            !strcmp(data, "ACTION=change"))
+            change = 1;
+        data = end + 1;
+        len -= field + 1;
+    }
+    return block && change;
+}
 
 int um_hot_init(const char *sys_root)
 {
-    const char *root = (sys_root && *sys_root) ? sys_root : "/sys";
-    g_ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (g_ifd < 0) return -1;
-    snprintf(g_blockdir, sizeof g_blockdir, "%s/block", root);
-    g_wd = inotify_add_watch(g_ifd, g_blockdir,
-                             IN_CREATE | IN_DELETE |
-                             IN_MOVED_TO | IN_MOVED_FROM);
-    if (g_wd < 0) {
-        close(g_ifd);
-        g_ifd = -1;
-        return -1;
+    um_hot_close();
+    if (sys_root && *sys_root && strcmp(sys_root, "/sys") && strcmp(sys_root, "/sys/")) {
+        int n = snprintf(mock_block, sizeof mock_block, "%s/block", sys_root);
+        if (n < 0 || (size_t)n >= sizeof mock_block) return -1;
+        hot_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (hot_fd >= 0) mock_watch = inotify_add_watch(hot_fd, mock_block, mock_mask);
+    } else {
+        struct sockaddr_nl address = {0};
+        address.nl_family = AF_NETLINK;
+        address.nl_groups = 1;  /* Kernel kobject notifications, before udev processing. */
+        hot_fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        NETLINK_KOBJECT_UEVENT);
+        if (hot_fd >= 0 && bind(hot_fd, (struct sockaddr *)&address, sizeof address) != 0)
+            um_hot_close();
     }
-    return g_ifd;
+    return hot_fd;
 }
 
 void um_hot_close(void)
 {
-    if (g_ifd >= 0) close(g_ifd);
-    g_ifd = -1;
-    g_wd = -1;
+    if (hot_fd >= 0) close(hot_fd);
+    hot_fd = -1;
+    mock_watch = -1;
+    mock_block[0] = '\0';
 }
 
-/* Re-arm after IN_IGNORED (watched dir replaced — happens with mock
- * sysfs trees in tests; harmless no-op when the watch is still valid). */
-static void rewatch(void)
+static int read_mock(void)
 {
-    if (g_ifd >= 0) {
-        g_wd = inotify_add_watch(g_ifd, g_blockdir,
-                                 IN_CREATE | IN_DELETE |
-                                 IN_MOVED_TO | IN_MOVED_FROM);
-        if (g_wd < 0) {              /* directory gone for good: drop hot path */
-            close(g_ifd);
-            g_ifd = -1;
+    union { struct inotify_event align; char bytes[4096]; } buffer;
+    ssize_t n = read(hot_fd, buffer.bytes, sizeof buffer.bytes);
+    size_t offset = 0;
+    if (n <= 0) return 0;
+    while (offset + sizeof(struct inotify_event) <= (size_t)n) {
+        const struct inotify_event *ev = (const void *)(buffer.bytes + offset);
+        if (ev->wd == mock_watch && (ev->mask & (IN_IGNORED | IN_MOVE_SELF | IN_DELETE_SELF))) {
+            if (ev->mask & IN_MOVE_SELF) inotify_rm_watch(hot_fd, mock_watch);
+            mock_watch = -1;
         }
+        offset += sizeof *ev + ev->len;
     }
+    return 1;  /* Including overflow and watch invalidation, which need a rescan. */
+}
+
+static int read_kernel(void)
+{
+    int changed = 0, batch;
+    for (batch = 0; batch < 64; batch++) {
+        struct sockaddr_nl from = {0};
+        socklen_t from_len = sizeof from;
+        char data[8192];
+        ssize_t n = recvfrom(hot_fd, data, sizeof data, MSG_TRUNC,
+                             (struct sockaddr *)&from, &from_len);
+        if (n < 0) return changed || errno == ENOBUFS;
+        if (from_len == sizeof from && from.nl_family == AF_NETLINK &&
+            from.nl_pid == 0 && from.nl_groups == 1 &&
+            ((size_t)n > sizeof data || um_hot_block_event(data, (size_t)n)))
+            changed = 1;
+    }
+    return changed;
 }
 
 int um_hot_wait(int timeout_ms)
 {
-    fd_set rfds;
-    struct timeval tv;
-    char buf[4096] __attribute__((aligned(8)));
-    int woke = 0;
-
-    if (g_ifd < 0) {                 /* no hot path: plain sleep */
-        struct timespec ts;
-        ts.tv_sec  = timeout_ms / 1000;
-        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        nanosleep(&ts, NULL);
+    struct pollfd fd = { hot_fd, POLLIN, 0 };
+    if (hot_fd < 0) {
+        poll(NULL, 0, timeout_ms);
         return 0;
     }
-
-    FD_ZERO(&rfds);
-    FD_SET(g_ifd, &rfds);
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    if (select(g_ifd + 1, &rfds, NULL, NULL, &tv) <= 0)
-        return 0;                    /* timeout or error: treat as tick */
-
-    /* drain all pending events, flag interesting ones */
-    for (;;) {
-        ssize_t n = read(g_ifd, buf, sizeof buf);
-        if (n <= 0) break;           /* EAGAIN: drained */
-        {
-            const struct inotify_event *ev;
-            char *p = buf;
-            while (p + sizeof *ev <= buf + n) {
-                ev = (const struct inotify_event *)p;
-                if (ev->mask & IN_IGNORED) rewatch();
-                if (ev->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO |
-                                IN_MOVED_FROM | IN_Q_OVERFLOW))
-                    woke = 1;
-                p += sizeof *ev + ev->len;
-            }
-        }
+    if (mock_block[0] && mock_watch < 0) {
+        mock_watch = inotify_add_watch(hot_fd, mock_block, mock_mask);
+        if (mock_watch >= 0) return 1;
     }
-    return woke;
+    if (poll(&fd, 1, timeout_ms) <= 0) return 0;
+    if (fd.revents & (POLLHUP | POLLNVAL)) {
+        um_hot_close();
+        return 1;
+    }
+    return mock_block[0] ? read_mock() : read_kernel();
 }
-
-#endif /* !_WIN32 */

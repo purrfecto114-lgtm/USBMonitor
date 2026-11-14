@@ -1,4 +1,4 @@
-/* lock.c — single-instance guard (flock on POSIX, named mutex on Windows). */
+/* lock.c — single-instance guard (flock on POSIX, exclusive file handle on Windows). */
 #define _XOPEN_SOURCE 700
 #include "usbmon.h"
 
@@ -6,26 +6,23 @@
 
 #ifdef _WIN32
 #include <windows.h>
-static HANDLE g_mutex = NULL;
+static HANDLE lock_file = INVALID_HANDLE_VALUE;
 
 int um_single_instance_acquire(const char *lock_path)
 {
-    wchar_t wpath[512];
-    (void)lock_path;
-    MultiByteToWideChar(CP_UTF8, 0, "Local\\usbmon-singleton", -1, wpath, 512);
-    g_mutex = CreateMutexW(NULL, TRUE, wpath);
-    if (!g_mutex) return -1;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(g_mutex);
-        g_mutex = NULL;
-        return -1;
-    }
+    wchar_t path[640];
+    um_utf8_to_wide(lock_path, path, sizeof path / sizeof *path);
+    lock_file = CreateFileW(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (lock_file == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_SHARING_VIOLATION ? 1 : -1;
     return 0;
 }
 
 void um_single_instance_release(void)
 {
-    if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = NULL; }
+    if (lock_file != INVALID_HANDLE_VALUE) CloseHandle(lock_file);
+    lock_file = INVALID_HANDLE_VALUE;
 }
 
 #else /* POSIX */
@@ -38,12 +35,13 @@ static int g_fd = -1;
 
 int um_single_instance_acquire(const char *lock_path)
 {
-    g_fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+    g_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (g_fd < 0) return -1;
     if (flock(g_fd, LOCK_EX | LOCK_NB) != 0) {
+        int busy = errno == EWOULDBLOCK;
         close(g_fd);
         g_fd = -1;
-        return -1;
+        return busy ? 1 : -1;
     }
     {
         char pid[32];

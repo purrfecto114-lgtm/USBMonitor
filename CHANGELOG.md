@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.0-rc.1] — 2026-11-14
+
+- Windows 统一设备枚举、事件和面板数据，支持无盘符存储，区分目录挂载、不可访问卷和空读卡器。
+- Linux 使用内核 block uevent 唤醒，测试目录保留 inotify。修复 X11 插入通知缺容量。
+- 拆分状态持久化，支持旧快照，避免失败扫描覆盖状态，单次与守护模式共用写入锁。
+- 原生面板重做深浅主题、容量卡片、列表滚动和键盘焦点，安全移除由 Windows PnP 裁决。
+- 修复中文 Hook 参数编码和 XDG 自启动路径转义。Windows Hook 使用明确的绝对可执行路径。
+
+
 ## [2.5.0] — 2026-10-02
 
 ### Added

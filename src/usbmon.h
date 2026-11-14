@@ -7,7 +7,7 @@
  *     a tiny helper binary, usbmon-toast, spawned only when a display
  *     is available)
  *   - one scan round per hour by default ("1h 一轮") — the guaranteed
- *     cadence; plug/unplug wake the daemon instantly (inotify on Linux,
+ *     cadence; plug/unplug wake the daemon instantly (uevents on Linux,
  *     WM_DEVICECHANGE on Windows), so popups appear in real time
  *   - JSONL structured event log, serial/label redaction by default
  *   - opt-in hooks executed as argv arrays (never through a shell),
@@ -21,9 +21,10 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
-#define UM_VERSION "2.5.0"
+#define UM_VERSION "2.6.0-rc.1"
 
 /* ---- limits (defensive caps, same spirit as the original normalizers) ---- */
 #define UM_MAX_DEV          64      /* devices per snapshot            */
@@ -45,8 +46,7 @@
 #define UM_SLEEP_TICK_MS    200
 #define UM_HOT_SETTLE_MS    700     /* debounce between event wake and round */
 #define UM_GUI_TOAST_TTL_S  12      /* popup auto-dismiss                      */
-#define UM_GUI_MAX_TOASTS   8       /* tracked helper children (reap table)    */
-#define UM_GUI_SLOTS        4       /* on-screen stacking slots (bottom-right) */
+#define UM_GUI_MAX_TOASTS   4       /* X11 windows and helper processes */
 
 /* ---------------------------------------------------------------- devices */
 
@@ -55,6 +55,7 @@ typedef struct {
     char display[UM_NAME_MAX * 2];
     char model[UM_MODEL_MAX];
     char serial[UM_SERIAL_MAX];     /* raw serial (may be empty)            */
+    char identity[24];            /* internal identity, persisted with key */
     char serial_fp[24];             /* "sha256:xxxxxxxxxxxx" redacted form  */
     char bus[16];                   /* "usb" / "removable" / "sd" / "mmc"   */
     int  removable;
@@ -81,11 +82,14 @@ int   um_glob_match(const char *pattern, const char *text, int fold_case);
 void  um_fingerprint(const char *value, char *out, size_t out_n);
 int   um_mkdir_p(const char *path);
 int   um_read_file_str(const char *path, char *buf, size_t n);
+size_t um_utf8_sequence(const unsigned char *s, size_t available);
+void um_display_text(const char *src, char *out, size_t capacity);
+FILE *um_fopen(const char *path, const char *mode);
 void  um_copy_str(char *dst, size_t n, const char *src);
 void  um_human_size(unsigned long long bytes, char *out, size_t n);
 const char *um_state_dir(char *buf, size_t n);
 const char *um_config_dir(char *buf, size_t n);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(UM_WIN32_SHIM)
 void um_utf8_to_wide(const char *in, wchar_t *out, size_t out_n);
 void um_wide_to_utf8(const wchar_t *in, char *out, size_t out_n);
 #endif
@@ -165,16 +169,21 @@ int  um_single_instance_acquire(const char *lock_path);
 void um_single_instance_release(void);
 
 /* ------------------------------------------------------------- hotpath.c -- */
-/* Event-driven wakeup: watch <sys_root>/block for create/delete so a plug
- * triggers a round immediately instead of waiting for the hourly tick.
- * POSIX/inotify implementation; Windows uses WM_DEVICECHANGE in gui_win32.c.
- * Returns an fd (-1 = unavailable).  um_hot_wait blocks up to timeout_ms
- * and returns 1 when a device change was observed (events drained).      */
+/* Kernel block notifications, with inotify for an explicit mock tree. */
 #ifndef _WIN32
+int um_find_executable(const char *name, char *out, size_t n);
+void um_set_executable(const char *argv0);
+const char *um_executable(void);
 int  um_hot_init(const char *sys_root);
 void um_hot_close(void);
 int  um_hot_wait(int timeout_ms);
+int  um_hot_block_event(const char *data, size_t len);
 #endif
+
+/* Persist successful snapshots and read the legacy key-only format. */
+int um_state_load(const char *path, um_snapshot *snap);
+int um_state_save(const char *path, const um_snapshot *snap);
+int um_snapshot_match(const um_snapshot *snap, const um_device *dev);
 
 /* ---------------------------------------------------------------- gui.c ---- */
 /* Popup GUI: when a USB device is inserted/removed a small toast window
@@ -186,14 +195,15 @@ typedef struct {
     int  enabled;        /* runtime: GUI actually active                       */
     int  raw_serial;     /* mirror --log-raw for display                       */
     int  toast_ttl;      /* auto-dismiss seconds                               */
-    int  slot_seq;       /* stacking slot counter                              */
     int  warned;         /* emitted "unavailable" notice once                  */
 #ifndef _WIN32
     int  toasts[UM_GUI_MAX_TOASTS];   /* helper pids, 0 = empty             */
 #else
+    int watch_devices;  /* device wakeups even with popups disabled */
     void *gui_thread;    /* HANDLE                                            */
     void *wake_event;    /* HANDLE set by WM_DEVICECHANGE                     */
-    unsigned long gui_tid; /* PostThreadMessage target                        */
+    void *ready_event;
+    void *listener;
 #endif
 } um_gui;
 
@@ -202,56 +212,6 @@ void um_gui_show_add(um_gui *g, const um_device *dev);
 void um_gui_show_remove(um_gui *g, const um_device *dev);
 void um_gui_reap(um_gui *g);            /* POSIX: reap finished helper children  */
 void um_gui_shutdown(um_gui *g);        /* brief wait, then forget helpers       */
-
-#ifdef _WIN32
-/* gui_win32.c: arbitrary-text toast (tray action feedback, e.g. eject). */
-void um_gui_win_notify(um_gui *g, const char *title, const char *body,
-                        int accent_ok);
-/* gui_win32.c: thread-safe toast post with an EXPLICIT slot and ttl —
- * unlike um_gui_win_notify it touches no um_gui state, so the async-eject
- * worker thread can call it (only the immutable gui_tid crosses threads).
- * Re-using a slot replaces the previous toast in place: the "正在安全弹出"
- * progress line is upgraded to the final result in the same slot. */
-void um_gui_win_post(unsigned long gui_tid, const char *title,
-                     const char *body, int accent_ok, int slot, int ttl);
-/* gui_win32.c: device add/remove -> the single-instance panel (heap model
- * marshaled to the GUI thread via UMWM_PANEL; falls back to a text toast
- * when the evidence layer yields nothing). */
-void um_gui_win_show(um_gui *g, const um_device *dev, int is_add);
-
-/* tray_win32.c: system tray + left/right menus, on the GUI thread. */
-void um_tray_install(void *owner_hwnd, void *gui);
-void um_tray_uninstall(void);
-int  um_tray_filter(void *hwnd, unsigned msg, void *wparam, void *lparam);
-/* tray_win32.c: test-only free-form log line (USBMON_TRAY_TEST); gui_win32.c
- * uses it to surface toast/panel diagnostics on headless CI runners. */
-void um_tray_test_log(const char *key, const char *detail);
-
-/* tray_win32.c: volume actions shared with the toast panel (gui_win32.c
- * wires the panel's Open/Reveal/Eject buttons to these).  GUI thread. */
-void um_tray_open_letter(char letter);
-void um_tray_reveal_letter(char letter);
-void um_tray_eject_letter(char letter, const char *model);
-
-/* Window messages shared by gui_win32.c and tray_win32.c.  Numeric
- * (WM_APP base 0x8000) so this header stays free of windows.h.
- * UMWM_TOAST / UMWM_QUIT / UMWM_PANEL are thread messages; the UMWM_TRAY*
- * ones are posted to the listener window — including by tests: posting them
- * with the exact LPARAM a real tray click delivers exercises the full menu
- * path on headless CI runners.  UMWM_PANEL carries a heap um_toast_model*
- * built on the daemon thread (um_enum_collect) — the GUI thread copies it
- * into the single-instance panel, shows it and frees it. */
-#define UMWM_TOAST        0x8001
-#define UMWM_QUIT         0x8002
-#define UMWM_TRAY         0x8003
-#define UMWM_TRAY_RESCAN  0x8004
-#define UMWM_TRAY_QUIT    0x8005
-#define UMWM_PANEL        0x8006
-/* Test-only: posted to the listener window by demo.ps1 to drive the async
- * safe-eject path headlessly (WPARAM packs the drive letter in its low
- * byte); honored only when USBMON_TRAY_TEST is set in the environment. */
-#define UMWM_TRAY_EJECT_TEST 0x8007
-#endif
 
 /* Login autostart (v1.1.1 --install-startup/--uninstall-startup/--startup-
  * status parity).  Windows: HKCU Run "usbmon" (same value the tray toggle
@@ -265,11 +225,10 @@ int  um_startup_enabled(void);
 const char *um_startup_where(void);
 
 /* -------------------------------------------------------------- main.c ---- */
-/* implemented in main.c: snapshot diff + round loop */
-int  um_snapshot_find(const um_snapshot *s, const char *key);
-
 /* main.c: request a clean daemon shutdown from another thread (the
  * tray "退出" item).  `reason` lands in the JSONL stop event. */
-void um_request_stop(const char *reason);
+#ifdef _WIN32
+void um_request_stop(void);
+#endif
 
 #endif /* USBMON_H */

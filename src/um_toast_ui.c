@@ -25,24 +25,21 @@ void um_theme_resolve(um_theme *t, const char *requested, int system_dark)
 
     if (dark) {
         t->name = "dark";
-        t->panel = 0x202630; t->panel2 = 0x2a323e;
-        t->text  = 0xf7f9fc; t->muted  = 0xb5c0cf;
-        t->border = 0x3a4656;
-        t->accent = 0x75a7ff; t->accent_hover = 0x91b9ff;
-        t->progress = 0x3b4654;
-        t->shadow = 0x91000000;
+        t->panel = 0x111923; t->panel2 = 0x1b2837;
+        t->text = 0xf2f6fc; t->muted = 0xb4c3d5;
+        t->border = 0x374a60;
+        t->accent = 0x9abaff; t->accent_hover = 0xb8cfff; t->on_accent = 0x0b1930;
+        t->progress = 0x364860;
+        t->ok = 0x6be1b5; t->warn = 0xffcc80; t->error = 0xffa6a3;
     } else {
         t->name = "light";
-        t->panel = 0xfbfcff; t->panel2 = 0xf2f5fa;
-        t->text  = 0x111827; t->muted  = 0x687386;
-        t->border = 0xd9e2ee;
-        t->accent = 0x1769e0; t->accent_hover = 0x0f5ed2;
-        t->progress = 0xe5ebf3;
-        t->shadow = 0x370f172a;
+        t->panel = 0xfafcff; t->panel2 = 0xf0f5fb;
+        t->text = 0x17263a; t->muted = 0x4c5f76;
+        t->border = 0xcbd8e7;
+        t->accent = 0x2051b0; t->accent_hover = 0x163e91; t->on_accent = 0xffffff;
+        t->progress = 0xd6e2f2;
+        t->ok = 0x0b7159; t->warn = 0x8a4b00; t->error = 0x9c373c;
     }
-    t->ok    = 0x34c759;
-    t->warn  = 0xffb020;
-    t->error = 0xff5c5c;
 }
 
 static unsigned long accent_of(const um_theme *t, int kind)
@@ -186,194 +183,158 @@ static const char *icon_status_for(um_dev_kind kind)
     }
 }
 
+static void stroke(um_drawlist *out, int x, int y, int w, int h, int radius,
+                   unsigned long color)
+{
+    int index = out->n;
+    push_round(out, x, y, w, h, color, radius, UM_HIT_NONE);
+    if (out->n > index) out->items[index].stroke = 1;
+}
+
+static int row_top(void) { return 90; }
+static int button_top(int height) { return height - UM_UI_PAD - UM_UI_BTN_H; }
+
+int um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int height)
+{
+    int rows;
+    if (!m->n_rows) return 0;
+    if (!s->expanded) return 1;
+    rows = (button_top(height) - 6 - row_top()) / UM_UI_ROW_H;
+    if (rows < 1) rows = 1;
+    return rows < m->n_rows ? rows : m->n_rows;
+}
+
 int um_toast_measure_height(const um_toast_model *m, const um_toast_state *s)
 {
-    int rows_h = 0;
-    int h = UM_UI_PAD + 46 + 20 + 8 + UM_UI_BTN_H + UM_UI_PAD;
+    if (!m->n_rows && !m->overview) return m->status[0] ? 166 : 148;
+    if (s->expanded && m->n_rows > 1) {
+        int height = row_top() + m->n_rows * UM_UI_ROW_H + UM_UI_PAD + UM_UI_BTN_H + 6;
+        return height < UM_UI_EXPANDED_H ? height : UM_UI_EXPANDED_H;
+    }
+    return UM_UI_COLLAPSED_H;
+}
 
-    if (m->status[0]) h += 18;
-    if (m->n_rows > 0) {
-        if (s->expanded) {
-            int full = m->n_rows * UM_UI_ROW_H;
-            rows_h = full > UM_UI_ROWS_MAX_H ? UM_UI_ROWS_MAX_H : full;
-        } else {
-            rows_h = UM_UI_ROWS_COLLAPSED_H;   /* 与 1.1.1 scroll minHeight 一致 */
-        }
-    }
-    h += rows_h;
-    /* 与 1.1.1 一致：min(max(自然高度, 205), 目标高度)。
-     * 0 行（纯文字通知 / 信息框）例外：205 的下限来自"至少放得下一行设备"
-     * 的经验值，对文字通知只会留出 57px 空行区 —— 按自然高度收缩。 */
-    {
-        int target = s->expanded ? UM_UI_EXPANDED_H : UM_UI_COLLAPSED_H;
-        if (m->n_rows > 0 && h < 205) h = 205;
-        if (h > target) h = target;
-    }
-    return h;
+static void button(um_drawlist *out, const um_theme *t, const um_toast_state *s,
+                   int x, int y, int w, int h, um_ui_hit hit, const char *label,
+                   int primary)
+{
+    int hover = s->hover_btn == (int)hit;
+    unsigned long bg = primary ? (hover ? t->accent_hover : t->accent)
+                               : (hover ? t->progress : t->panel2);
+    push_round(out, x, y, w, h, bg, 10, hit);
+    stroke(out, x, y, w, h, 10, s->focus_btn == (int)hit ? t->text :
+           (primary ? bg : t->border));
+    push_text(out, x, y + (h - 16) / 2, w, UM_F_BTN,
+              primary ? t->on_accent : t->text, UM_A_CENTER, label);
 }
 
 void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
-                     const um_theme *t, int width, int height,
-                     um_drawlist *out)
+                     const um_theme *t, int width, int height, um_drawlist *out)
 {
     const int p = UM_UI_PAD;
-    int y = p;
-    int i;
+    int by = button_top(height);
+    int badge = m->count[0] ? 62 : 0;
+    int rows = um_toast_rows_visible(m, s, height);
+    int first = s->expanded ? s->scroll_px / UM_UI_ROW_H : 0;
+    int i, has_open = !s->expanded && model_has_openable(m);
     unsigned long accent = accent_of(t, m->accent_kind);
-    int btn_y = height - p - UM_UI_BTN_H;
-    int rows_top;
+    char countdown[64];
 
     out->n = 0;
-
-    /* 窗口底 + 边框（圆角；后端可用区域裁剪实现真圆角） */
-    push_round(out, 0, 0, width, height, t->panel, 10, UM_HIT_NONE);
-
-    /* ---- 头部：图标 + 标题 + 副标题 + 计数 ---- */
-    push_icon(out, p, y, 34, 34,
-              m->accent_kind == 1 ? "add"
-              : m->accent_kind == 3 ? "remove" : "usb",
+    push_round(out, 0, 0, width, height, t->panel, 18, UM_HIT_NONE);
+    stroke(out, 1, 1, width - 2, height - 2, 17, t->border);
+    push_round(out, p, p, 38, 38, t->panel2, 12, UM_HIT_NONE);
+    push_icon(out, p + 6, p + 6, 27, 27,
+              m->accent_kind == 1 ? "add" : m->accent_kind == 3 ? "remove" : "usb",
               accent, t->text);
-    push_text(out, p + 44, y + 1, width - p * 2 - 60, UM_F_TITLE, t->text,
-              UM_A_LEFT, m->headline);
-    push_text(out, p + 44, y + 23, width - p * 2 - 60, UM_F_SMALL, t->muted,
-              UM_A_LEFT, m->subtitle);
-    if (m->count[0])
-        push_text(out, width - p - 60, y + 5, 60, UM_F_SMALL, t->muted,
-                  UM_A_RIGHT, m->count);
-    y += 46;
-
-    /* ---- 摘要 ---- */
-    push_text(out, p, y, width - p * 2, UM_F_BODY, t->muted, UM_A_LEFT,
-              m->summary);
-    y += 20;
-
-    /* ---- 状态行（安全弹出进行中等）---- */
-    if (m->status[0]) {
-        push_text(out, p, y, width - p * 2, UM_F_SMALL, t->warn, UM_A_LEFT,
-                  m->status);
-        y += 18;
+    push_text(out, p + 49, p + 1, width - 2 * p - 49 - badge, UM_F_TITLE,
+              t->text, UM_A_LEFT, m->headline);
+    push_text(out, p + 49, p + 24, width - 2 * p - 49 - badge, UM_F_SMALL,
+              t->muted, UM_A_LEFT, m->subtitle);
+    if (badge) {
+        push_round(out, width - p - 54, p + 3, 54, 26, t->panel2, 12, UM_HIT_NONE);
+        push_text(out, width - p - 54, p + 9, 54, UM_F_SMALL,
+                  t->text, UM_A_CENTER, m->count);
     }
-    y += 8;
-    rows_top = y;
+    if (m->summary[0] || m->status[0]) {
+        push_round(out, p, 62, 3, 18, accent, 2, UM_HIT_NONE);
+        push_text(out, p + 12, 63, width - 2 * p - 12, UM_F_BODY,
+                  t->muted, UM_A_LEFT, m->status[0] ? m->status : m->summary);
+    }
 
-    /* ---- 设备/分区行 ---- */
-    {
-        int rows_bottom = btn_y - 10;
-        int visible_rows = s->expanded ? m->n_rows : (m->n_rows > 0 ? 1 : 0);
-        int clip_h = rows_bottom - rows_top;
-        for (i = 0; i < visible_rows && i < UM_UI_MAX_ROWS; i++) {
-            const um_volume *v = &m->rows[i];
-            int ry = rows_top + i * UM_UI_ROW_H - s->scroll_px;
-            int rh = UM_UI_ROW_H - 8;
-            unsigned long bg = t->panel2;
-            unsigned long bd = t->border;
-            int hit = UM_HIT_ROW + i;
-            if (ry >= rows_bottom || ry + rh <= rows_top) continue;
+    if (first + rows > m->n_rows) first = m->n_rows - rows;
+    for (i = 0; i < rows; i++) {
+        int index = first + i, y = row_top() + i * UM_UI_ROW_H;
+        const um_volume *v = &m->rows[index];
+        int row_w = width - 2 * p - (s->expanded && rows < m->n_rows ? 8 : 0);
+        int row_h = UM_UI_ROW_H - 8;
+        int right = p + row_w;
+        int text_w = row_w - 58 - (s->expanded && v->openable ? 80 : 12);
+        int hover = index == s->hover_row || index == s->focus_row;
+        unsigned long edge = hover ? t->accent : t->border;
+        const char *capacity = v->capacity;
+        char formatted[128];
 
-            if (i == s->hover_row || i == s->focus_row) {
-                bd = t->accent;
-                bg = t->panel2;
-            }
-            push_round(out, p, ry, width - p * 2, rh, bg, 6,
-                       (um_ui_hit)hit);
-            /* 行边框：用一条线不方便表达圆角，交给后端按 border 描边 */
-            {
-                um_draw *d = push(out);
-                if (d) {
-                    d->kind = UM_D_ROUNDRECT;
-                    d->x = p; d->y = ry; d->w = width - p * 2; d->h = rh;
-                    d->color = bd; d->radius = 6; d->hit = UM_HIT_NONE;
-                    d->stroke = 1;          /* 只描边 */
-                }
-            }
-
-            push_icon(out, p + 12, ry + 9, 30, 30, icon_status_for(v->kind),
-                      v->ejectable ? t->accent : t->muted, t->text);
-            push_text(out, p + 12 + 40, ry + 9,
-                      width - p * 2 - 52 - (s->expanded ? 76 : 0),
-                      UM_F_ROWTITLE, t->text, UM_A_LEFT, v->title);
-            push_text(out, p + 12 + 40, ry + 29,
-                      width - p * 2 - 52 - (s->expanded ? 76 : 0),
-                      UM_F_SMALL, t->muted, UM_A_LEFT, v->subtitle);
-            {
-                char cap[160];
-                um_ui_capacity_line(v, cap, sizeof cap);
-                push_text(out, p + 12, ry + 47, width - p * 2 - 24,
-                          UM_F_SMALL, t->muted, UM_A_LEFT, cap);
-            }
-            /* 容量条：底色 + 已用（自绘而非 PBM_SETBARCOLOR —— 启用视觉
-             * 样式后该消息无效，见 docs/PORT_AND_TRADEOFFS.md） */
-            push_round(out, p + 12, ry + 57, width - p * 2 - 24, 6,
-                       t->progress, 3, UM_HIT_NONE);
-            if (v->pct > 0) {
-                int full = width - p * 2 - 24;
-                int used_w = full * v->pct / 100;
-                push_round(out, p + 12, ry + 57, used_w, 6, accent, 3,
-                           UM_HIT_NONE);
-            }
-            if (s->expanded && v->openable) {
-                int bx = width - p - 12 - 68;
-                push_round(out, bx, ry + 9, 68, 34, accent, 6,
-                           (um_ui_hit)(UM_HIT_ROW_OPEN + i));
-                push_text(out, bx, ry + 19, 68, UM_F_BTN, 0xffffff,
-                          UM_A_CENTER, "打开");
-            }
+        push_round(out, p, y, row_w, row_h, t->panel2, 12,
+                   (um_ui_hit)(UM_HIT_ROW + index));
+        stroke(out, p, y, row_w, row_h, 12, edge);
+        push_icon(out, p + 12, y + 13, 29, 29, icon_status_for(v->kind),
+                  v->openable ? t->accent : t->muted, t->text);
+        push_text(out, p + 54, y + 10, text_w, UM_F_ROWTITLE, t->text, UM_A_LEFT, v->title);
+        push_text(out, p + 54, y + 30, text_w, UM_F_SMALL, t->muted, UM_A_LEFT, v->subtitle);
+        if (!capacity[0] && v->total) {
+            um_ui_capacity_line(v, formatted, sizeof formatted);
+            capacity = formatted;
         }
-        (void)clip_h;
+        if (capacity[0])
+            push_text(out, p + 54, y + 52, row_w - (v->pct >= 0 ? 152 : 64),
+                      UM_F_SMALL, t->muted, UM_A_LEFT, capacity);
+        if (v->total && v->pct >= 0) {
+            int pct = v->pct > 100 ? 100 : v->pct;
+            push_round(out, right - 80, y + 56, 68, 5, t->progress, 3, UM_HIT_NONE);
+            if (pct > 0) push_round(out, right - 80, y + 56, 68 * pct / 100, 5,
+                                    t->accent, 3, UM_HIT_NONE);
+        }
+        if (s->expanded && v->openable)
+            button(out, t, s, right - 74, y + 12, 62, 31,
+                   (um_ui_hit)(UM_HIT_ROW_OPEN + index), "打开", 0);
+    }
+    if (s->expanded && rows > 0 && rows < m->n_rows) {
+        int track = rows * UM_UI_ROW_H - 8;
+        int thumb = track * rows / m->n_rows;
+        if (thumb < 16) thumb = 16;
+        push_round(out, width - p - 4, row_top(), 4, track, t->progress, 2, UM_HIT_NONE);
+        push_round(out, width - p - 4, row_top() + (track - thumb) * first / (m->n_rows - rows),
+                   4, thumb, t->muted, 2, UM_HIT_NONE);
     }
 
-    /* ---- 0 行 = 纯文字信息框 ---- */
-    if (m->n_rows == 0) {
-        /* 不画 展开/关闭/打开：整窗点击即关闭（后端在 hit miss 时发 CLOSE），
-         * Esc 亦可。底部只留倒计时，于是宽度可以按文案实测收窄到 300，
-         * 不会出现倒计时压住"关闭"按钮的排版。 */
-        char cd[64];
-        if (s->paused) snprintf(cd, sizeof cd, "%s", "已暂停");
-        else if (m->status[0]) snprintf(cd, sizeof cd, "%s", "");
-        else um_ui_countdown(s->remaining_ms, cd, sizeof cd);
-        push_text(out, width - p * 2 - 130, btn_y + 13, 124, UM_F_SMALL,
-                  t->muted, UM_A_RIGHT, cd);
+    if (s->paused) snprintf(countdown, sizeof countdown, "计时已暂停");
+    else um_ui_countdown(s->remaining_ms, countdown, sizeof countdown);
+    if (!m->n_rows && !m->overview) {
+        push_text(out, p, by + 12, width - 2 * p, UM_F_SMALL,
+                  t->muted, UM_A_RIGHT, countdown);
         return;
     }
+    if (!m->n_rows)
+        push_round(out, p, row_top(), width - 2 * p, UM_UI_ROW_H - 8,
+                   t->panel2, 12, UM_HIT_NONE);
+    if (!m->n_rows)
+        push_text(out, p, row_top() + 27, width - 2 * p, UM_F_BODY,
+                  t->muted, UM_A_CENTER, "接入设备后会自动更新");
 
-    /* ---- 底栏按钮 ---- */
-    if (m->n_rows > 1) {
-        unsigned long bg = (s->hover_btn == UM_HIT_EXPAND) ? t->accent_hover
-                                                           : t->border;
-        push_round(out, p, btn_y, 90, UM_UI_BTN_H, bg, 6, UM_HIT_EXPAND);
-        push_text(out, p, btn_y + 13, 90, UM_F_BTN,
-                  (s->hover_btn == UM_HIT_EXPAND) ? 0xffffff : t->text,
-                  UM_A_CENTER, s->expanded ? "折叠" : "展开");
-    }
+    if (m->n_rows > 1)
+        button(out, t, s, p, by, 90, UM_UI_BTN_H, UM_HIT_EXPAND,
+               s->expanded ? "收起列表" : "展开列表", 0);
     {
-        unsigned long bg = (s->hover_btn == UM_HIT_CLOSE) ? t->accent_hover
-                                                          : t->border;
-        int cx = (m->n_rows > 1) ? p + 90 + 8 : p;
-        push_round(out, cx, btn_y, 90, UM_UI_BTN_H, bg, 6, UM_HIT_CLOSE);
-        push_text(out, cx, btn_y + 13, 90, UM_F_BTN,
-                  (s->hover_btn == UM_HIT_CLOSE) ? 0xffffff : t->text,
-                  UM_A_CENTER, "关闭");
+        int close_x = p + (m->n_rows > 1 ? 98 : 0);
+        int text_x = close_x + 70;
+        int text_right = has_open ? width - p - 126 : width - p;
+        button(out, t, s, close_x, by, 66, UM_UI_BTN_H, UM_HIT_CLOSE, "关闭", 0);
+        push_text(out, text_x, by + 14, text_right - text_x, UM_F_SMALL,
+                  t->muted, UM_A_RIGHT, countdown);
     }
-
-    /* 倒计时（主按钮左侧；hover 暂停时显示"已暂停"） */
-    {
-        char cd[64];
-        if (s->paused) snprintf(cd, sizeof cd, "%s", "已暂停");
-        else if (m->status[0]) snprintf(cd, sizeof cd, "%s", "");
-        else um_ui_countdown(s->remaining_ms, cd, sizeof cd);
-        push_text(out, width - p - 118 - 130, btn_y + 13, 124, UM_F_SMALL,
-                  t->muted, UM_A_RIGHT, cd);
-    }
-
-    /* 主按钮：折叠态显示（展开态每行自带"打开"）—— 与 1.1.1 一致 */
-    if (m->n_rows > 0 && !s->expanded && model_has_openable(m)) {
-        unsigned long bg = (s->hover_btn == UM_HIT_OPEN) ? t->accent_hover
-                                                         : t->accent;
-        push_round(out, width - p - 118, btn_y, 118, UM_UI_BTN_H, bg, 6,
-                   UM_HIT_OPEN);
-        push_text(out, width - p - 118, btn_y + 13, 118, UM_F_BTN, 0xffffff,
-                  UM_A_CENTER, "打开U盘");
-    }
+    if (has_open)
+        button(out, t, s, width - p - 118, by, 118, UM_UI_BTN_H, UM_HIT_OPEN, "打开卷", 1);
 }
 
 um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
@@ -400,23 +361,13 @@ um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
 int um_toast_max_scroll(const um_toast_model *m, const um_toast_state *s,
                         int height)
 {
-    int rows_top = UM_UI_PAD + 46 + 20 + 8 + (m->status[0] ? 18 : 0);
-    int btn_y    = height - UM_UI_PAD - UM_UI_BTN_H;
-    int viewport = (btn_y - 10) - rows_top;
-    int full, maxs;
-
-    if (viewport < 0) viewport = 0;
-    full = s->expanded ? m->n_rows * UM_UI_ROW_H : UM_UI_ROW_H;
-    maxs = full - viewport;
-    if (maxs < 0) maxs = 0;
-    return maxs;
+    return s->expanded ? (m->n_rows - um_toast_rows_visible(m, s, height)) * UM_UI_ROW_H : 0;
 }
 
 /* ============================================================== 新增能力 ==
  * 以下三段对应 1.1.1 明确修过的问题与本次新增的设备分类需求：
  *   1) UTF-8 → UTF-16（修"中文乱码"根因，而非把每个字节当码点）
  *   2) 设备分类决策树（HID 智能笔 / 网卡 / 拓展坞 / 无盘符 / 误报防御）
- *   3) 多分区聚合（以 DiskNumber 为键，而不是盘符）
  * ========================================================================== */
 
 /* ------------------------------------------------------- UTF-8 → UTF-16 -- */
@@ -513,35 +464,9 @@ um_dev_kind um_ui_classify(unsigned tags, int has_letter, int bus_is_usb,
     if (is_net) return is_usb ? UM_KIND_NET_ADAPTER : UM_KIND_UNKNOWN;
     if (is_hid) return is_usb ? UM_KIND_HID_PEN : UM_KIND_UNKNOWN;
 
-    /* 只有 USB 标签、没有任何功能接口 → 证据不足（1.1.1 bug1 的教训）。
-     * removable 只影响 can_eject，不影响分类。 */
+    /* A transport tag alone does not identify a useful device function. */
     (void)removable;
     return UM_KIND_UNKNOWN;
-}
-
-int um_ui_can_open(um_dev_kind kind)
-{
-    return kind == UM_KIND_USB_STORAGE;
-}
-
-int um_ui_can_eject(um_dev_kind kind, int removable)
-{
-    switch (kind) {
-    case UM_KIND_USB_STORAGE:
-    case UM_KIND_STORAGE_NO_LETTER:
-        /* 只有标记为可移除的存储才允许弹出；固定盘/系统盘必须禁止。 */
-        return removable ? 1 : 0;
-    /* 非存储设备（笔 / 网卡 / 拓展坞）与证据不足者一律不弹：
-     * 对它们发存储 eject IOCTL 既无意义也会失败。 */
-    case UM_KIND_HID_PEN:
-    case UM_KIND_NET_ADAPTER:
-    case UM_KIND_DOCK_HUB:
-    case UM_KIND_EMPTY_SLOT:
-    case UM_KIND_LOCKED_VOLUME:
-    case UM_KIND_UNKNOWN:
-    default:
-        return 0;
-    }
 }
 
 void um_ui_device_notice(um_dev_kind kind, char *out, size_t n)
@@ -550,11 +475,11 @@ void um_ui_device_notice(um_dev_kind kind, char *out, size_t n)
     switch (kind) {
     case UM_KIND_USB_STORAGE:        msg = ""; break;
     case UM_KIND_STORAGE_NO_LETTER:
-        msg = "USB 存储设备已连接，但未分配盘符（可在磁盘管理中分配）"; break;
+        msg = "设备已连接 · 未分配盘符"; break;
     case UM_KIND_EMPTY_SLOT:
         msg = "读卡器已就绪，但未插入介质"; break;
     case UM_KIND_LOCKED_VOLUME:
-        msg = "卷已锁定（如 BitLocker），解锁后才能打开"; break;
+        msg = "卷当前不可访问"; break;
     case UM_KIND_DOCK_HUB:
         msg = "拓展坞 / USB 集线器 · 无存储"; break;
     case UM_KIND_NET_ADAPTER:
@@ -566,79 +491,4 @@ void um_ui_device_notice(um_dev_kind kind, char *out, size_t n)
         msg = "USB 设备已连接（类型未确定，无存储）"; break;
     }
     snprintf(out, n, "%s", msg);
-}
-
-void um_ui_remove_notice(char *out, size_t n)
-{
-    /* 与 1.1.1 app.py:1606 的原文保持一致 */
-    snprintf(out, n, "%s", "USB 设备已拔出；该设备可能尚未分配盘符。");
-}
-
-/* ------------------------------------------------------------- 多分区聚合 -- */
-
-int um_ui_group_by_disk(const um_volume *vols, int n_vols,
-                        um_device_row *rows, int max_rows)
-{
-    int i, j, n = 0;
-
-    if (!vols || !rows || max_rows <= 0) return 0;
-
-    for (i = 0; i < n_vols && n < max_rows; i++) {
-        const um_volume *v = &vols[i];
-        um_device_row  *r = NULL;
-
-        /* disk_number < 0 = "不知道在哪块盘上"：不可归并，各自成行。
-         * （否则笔/网卡/拓展坞这类无盘号的非存储设备会被并成一行幽灵设备。） */
-        if (v->disk_number >= 0) {
-            for (j = 0; j < n; j++) {
-                if (rows[j].disk_number == v->disk_number) { r = &rows[j]; break; }
-            }
-        }
-        if (!r) {
-            r = &rows[n++];
-            memset(r, 0, sizeof *r);
-            r->disk_number = v->disk_number;
-            snprintf(r->title, sizeof r->title, "%s", v->title);
-            r->tags = v->tags;
-            r->kind = v->kind;
-            r->pct = -1;
-        }
-        r->tags |= v->tags;
-        r->total += v->total;
-        r->used  += v->used;
-        r->free  += v->free;
-        if (r->pct < 0) r->pct = v->pct;
-        if (r->title[0] == '\0' && v->title[0])
-            snprintf(r->title, sizeof r->title, "%s", v->title);
-        /* 优先保留"最具体"的类别：存储 > 非存储 */
-        if (v->kind == UM_KIND_USB_STORAGE) r->kind = v->kind;
-        if (v->ejectable) r->ejectable = 1;
-        if (v->openable)  r->openable = 1;
-        for (j = 0; j < v->n_letters && r->n_letters < UM_UI_MAX_LETTER; j++) {
-            if (v->letters[j][0])
-                snprintf(r->letters[r->n_letters++], 4, "%s", v->letters[j]);
-        }
-    }
-    return n;
-}
-
-void um_ui_row_subtitle(const um_device_row *row, char *out, size_t n)
-{
-    char list[UM_UI_MAX_LETTER * 6];
-    int i;
-
-    if (!row) { if (n) out[0] = 0; return; }
-
-    list[0] = '\0';
-    for (i = 0; i < row->n_letters; i++) {
-        if (i) strncat(list, "、", sizeof list - strlen(list) - 1);
-        strncat(list, row->letters[i], sizeof list - strlen(list) - 1);
-    }
-
-    if (row->n_letters > 1)
-        snprintf(out, n, "可移动磁盘 · %s（%d 个分区）", list, row->n_letters);
-    else if (row->n_letters == 1)
-        snprintf(out, n, "可移动磁盘 · %s", list);
-    else
-        snprintf(out, n, "%s", "未分配盘符");
 }

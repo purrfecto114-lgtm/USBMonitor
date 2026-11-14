@@ -1,92 +1,103 @@
 #!/usr/bin/env bash
-# demo-gui.sh — end-to-end demo of the popup GUI (usbmon-toast) under Xvfb.
-#
-# Simulates the user experience: start the daemon, insert a USB stick,
-# watch the toast pop up instantly (hot path), unplug it, see the gray
-# removal toast, then verify clean shutdown with no zombie children.
-#
-# Requirements: Xvfb + a CJK font (fontconfig) — both present in the
-# dev sandbox.  Run: bash tools/demo-gui.sh
-#
+# Run the Linux GUI regression on an isolated X display and state tree.
 set -u
 cd "$(dirname "$0")/.."
-
-SYS=/tmp/usbmon-gui-sys
-LOG=/tmp/usbmon-gui-events.jsonl
-PASS=0; FAIL=0
-ok()   { PASS=$((PASS+1)); echo "  >>> PASS: $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  >>> FAIL: $1"; }
-
-command -v Xvfb >/dev/null || { echo "Xvfb not installed"; exit 1; }
-# build only what is missing (CI may ship a glibc-baseline usbmon-toast
-# or a musl-static usbmon here — never overwrite those)
-[ -x ./usbmon ] || make >/dev/null || exit 1
-[ -x ./usbmon-toast ] || make usbmon-toast >/dev/null || exit 1
-
-rm -rf "$SYS" "$LOG" ~/.local/state/usbmon/last-snapshot.txt
+RUN=$(mktemp -d "${TMPDIR:-.}/usbmon-gui.XXXXXX") || exit 1
+RUN=$(cd "$RUN" && pwd) || exit 1
+SYS=$RUN/sys
+LOG=$RUN/events.jsonl
+export XDG_STATE_HOME=$RUN/state XDG_CONFIG_HOME=$RUN/config
 mkdir -p "$SYS/block"
+xvfb= daemon=
+cleanup() {
+    if [ -n "$daemon" ]; then kill -TERM "$daemon" 2>/dev/null; wait "$daemon" 2>/dev/null; fi
+    if [ -n "$xvfb" ]; then kill "$xvfb" 2>/dev/null; wait "$xvfb" 2>/dev/null; fi
+    rm -rf -- "$RUN"
+}
+trap cleanup EXIT
 
-# --- virtual display ---------------------------------------------------
-Xvfb :77 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
-XVFB_PID=$!
-sleep 1.2
-export DISPLAY=:77
+if [ -n "${USBMON_TEST_DISPLAY:-}" ]; then
+    export DISPLAY=$USBMON_TEST_DISPLAY
+else
+    command -v Xvfb >/dev/null || { echo "Xvfb not installed"; exit 1; }
+    Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$RUN/display" >"$RUN/xvfb.log" 2>&1 &
+    xvfb=$!
+    for _ in {1..40}; do
+        [ -s "$RUN/display" ] && break
+        kill -0 "$xvfb" 2>/dev/null || { cat "$RUN/xvfb.log"; exit 1; }
+        sleep 0.1
+    done
+    [ -s "$RUN/display" ] || { cat "$RUN/xvfb.log"; exit 1; }
+    export DISPLAY=:$(cat "$RUN/display")
+fi
+command -v xwininfo >/dev/null || { echo "xwininfo not installed"; exit 1; }
+[ -x ./usbmon ] || make usbmon || exit 1
+[ -x ./usbmon-toast ] || make usbmon-toast || exit 1
 
-make_device() {  # $1=name $2=vendor $3=model $4=serial $5=sectors
-    local port=$(( $(printf '%d' "'${1: -1}") - 97 + 2 ))   # sdb→3, sdc→4...
-    local d="$SYS/block/$1"
-    local tgt="$SYS/devices/pci0000:00/0000:00:14.0/usb3/3-$port/3-$port:1.0/host6/target6:0:0/6:0:0:0"
-    mkdir -p "$tgt" "$d/${1}1"
-    echo "$5" > "$d/size"; echo 1 > "$d/removable"
-    echo "$(( $5 - 4096 ))" > "$d/${1}1/size"
-    echo "$3" > "$tgt/model"; echo "$2" > "$tgt/vendor"; echo "$4" > "$tgt/serial"
-    ln -sfn "$tgt" "$d/device"
+PASS=0 FAIL=0
+ok()  { PASS=$((PASS+1)); echo "  >>> PASS: $1"; }
+bad() { FAIL=$((FAIL+1)); echo "  >>> FAIL: $1"; }
+check() { local label=$1; shift; if "$@"; then ok "$label"; else bad "$label"; fi; }
+count_windows() {
+    local tree
+    tree=$(xwininfo -root -tree) || return 1
+    awk '/"usbmon-toast"/ { n++ } END { print n+0 }' <<<"$tree"
+}
+make_device() {
+    local key=$1 port="$SYS/devices/usb/port-$1" node="$SYS/block/$1"
+    mkdir -p "$port" "$node/${key}1"
+    echo 1 > "$node/removable"
+    echo 59105800 > "$node/size"
+    echo "$2" > "$port/model"
+    ln -s ../../bus/usb "$port/subsystem"
+    ln -s "$port" "$node/device"
+}
+start() {
+    ./usbmon --sys-root "$SYS" --log "$LOG" --interval 3600 --no-hooks --toast-secs 30 &
+    daemon=$!
+    for _ in {1..40}; do
+        grep -q '"ev":"start"' "$LOG" 2>/dev/null && break
+        sleep 0.1
+    done
+}
+stop() {
+    kill -TERM "$daemon"
+    wait "$daemon"
+    local rc=$?
+    daemon=
+    return "$rc"
+}
+wait_windows() {
+    local expected=$1
+    for _ in {1..40}; do
+        [ "$(count_windows)" = "$expected" ] && return 0
+        sleep 0.1
+    done
+    return 1
 }
 
-echo "== 1. daemon starts (GUI auto-detected via DISPLAY) =="
-make_device sdb "SanDisk " "Cruzer Glide 3.0 " "0101834A2B341234" 59105800
-setsid ./usbmon --sys-root "$SYS" --log "$LOG" --interval 3600 \
-       --no-hooks --toast-secs 30 >/dev/null 2>&1 &
-sleep 1
-DPID=$(pgrep -x usbmon | head -1)
-[ -n "$DPID" ] && ok "daemon running (pid $DPID)" || bad "daemon not running"
-grep -q 'gui=1' "$LOG" && ok "start event says gui=1" || bad "gui not enabled"
-
-echo "== 2. insert a stick → toast within ~1s (hot path) =="
-make_device sdc "金士顿 " "DataTraveler 3.0 " "60A44C4C1234567890" 121395200
-sleep 1.5
-pgrep -P "$DPID" usbmon-toast >/dev/null && ok "toast helper spawned" \
-                                                || bad "no toast child"
-grep -q '"ev":"add","key":"sdc"' "$LOG" && ok "add event logged" || bad "no add event"
-grep '"ev":"round"' "$LOG" | grep -q '"wake":"hot"' && ok "round woken by hot path" \
-                                                           || bad "no hot wake"
-grep -q '"baseline":1' "$LOG" && ok "baseline add flagged (no popup)" || bad "no baseline flag"
-
-echo "== 3. unplug sdc → removal toast =="
+make_device sdb "SanDisk Cruzer 3.0"
+start
+check "daemon running" kill -0 "$daemon"
+check "GUI enabled" grep -q 'gui=1' "$LOG"
+check "baseline add has no popup" wait_windows 0
+make_device sdc "金士顿 DataTraveler 3.0"
+check "insertion opens a real X11 window" wait_windows 1
+check "add recorded" grep -q '"ev":"add","key":"sdc"' "$LOG"
+check "hot path woke the monitor" grep -q '"wake":"hot"' "$LOG"
+if [ -n "${USBMON_GUI_CAPTURE:-}" ] && command -v import >/dev/null; then
+    import -display "$DISPLAY" -window usbmon-toast "$USBMON_GUI_CAPTURE"
+fi
 rm -rf "$SYS/block/sdc"
-sleep 1.5
-pgrep -P "$DPID" usbmon-toast >/dev/null | grep -q . && ok "removal toast present" \
-                                                             || true
-grep -q '"ev":"remove","key":"sdc"' "$LOG" && ok "remove event logged" || bad "no remove event"
-
-echo "== 4. restart daemon → no duplicate adds (state persistence) =="
-ADDS=$(grep -c '"ev":"add"' "$LOG")
-kill -TERM "$DPID"; sleep 1
-setsid ./usbmon --sys-root "$SYS" --log "$LOG" --interval 3600 \
-       --no-hooks >/dev/null 2>&1 &
-sleep 1.2
-DPID=$(pgrep -x usbmon | head -1)
-[ "$(grep -c '"ev":"add"' "$LOG")" = "$ADDS" ] && ok "no re-adds after restart" \
-                                                    || bad "duplicate adds after restart"
-
-echo "== 5. shutdown: clean, no zombies, no orphan toasts =="
-kill -TERM "$DPID"; sleep 1
-pgrep -x usbmon >/dev/null && bad "daemon still alive" || ok "daemon exited"
-ps -eo stat,comm 2>/dev/null | grep -q defunct && bad "zombie processes" \
-                                                     || ok "no zombies"
-grep -q '"ev":"stop","detail":"signal"' "$LOG" && ok "stop event logged" || bad "no stop event"
-
-kill "$XVFB_PID" 2>/dev/null
-echo
-echo "result: $PASS passed, $FAIL failed"
+check "removal opens a second X11 window" wait_windows 2
+check "remove recorded" grep -q '"ev":"remove","key":"sdc"' "$LOG"
+check "clean exit with visible notifications" stop
+check "both helper windows closed" wait_windows 0
+adds=$(grep -c '"ev":"add"' "$LOG")
+start
+sleep 1
+check "restart does not duplicate additions" test "$(grep -c '"ev":"add"' "$LOG")" = "$adds"
+check "restart exits cleanly" stop
+check "stop recorded" grep -q '"ev":"stop","detail":"signal"' "$LOG"
+printf 'result: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

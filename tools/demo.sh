@@ -17,25 +17,28 @@ cd "$(dirname "$0")/.."
 #   USBMON=./usbmon-static bash tools/demo.sh
 USBMON_BIN="${USBMON:-./usbmon}"
 
-SYS=/tmp/usbmon-demo-sys
-LOG=/tmp/usbmon-demo-events.jsonl
-HOOKS=/tmp/usbmon-demo-hooks.json
-MARK=/tmp/usbmon-demo-hook-fired
+RUN=$(mktemp -d "${TMPDIR:-.}/usbmon-demo.XXXXXX") || exit 1
+RUN=$(cd "$RUN" && pwd) || exit 1
+trap 'rm -rf -- "$RUN"' EXIT
+SYS=$RUN/sys
+LOG=$RUN/events.jsonl
+HOOKS=$RUN/hooks.json
+MARK=$RUN/hook-fired
+export XDG_STATE_HOME=$RUN/state XDG_CONFIG_HOME=$RUN/config
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  >>> PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  >>> FAIL: $1"; }
 
 echo "(binary under test: $USBMON_BIN)"
 
-rm -rf "$SYS" "$LOG" "$MARK" ~/.local/state/usbmon/last-snapshot.txt
 mkdir -p "$SYS/block"
 
 make_device() {  # $1=name  $2=vendor  $3=model  $4=serial  $5=sectors  $6=usb?
-    local d="$SYS/block/$1"
     # unique usb bus path per device (sdb->3-2, sdc->3-3, ...)
-    local port="3-$((0x$(echo "$1" | tail -c 2) - 0x61 + 2))"
+    local port="3-$(printf '%d' "'${1: -1}")"
     local tgt="$SYS/devices/pci0000:00/0000:00:14.0/usb3/$port/$port:1.0/host6/target6:0:0/6:0:0:0"
-    mkdir -p "$tgt" "$d/${1}1"
+    local d="$tgt/block/$1"
+    mkdir -p "$d/${1}1"
     # block attributes live in /sys/block/<dev>
     echo "$5"     > "$d/size"
     echo 1        > "$d/removable"
@@ -47,22 +50,18 @@ make_device() {  # $1=name  $2=vendor  $3=model  $4=serial  $5=sectors  $6=usb?
     echo "$4" > "$tgt/serial"
     # /sys/block/<dev>/device -> ../../devices/.../usbX/X-Y/.../block
     ln -sfn "$tgt" "$d/device"
+    ln -sfn ../../../../bus/usb "$SYS/devices/pci0000:00/0000:00:14.0/usb3/$port/subsystem"
+    ln -sfn "$d" "$SYS/block/$1"
 }
 
 # hooks: fire a marker command when any device is added
-cat > "$HOOKS" <<'EOF'
-{
-  "hooks": [
-    {
-      "name": "demo-marker",
-      "match_keys": ["sd*"],
-      "command": ["/usr/bin/touch", "/tmp/usbmon-demo-hook-fired"],
-      "debounce_seconds": 1,
-      "enabled": true
-    }
-  ]
-}
-EOF
+python3 - "$HOOKS" "$MARK" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], 'w', encoding='utf-8') as f:
+    json.dump({"hooks": [{"name": "demo-marker", "match_keys": ["sd*"],
+                         "command": ["/usr/bin/touch", sys.argv[2]],
+                         "debounce_seconds": 1, "enabled": True}]}, f)
+PYEOF
 
 echo "== 1. initial state: one USB stick present =="
 make_device sdb "SanDisk " "Cruzer Glide 3.0 " "0101834A2B341234" 59105800 usb
@@ -91,7 +90,7 @@ grep -q '"ev":"add","key":"sdc"' "$LOG" \
 
 echo
 echo "== 4. simulate unplug of sdb + stale mount entry check =="
-rm -rf "$SYS/block/sdb"
+rm -f "$SYS/block/sdb"
 "$USBMON_BIN" --once --sys-root "$SYS" --log "$LOG" --verbose
 grep -q '"ev":"remove","key":"sdb"' "$LOG" \
     && ok "sdb remove logged" || bad "sdb remove event missing"
@@ -117,7 +116,7 @@ then ok "every JSONL line is valid JSON"; else bad "invalid JSONL lines"; fi
 
 echo
 echo "== 6. daemon mode: 2s rounds, live plug during run =="
-rm -rf "$SYS/block/sdc"
+rm -f "$SYS/block/sdc"
 "$USBMON_BIN" --sys-root "$SYS" --log "$LOG" --interval 2 --verbose &
 DPID=$!
 sleep 1
@@ -142,9 +141,8 @@ echo "== 7. login autostart CLI roundtrip (isolated HOME) =="
 # Pin BOTH resolution inputs: GitHub runners export XDG_CONFIG_HOME, which
 # autostart_path() prefers over HOME — an isolated HOME alone would write
 # the .desktop outside $ASTART and the file assertions would miss it.
-ASTART=/tmp/usbmon-demo-home
-astart() { env XDG_CONFIG_HOME="$ASTART/.config" HOME="$ASTART" "$USBMON_BIN" "$@"; }
-rm -rf "$ASTART"; mkdir -p "$ASTART"
+ASTART=$RUN/login
+astart() { env XDG_CONFIG_HOME="$ASTART/.config" "$USBMON_BIN" "$@"; }
 if astart --startup-status | grep -q "未启用"; then
     ok "--startup-status reports 未启用 on a fresh HOME"
 else

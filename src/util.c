@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -193,6 +194,54 @@ void um_fingerprint(const char *value, char *out, size_t out_n)
 
 /* ------------------------------------------------------------- fs helpers */
 
+size_t um_utf8_sequence(const unsigned char *s, size_t available)
+{
+    size_t n, i;
+    if (!available) return 0;
+    if (s[0] < 0x80) return 1;
+    if (s[0] < 0xc2 || s[0] > 0xf4) return 0;
+    n = s[0] < 0xe0 ? 2 : s[0] < 0xf0 ? 3 : 4;
+    if (available < n) return 0;
+    for (i = 1; i < n; i++) if ((s[i] & 0xc0) != 0x80) return 0;
+    if ((s[0] == 0xe0 && s[1] < 0xa0) || (s[0] == 0xed && s[1] >= 0xa0) ||
+        (s[0] == 0xf0 && s[1] < 0x90) || (s[0] == 0xf4 && s[1] >= 0x90)) return 0;
+    return n;
+}
+
+void um_display_text(const char *src, char *out, size_t capacity)
+{
+    const unsigned char *s = (const unsigned char *)src;
+    size_t left = strlen(src), used = 0;
+    if (!capacity) return;
+    while (left && used + 1 < capacity) {
+        size_t n = um_utf8_sequence(s, left);
+        if (!n || s[0] < 0x20 || s[0] == 0x7f) {
+            out[used++] = '?';
+            n = 1;
+        } else {
+            if (n >= capacity - used) break;
+            memcpy(out + used, s, n);
+            used += n;
+        }
+        s += n;
+        left -= n;
+    }
+    out[used] = '\0';
+}
+
+FILE *um_fopen(const char *path, const char *mode)
+{
+#ifdef _WIN32
+    wchar_t wide[640], flags[8];
+    um_utf8_to_wide(path, wide, sizeof wide / sizeof *wide);
+    um_utf8_to_wide(mode, flags, sizeof flags / sizeof *flags);
+    if (!wide[0]) { errno = EINVAL; return NULL; }
+    return _wfopen(wide, flags);
+#else
+    return fopen(path, mode);
+#endif
+}
+
 void um_copy_str(char *dst, size_t n, const char *src)
 {
     snprintf(dst, n, "%s", src ? src : "");
@@ -208,6 +257,27 @@ void um_human_size(unsigned long long bytes, char *out, size_t n)
     else snprintf(out, n, "%.1f %s", v, unit[u]);
 }
 
+#ifdef _WIN32
+static int mkdir_windows(const char *path)
+{
+    wchar_t wide[512];
+    um_utf8_to_wide(path, wide, sizeof wide / sizeof *wide);
+    if (!wide[0]) { errno = EINVAL; return -1; }
+    return _wmkdir(wide);
+}
+
+static const char *windows_home(const wchar_t *primary, const wchar_t *secondary,
+                                char *out, size_t n)
+{
+    wchar_t wide[512];
+    DWORD size = GetEnvironmentVariableW(primary, wide, 512);
+    if (!size) size = GetEnvironmentVariableW(secondary, wide, 512);
+    out[0] = '\0';
+    if (size && size < 512) um_wide_to_utf8(wide, out, n);
+    return out[0] ? out : ".";
+}
+#endif
+
 int um_mkdir_p(const char *path)
 {
     char tmp[512];
@@ -215,14 +285,18 @@ int um_mkdir_p(const char *path)
     snprintf(tmp, sizeof tmp, "%s", path);
     size_t len = strlen(tmp);
     if (len == 0) return -1;
-    if (tmp[len - 1] == '/' || tmp[len - 1] == '\\') tmp[len - 1] = '\0';
+    if (len > 1 && tmp[len - 1] == '/') tmp[len - 1] = '\0';
 
     for (p = tmp + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') {
+#ifdef _WIN32
+        if ((*p == '/' || *p == '\\') && p[-1] != ':') {
+#else
+        if (*p == '/') {
+#endif
             char saved = *p;
             *p = '\0';
 #ifdef _WIN32
-            if (_mkdir(tmp) != 0 && errno != EEXIST) return -1;
+            if (mkdir_windows(tmp) != 0 && errno != EEXIST) return -1;
 #else
             if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
 #endif
@@ -230,7 +304,7 @@ int um_mkdir_p(const char *path)
         }
     }
 #ifdef _WIN32
-    if (_mkdir(tmp) != 0 && errno != EEXIST) return -1;
+    if (mkdir_windows(tmp) != 0 && errno != EEXIST) return -1;
 #else
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
 #endif
@@ -241,10 +315,12 @@ int um_read_file_str(const char *path, char *buf, size_t n)
 {
     FILE *f;
     size_t got;
+    if (n < 1) return -1;
     buf[0] = '\0';
-    f = fopen(path, "rb");
+    f = um_fopen(path, "rb");
     if (!f) return -1;
     got = fread(buf, 1, n - 1, f);
+    if (ferror(f)) { fclose(f); return -1; }
     fclose(f);
     buf[got] = '\0';
     /* trim trailing whitespace/newlines sysfs loves to add */
@@ -258,9 +334,8 @@ int um_read_file_str(const char *path, char *buf, size_t n)
 const char *um_state_dir(char *buf, size_t n)
 {
 #ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base) base = getenv("APPDATA");
-    if (!base) base = ".";
+    char home[512];
+    const char *base = windows_home(L"LOCALAPPDATA", L"APPDATA", home, sizeof home);
     snprintf(buf, n, "%s\\usbmon", base);
 #else
     const char *xdg = getenv("XDG_STATE_HOME");
@@ -278,9 +353,8 @@ const char *um_state_dir(char *buf, size_t n)
 const char *um_config_dir(char *buf, size_t n)
 {
 #ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("LOCALAPPDATA");
-    if (!base) base = ".";
+    char home[512];
+    const char *base = windows_home(L"APPDATA", L"LOCALAPPDATA", home, sizeof home);
     snprintf(buf, n, "%s\\usbmon", base);
 #else
     const char *xdg = getenv("XDG_CONFIG_HOME");
@@ -302,53 +376,106 @@ const char *um_config_dir(char *buf, size_t n)
  * Windows twin (HKCU Run) lives in tray_win32.c. */
 #ifndef _WIN32
 
+static char executable[512];
+
+int um_find_executable(const char *name, char *out, size_t n)
+{
+    const char *search = getenv("PATH");
+    char *paths, *dir, *next;
+    char candidate[PATH_MAX], resolved[PATH_MAX];
+    if (strchr(name, '/')) {
+        if (!realpath(name, resolved) || strlen(resolved) >= n || access(resolved, X_OK))
+            return 0;
+        um_copy_str(out, n, resolved);
+        return 1;
+    }
+    paths = search ? strdup(search) : NULL;
+    if (!paths) return 0;
+    for (dir = strtok_r(paths, ":", &next); dir; dir = strtok_r(NULL, ":", &next)) {
+        int len = snprintf(candidate, sizeof candidate, "%s/%s", dir, name);
+        if (len < 0 || (size_t)len >= sizeof candidate || access(candidate, X_OK)) continue;
+        if (!realpath(candidate, resolved) || strlen(resolved) >= n) continue;
+        um_copy_str(out, n, resolved);
+        free(paths);
+        return 1;
+    }
+    free(paths);
+    return 0;
+}
+
+void um_set_executable(const char *argv0)
+{
+    ssize_t len = readlink("/proc/self/exe", executable, sizeof executable - 1);
+    if (len > 0 && (size_t)len < sizeof executable - 1) {
+        executable[len] = '\0';
+        return;
+    }
+    executable[0] = '\0';
+    if (argv0) um_find_executable(argv0, executable, sizeof executable);
+}
+
+const char *um_executable(void) { return executable; }
+
 static int autostart_path(char *buf, size_t n)
 {
-    const char *xdg  = getenv("XDG_CONFIG_HOME");
-    const char *home = getenv("HOME");
-
-    if (xdg && *xdg) snprintf(buf, n, "%s/autostart/usbmon.desktop", xdg);
-    else if (home && *home)
-        snprintf(buf, n, "%s/.config/autostart/usbmon.desktop", home);
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    int len;
+    if (xdg && xdg[0] == '/')
+        len = snprintf(buf, n, "%s/autostart/usbmon.desktop", xdg);
+    else if (home && home[0] == '/')
+        len = snprintf(buf, n, "%s/.config/autostart/usbmon.desktop", home);
     else
         return -1;
-    return 0;
+    return len < 0 || (size_t)len >= n ? -1 : 0;
+}
+
+static int write_exec(FILE *f, const char *exe)
+{
+    const unsigned char *p = (const unsigned char *)exe;
+    if (fputs("Exec=\"", f) < 0) return -1;
+    for (; *p; p++) {
+        if (*p == '\\') {
+            if (fputs("\\\\\\\\", f) < 0) return -1;
+        } else if (*p == '\t') {
+            if (fputs("\\t", f) < 0) return -1;
+        } else {
+            if (strchr("\"$`", *p) && fputs("\\\\", f) < 0) return -1;
+            if (*p == '%' && fputc('%', f) == EOF) return -1;
+            if (fputc(*p, f) == EOF) return -1;
+        }
+    }
+    return fputs("\"\n", f) < 0 ? -1 : 0;
 }
 
 int um_startup_install(void)
 {
-    char p[512], exe[512];
-    ssize_t len;
+    char path[512], tmp[544], dir[512];
+    const char *exe = um_executable();
     FILE *f;
+    int fd, ok;
 
-    if (autostart_path(p, sizeof p)) return -1;
-    len = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (len <= 0) return -1;
-    exe[len] = '\0';
+    if (autostart_path(path, sizeof path) || !exe[0] || strpbrk(exe, "=\r\n"))
+        return -1;
 
-    /* parent dir first (~/.config/autostart may not exist yet) */
-    {
-        char dir[512];
-        char *slash;
-        snprintf(dir, sizeof dir, "%s", p);
-        slash = strrchr(dir, '/');
-        if (slash) *slash = '\0';
-        um_mkdir_p(dir);
+    um_copy_str(dir, sizeof dir, path);
+    *strrchr(dir, '/') = '\0';
+    if (um_mkdir_p(dir) != 0) return -1;
+    snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(tmp);
+        return -1;
     }
-
-    f = fopen(p, "w");
-    if (!f) return -1;
-    fprintf(f,
-            "[Desktop Entry]\n"
-            "Type=Application\n"
-            "Name=usbmon\n"
-            "Comment=USB storage monitor (daemon + tray/toasts)\n"
-            "Exec=%s\n"
-            "Terminal=false\n"
-            "X-GNOME-Autostart-enabled=true\n",
-            exe);
-    fclose(f);
-    return 0;
+    ok = fputs("[Desktop Entry]\nType=Application\nName=usbmon\n"
+               "Comment=USB storage monitor\nTerminal=false\n", f) >= 0 &&
+         write_exec(f, exe) == 0;
+    if (fclose(f)) ok = 0;
+    if (ok && rename(tmp, path) == 0) return 0;
+    unlink(tmp);
+    return -1;
 }
 
 int um_startup_uninstall(void)

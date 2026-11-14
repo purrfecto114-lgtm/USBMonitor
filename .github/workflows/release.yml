@@ -2,7 +2,9 @@ name: Build, tag and release
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
     paths:
       - "src/usbmon.h"
       - "CHANGELOG.md"
@@ -25,6 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       skip: ${{ steps.skip.outputs.skip }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Check out
         uses: actions/checkout@v7
@@ -35,12 +38,23 @@ jobs:
           set -eu
           VERSION=$(sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
           [ -n "$VERSION" ] || { echo "UM_VERSION missing in src/usbmon.h"; exit 1; }
-          echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-            || { echo "version '$VERSION' is not plain semver"; exit 1; }
-          grep -q "^## \[$VERSION\]" CHANGELOG.md \
+          echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+            || { echo "version '$VERSION' is not supported semver (optional pre-release suffix allowed)"; exit 1; }
+          grep -Fq -- "## [$VERSION]" CHANGELOG.md \
             || { echo "CHANGELOG.md has no '## [$VERSION]' section"; exit 1; }
+          PRERELEASE=false
+          case "$VERSION" in *-*) PRERELEASE=true ;; esac
+          case "$GITHUB_REF" in
+            refs/heads/release/*)
+              [ "$PRERELEASE" = true ] || { echo "release/** branches must use a pre-release version"; exit 1; }
+              ;;
+            refs/heads/main)
+              [ "$PRERELEASE" = false ] || { echo "main must not publish a pre-release version"; exit 1; }
+              ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "release version: $VERSION"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "release version: $VERSION (prerelease=$PRERELEASE)"
 
       - name: "Skip if release already exists (safe no-op)"
         id: skip
@@ -84,6 +98,14 @@ jobs:
 
       - name: "Panel UI kernel + evidence layer tests (win32_shim)"
         run: make selftest
+
+      - name: "Daemon integration regression (23 assertions)"
+        run: make integration-test
+
+      - name: "ASan/UBSan daemon regression (23 assertions)"
+        run: |
+          make asan
+          python3 tests/daemon_test.py ./usbmon-asan
 
       - name: "Build static daemon (musl, self-contained)"
         run: |
@@ -138,7 +160,7 @@ jobs:
 
       - name: "GUI regression under Xvfb (dynamic daemon + baseline toast)"
         run: |
-          sudo apt-get install -y --no-install-recommends xvfb
+          sudo apt-get install -y --no-install-recommends xvfb x11-utils
           bash tools/demo-gui.sh
 
       - name: "Package Linux dist artifacts (static daemon + SHA256SUMS)"
@@ -274,6 +296,7 @@ jobs:
       - name: "Create tag and publish release with assets"
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          IS_PRERELEASE: ${{ needs.meta.outputs.prerelease }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
@@ -287,11 +310,15 @@ jobs:
             fi
             echo "tag v$VERSION exists at head — publishing release for it"
           fi
+          RELEASE_FLAGS=(--latest)
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            RELEASE_FLAGS=(--prerelease --latest=false)
+          fi
           gh release create "v$VERSION" \
             --target "$GITHUB_SHA" \
             --title "usbmon v$VERSION" \
             --notes-file release-notes.md \
-            --latest \
+            "${RELEASE_FLAGS[@]}" \
             "dist/usbmon-$VERSION-linux-amd64.tar.gz" \
             "dist/usbmon-$VERSION-windows-amd64.zip" \
             "dist/SHA256SUMS.txt"
@@ -301,7 +328,11 @@ jobs:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           {
-            echo "### release v$VERSION published"
+            if [ "${{ needs.meta.outputs.prerelease }}" = "true" ]; then
+              echo "### pre-release v$VERSION published (not marked Latest)"
+            else
+              echo "### release v$VERSION published"
+            fi
             echo ''
             echo '```'
             cat dist/SHA256SUMS.txt

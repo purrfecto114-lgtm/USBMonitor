@@ -47,7 +47,6 @@ static void fill_volume(um_volume *v, const char *path, const char *title,
     v->total = total; v->used = used; v->free = freeb;
     v->pct = (total > 0) ? (int)((used * 100) / total) : -1;
     v->disk_number = 0;
-    v->tags = UM_TAG_USB | UM_TAG_STORAGE | UM_TAG_VOLUME;
     v->kind = UM_KIND_USB_STORAGE;
     v->ejectable = 1;
     v->openable = 1;
@@ -59,7 +58,7 @@ static void make_model(um_toast_model *m)
 {
     memset(m, 0, sizeof *m);
     snprintf(m->headline, sizeof m->headline, "%s", "USB 设备监控");
-    snprintf(m->subtitle, sizeof m->subtitle, "%s", "2 个设备 · 3 个卷");
+    snprintf(m->subtitle, sizeof m->subtitle, "%s", "3 个设备 · 3 个卷");
     snprintf(m->summary, sizeof m->summary, "%s", "USB 已连接：E:、F:、G:");
     snprintf(m->count, sizeof m->count, "%s", "3 个");
     m->accent_kind = 1;                      /* ok / 绿 */
@@ -83,9 +82,9 @@ int main(void)
 
     printf("== 1. 主题解析（auto → 系统深色 / 浅色）==\n");
     um_theme_resolve(&theme, "auto", 1);
-    CHECK(strcmp(theme.name, "dark") == 0 && theme.panel == 0x202630);
+    CHECK(strcmp(theme.name, "dark") == 0 && theme.panel == 0x111923);
     um_theme_resolve(&theme, "light", 1);
-    CHECK(strcmp(theme.name, "light") == 0 && theme.panel == 0xfbfcff);
+    CHECK(strcmp(theme.name, "light") == 0 && theme.panel == 0xfafcff);
 
     printf("== 2. 文案工具（对齐 core.py）==\n");
     {
@@ -108,7 +107,7 @@ int main(void)
         s.expanded = 0;
         CHECK(um_toast_measure_height(&m, &s) == 230);
         s.expanded = 1;
-        CHECK(um_toast_measure_height(&m, &s) == 334);     /* 3 行 */
+        CHECK(um_toast_measure_height(&m, &s) == 406);     /* 3 行 */
         m.n_rows = 8;
         CHECK(um_toast_measure_height(&m, &s) == 430);     /* 夹到上限 */
         s.expanded = 0;
@@ -270,74 +269,6 @@ int main(void)
         CHECK(um_ui_classify(UM_TAG_USB, 0, 0, 0, 1, 1) == UM_KIND_UNKNOWN);
     }
 
-    printf("== 10. 能力判定：谁能打开、谁能安全弹出 ==\n");
-    {
-        CHECK(um_ui_can_open(UM_KIND_USB_STORAGE) == 1);
-        CHECK(um_ui_can_open(UM_KIND_STORAGE_NO_LETTER) == 0);  /* 无盘符打不开 */
-        CHECK(um_ui_can_open(UM_KIND_EMPTY_SLOT) == 0);
-        CHECK(um_ui_can_open(UM_KIND_LOCKED_VOLUME) == 0);      /* 未解锁打不开 */
-        CHECK(um_ui_can_open(UM_KIND_HID_PEN) == 0);
-        CHECK(um_ui_can_open(UM_KIND_DOCK_HUB) == 0);
-        CHECK(um_ui_can_open(UM_KIND_NET_ADAPTER) == 0);
-
-        CHECK(um_ui_can_eject(UM_KIND_USB_STORAGE, 1) == 1);
-        CHECK(um_ui_can_eject(UM_KIND_STORAGE_NO_LETTER, 1) == 1); /* 存储可弹出 */
-        CHECK(um_ui_can_eject(UM_KIND_USB_STORAGE, 0) == 0);        /* 固定盘禁弹 */
-        CHECK(um_ui_can_eject(UM_KIND_HID_PEN, 1) == 0);            /* 笔不弹 */
-        CHECK(um_ui_can_eject(UM_KIND_NET_ADAPTER, 1) == 0);        /* 网卡不弹 */
-        CHECK(um_ui_can_eject(UM_KIND_DOCK_HUB, 1) == 0);           /* 拓展坞不弹 */
-        CHECK(um_ui_can_eject(UM_KIND_EMPTY_SLOT, 1) == 0);         /* 空槽不弹 */
-        CHECK(um_ui_can_eject(UM_KIND_UNKNOWN, 1) == 0);
-    }
-
-    printf("== 11. 多分区 U 盘聚合（DiskNumber 为键，不是盘符）==\n");
-    {
-        um_volume vols[8];
-        um_device_row rows[8];
-        int n;
-        memset(vols, 0, sizeof vols);
-        /* 同一个 U 盘（disk 2）上的 3 个分区 */
-        for (n = 0; n < 3; n++) {
-            vols[n].disk_number = 2;
-            vols[n].tags = UM_TAG_USB | UM_TAG_STORAGE | UM_TAG_VOLUME;
-            vols[n].kind = UM_KIND_USB_STORAGE;
-            vols[n].total = 62668800000ULL;
-            vols[n].free = 20000000000ULL;
-            vols[n].pct = 60;
-            snprintf(vols[n].letters[vols[n].n_letters++], 4, "%c:",
-                     (char)('E' + n));
-        }
-        /* 另一台独立 U 盘（disk 5） */
-        vols[3].disk_number = 5;
-        vols[3].tags = UM_TAG_USB | UM_TAG_STORAGE | UM_TAG_VOLUME;
-        vols[3].kind = UM_KIND_USB_STORAGE;
-        vols[3].total = 32000000000ULL;
-        vols[3].free = 24000000000ULL;
-        vols[3].pct = 25;
-        snprintf(vols[3].letters[vols[3].n_letters++], 4, "H:");
-
-        n = um_ui_group_by_disk(vols, 4, rows, 8);
-        CHECK(n == 2);                       /* 3 个分区 + 1 台 = 2 个设备 */
-        CHECK(rows[0].n_letters == 3);
-        CHECK(strcmp(rows[0].letters[0], "E:") == 0);
-        CHECK(strcmp(rows[0].letters[2], "G:") == 0);
-        CHECK(rows[0].disk_number == 2);
-        CHECK(rows[1].n_letters == 1);
-        CHECK(strcmp(rows[1].letters[0], "H:") == 0);
-        /* 多行副标题应含分区数 */
-        {
-            char sub[160];
-            um_ui_row_subtitle(&rows[0], sub, sizeof sub);
-            CHECK(strstr(sub, "3 个分区") != NULL);
-            CHECK(strstr(sub, "E:") != NULL && strstr(sub, "G:") != NULL);
-        }
-        {
-            char sub[160];
-            um_ui_row_subtitle(&rows[1], sub, sizeof sub);
-            CHECK(strstr(sub, "3 个分区") == NULL);   /* 单分区不说分区数 */
-        }
-    }
-
     printf("== 12. 未分配盘符 / 非存储设备的提示文案 ==\n");
     {
         char b[256];
@@ -352,10 +283,8 @@ int main(void)
         um_ui_device_notice(UM_KIND_EMPTY_SLOT, b, sizeof b);
         CHECK(strstr(b, "未插入") != NULL || strstr(b, "无介质") != NULL);
         um_ui_device_notice(UM_KIND_LOCKED_VOLUME, b, sizeof b);
-        CHECK(strstr(b, "解锁") != NULL);
+        CHECK(strstr(b, "不可访问") != NULL);
         /* 1.1.1 原文：拔出时可能尚未分配盘符 */
-        um_ui_remove_notice(b, sizeof b);
-        CHECK(strstr(b, "可能尚未分配盘符") != NULL);
     }
 
     printf("== 7. 视觉快照（SVG）==\n");
@@ -373,7 +302,7 @@ int main(void)
         CHECK(um_toast_win_is_expanded(w2) == 1);
         shim_reset();
         shim_paint(TEST_HWND);
-        shim_svg("out-toast-expanded.svg", 440, 334, "#101418");
+        shim_svg("out-toast-expanded.svg", 440, 406, "#101418");
         printf("  -> out-toast-expanded.svg (%d 图元)\n", g_ndraws);
         CHECK(g_ndraws > 20);
 
@@ -387,7 +316,7 @@ int main(void)
             um_toast_win_update(w2, &m2);
             shim_reset();
             shim_paint(TEST_HWND);
-            shim_svg("out-toast-light-status.svg", 440, 334, "#dfe4ec");
+            shim_svg("out-toast-light-status.svg", 440, 406, "#dfe4ec");
             printf("  -> out-toast-light-status.svg (%d 图元)\n", g_ndraws);
             CHECK(g_ndraws > 20);
         }
@@ -415,7 +344,6 @@ int main(void)
                      "Generic USB Storage");
             snprintf(m3.rows[1].subtitle, sizeof m3.rows[1].subtitle, "%s",
                      "USB 存储设备 · 未分配盘符");
-            m3.rows[1].tags = UM_TAG_USB | UM_TAG_STORAGE;
             m3.rows[1].kind = UM_KIND_STORAGE_NO_LETTER;
             m3.rows[1].ejectable = 1;
             m3.rows[1].openable = 0;
@@ -426,7 +354,6 @@ int main(void)
                      "Wacom 智能笔");
             snprintf(m3.rows[2].subtitle, sizeof m3.rows[2].subtitle, "%s",
                      "USB HID 设备 · 无存储");
-            m3.rows[2].tags = UM_TAG_USB | UM_TAG_HID;
             m3.rows[2].kind = UM_KIND_HID_PEN;
             m3.rows[2].ejectable = 0;
             m3.rows[2].openable = 0;
@@ -438,7 +365,7 @@ int main(void)
             shim_paint(TEST_HWND);
             {
                 int h = um_toast_win_height(w2);
-                shim_svg("out-toast-mixed-devices.svg", 440, h > 0 ? h : 334,
+                shim_svg("out-toast-mixed-devices.svg", 440, h > 0 ? h : 406,
                          "#101418");
                 printf("  -> out-toast-mixed-devices.svg (%d 图元)\n", g_ndraws);
             }
@@ -459,7 +386,6 @@ int main(void)
         snprintf(mm.rows[0].title, sizeof mm.rows[0].title, "%s", "Wacom 智能笔");
         snprintf(mm.rows[0].subtitle, sizeof mm.rows[0].subtitle, "%s",
                  "USB HID 设备 · 无存储");
-        mm.rows[0].tags = UM_TAG_USB | UM_TAG_HID;
         mm.rows[0].kind = UM_KIND_HID_PEN;
         mm.rows[0].ejectable = 0;
         mm.rows[0].openable = 0;
@@ -473,33 +399,6 @@ int main(void)
         shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(200 | (100 << 16)));
         CHECK(g_last_act != UM_ACT_OPEN_ROW);
         um_toast_win_destroy(w2);
-    }
-
-    printf("== 14. group_by_disk：disk_number<0 不可归并（回归：笔+网卡+拓展坞并成一行）==\n");
-    {
-        um_volume vols[4];
-        um_device_row rows[4];
-        int n;
-        memset(vols, 0, sizeof vols);
-        snprintf(vols[0].title, sizeof vols[0].title, "%s", "Wacom 智能笔");
-        vols[0].kind = UM_KIND_HID_PEN;  vols[0].disk_number = -1;
-        snprintf(vols[1].title, sizeof vols[1].title, "%s", "USB 网卡");
-        vols[1].kind = UM_KIND_NET_ADAPTER; vols[1].disk_number = -1;
-        snprintf(vols[2].title, sizeof vols[2].title, "%s", "拓展坞");
-        vols[2].kind = UM_KIND_DOCK_HUB;  vols[2].disk_number = -1;
-        n = um_ui_group_by_disk(vols, 3, rows, 4);
-        CHECK(n == 3);                      /* 不是 1（旧实现会并成一行幽灵设备） */
-        CHECK(strcmp(rows[0].title, "Wacom 智能笔") == 0);
-        CHECK(strcmp(rows[1].title, "USB 网卡") == 0);
-        CHECK(strcmp(rows[2].title, "拓展坞") == 0);
-        /* 同盘号仍然正常归并 */
-        vols[0].disk_number = 7; vols[1].disk_number = 7;
-        snprintf(vols[0].letters[0], 4, "E:");
-        snprintf(vols[1].letters[0], 4, "F:");
-        vols[0].n_letters = 1; vols[1].n_letters = 1;
-        vols[0].kind = UM_KIND_USB_STORAGE;
-        n = um_ui_group_by_disk(vols, 3, rows, 4);
-        CHECK(n == 2);
     }
 
     printf("== 15. 滚轮滚动与展开几何（回归：展开不重设窗口、无滚轮时第5行后不可见）==\n");
@@ -530,7 +429,7 @@ int main(void)
 
         /* 折叠态滚轮无效 */
         shim_send(TEST_HWND, WM_MOUSEWHEEL,
-                  (WPARAM)((unsigned short)(-120) << 16), 0);
+                  ((WPARAM)(uint16_t)-120 << 16), 0);
         CHECK(um_toast_win_is_expanded(w2) == 0);
 
         um_toast_win_toggle_expand(w2);
@@ -546,23 +445,22 @@ int main(void)
             int maxs = um_toast_max_scroll(&mm, st, um_toast_win_height(w2));
             CHECK(st->scroll_px == 0);
             shim_send(TEST_HWND, WM_MOUSEWHEEL,
-                      (WPARAM)((unsigned short)(-120) << 16), 0);
+                      ((WPARAM)(uint16_t)-120 << 16), 0);
             shim_send(TEST_HWND, WM_MOUSEWHEEL,
-                      (WPARAM)((unsigned short)(-120) << 16), 0);
-            CHECK(st->scroll_px == 240);
-            /* 命中区随滚动移动：y=100 原属行 0/1（行顶 90/152）；滚 240px 后
-             * 首个可见行是行 4（ry = 90+4*62-240 = 98），y=100 命中行 4。 */
+                      ((WPARAM)(uint16_t)-120 << 16), 0);
+            CHECK(st->scroll_px == 2 * UM_UI_ROW_H);
+            /* Two wheel detents reveal the third whole row. */
             CHECK(um_toast_hit_test(&mm, st, 440, 430, 60, 100)
-                  == UM_HIT_ROW + 4);
+                  == UM_HIT_ROW + 2);
             /* 滚过头的部分被夹住 */
             for (i = 0; i < 30; i++)
                 shim_send(TEST_HWND, WM_MOUSEWHEEL,
-                          (WPARAM)((unsigned short)(-120) << 16), 0);
+                          ((WPARAM)(uint16_t)-120 << 16), 0);
             CHECK(st->scroll_px == maxs);
             /* 反向滚回 0（同样夹住） */
             for (i = 0; i < 30; i++)
                 shim_send(TEST_HWND, WM_MOUSEWHEEL,
-                          (WPARAM)((unsigned short)(120) << 16), 0);
+                          ((WPARAM)120 << 16), 0);
             CHECK(st->scroll_px == 0);
             CHECK(um_toast_win_is_expanded(w2) == 1);
         }
@@ -717,6 +615,35 @@ int main(void)
     }
 
     um_toast_win_destroy(w);
+    printf("== Keyboard: expand, scroll focused rows, close ==\n");
+    {
+        um_toast_model mm;
+        um_toast_win *kw;
+        int i;
+        make_model(&mm);
+        for (i = 3; i < 9; i++) mm.rows[i] = mm.rows[2];
+        mm.n_rows = 9;
+        kw = um_toast_win_new(&mm, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(kw != NULL);
+        if (kw) {
+            um_toast_win_show(kw);
+            shim_send(TEST_HWND, WM_KEYDOWN, VK_TAB, 0);
+            CHECK(um_toast_win_state(kw)->focus_row == 0);
+            shim_send(TEST_HWND, WM_KEYDOWN, VK_TAB, 0);
+            CHECK(um_toast_win_state(kw)->focus_btn == UM_HIT_EXPAND);
+            shim_send(TEST_HWND, WM_KEYDOWN, VK_RETURN, 0);
+            CHECK(um_toast_win_is_expanded(kw));
+            for (i = 0; i < 7; i++) shim_send(TEST_HWND, WM_KEYDOWN, VK_DOWN, 0);
+            CHECK(um_toast_win_state(kw)->focus_row == 6);
+            CHECK(um_toast_win_state(kw)->scroll_px > 0);
+            shim_send(TEST_HWND, WM_KEYDOWN, VK_RETURN, 0);
+            CHECK(g_last_act == UM_ACT_OPEN_ROW && g_last_row == 6);
+            shim_send(TEST_HWND, WM_CLOSE, 0, 0);
+            CHECK(g_last_act == UM_ACT_CLOSE);
+            um_toast_win_destroy(kw);
+        }
+    }
+
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

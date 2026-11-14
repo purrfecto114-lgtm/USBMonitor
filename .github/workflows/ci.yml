@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     branches: [main]
 
@@ -27,13 +27,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev musl-tools xvfb
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools xvfb x11-utils
 
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
 
       - name: "Panel UI kernel + evidence layer tests (win32_shim)"
-        run: make selftest
+        run: make selftest integration-test
 
       - name: "Smoke test (--version / --list)"
         run: |
@@ -69,15 +69,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v7
-      - name: "gcc -fanalyzer (known false positive filtered)"
-        run: |
-          make analyze 2>&1 | tee analyze.log || true
-          # hook.c argv loop is a documented analyzer false positive; anything
-          # else fails the build.
-          OTHER=$(grep -c 'warning:' analyze.log || true)
-          KNOWN=$(grep -c "hook.c.*uninitialized" analyze.log || true)
-          echo "warnings=$OTHER known_false_positive=$KNOWN"
-          [ "$OTHER" -le "$KNOWN" ]
+      - name: "gcc -fanalyzer (warnings are errors)"
+        run: make analyze
 
   build-windows:
     name: "cross-compile Windows exe (mingw-w64, strict, static)"

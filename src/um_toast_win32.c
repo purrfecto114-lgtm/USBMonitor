@@ -1,25 +1,4 @@
-/* um_toast_win32.c — Win32 渲染后端（usbmon 通知浮层）。
- *
- * 这一层只做三件事：
- *   1. 把 um_toast_ui.c 算好的 draw list 用 GDI 画出来（双缓冲，无闪烁）；
- *   2. 把鼠标/键盘/定时器消息翻译成 um_toast_state 上的状态迁移；
- *   3. 把用户动作以回调形式抛回给调用方（打开 / 定位 / 复制 / 安全弹出…）。
- *
- * 它刻意**不**知道 USB、不碰注册表、不做 IOCTL：安全弹出、复制路径这些
- * 动作交给 tray/gui 层复用已有实现（tray_win32.c 里已经有了）。
- *
- * 关键实现取舍（均有据可查，见 docs/PORT_AND_TRADEOFFS.md）：
- *   - 按钮不用子窗口控件，而用"自绘 + 命中测试"：省掉 BS_OWNERDRAW 的
- *     消息往返，也避免 layered window 下子窗口不跟随合成的老问题；
- *     键盘可达性用状态机里的 focus_row / focus_btn 补齐（Tab 焦点环）。
- *   - 容量条自绘：PBM_SETBARCOLOR 在启用视觉样式时直接失效（Microsoft
- *     Learn 明确说明），自绘是唯一稳定可控的路径。
- *   - 深色跟随系统：HKCU\...\Themes\Personalize\AppsUseLightTheme（0=深色）。
- *   - hover 暂停：鼠标在窗内（WM_MOUSEMOVE，同 1.1.1 enterEvent 语义）即
- *     暂停；TrackMouseEvent(TME_LEAVE|TME_HOVER) 兜底（触发一次后须重注）。
- *   - 圆角用 SetWindowRgn(CreateRoundRectRgn)：比 layered window 简单，
- *     不引入 UpdateLayeredWindow 的整套位图合成。
- */
+/* Win32 drawing and input for the platform-neutral panel. */
 #include "um_toast_ui.h"
 #include "um_toast_win32.h"
 
@@ -47,11 +26,15 @@
 
 struct um_toast_win {
     HWND             hwnd;
+    HMONITOR         monitor;
     um_toast_model   model;
     um_toast_state   state;
     um_theme         theme;
     int              width, height;     /* 设计空间（96DPI）像素 */
     int              dpi;
+    int              above_px, slot;
+    int              font_dpi;
+    HFONT            fonts[5];
     double           fit;              /* 工作区钳制因子（0.05..1.0） */
     int              topmost;
     int              tracking;          /* TrackMouseEvent 已注册 */
@@ -205,26 +188,33 @@ static void draw_usb_icon(HDC hdc, int x, int y, int w, int h,
 static void paint_toast(struct um_toast_win *w, HDC hdc)
 {
     um_drawlist dl;
-    HFONT fonts[5];
     HFONT old_font;
     HDC   mem;
     HBITMAP bmp, old_bmp;
     int pw = ui_scale(w, w->width), ph = ui_scale(w, w->height);
-    int i;
+    int i, dpi = ui_font_dpi(w);
 
     mem = CreateCompatibleDC(hdc);
-    bmp = CreateCompatibleBitmap(hdc, pw, ph);
-    old_bmp = (HBITMAP)SelectObject(mem, bmp);
+    bmp = mem ? CreateCompatibleBitmap(hdc, pw, ph) : NULL;
+    old_bmp = bmp ? (HBITMAP)SelectObject(mem, bmp) : NULL;
+    if (!bmp) {
+        if (mem) DeleteDC(mem);
+        mem = hdc;
+    }
 
     um_toast_layout(&w->model, &w->state, &w->theme,
                     w->width, w->height, &dl);
 
-    fonts[UM_F_TITLE]    = make_font(16, ui_font_dpi(w), 1, font_face());
-    fonts[UM_F_BODY]     = make_font(13, ui_font_dpi(w), 0, font_face());
-    fonts[UM_F_SMALL]    = make_font(12, ui_font_dpi(w), 0, font_face());
-    fonts[UM_F_BTN]      = make_font(13, ui_font_dpi(w), 1, font_face());
-    fonts[UM_F_ROWTITLE] = make_font(13, ui_font_dpi(w), 1, font_face());
-    old_font = (HFONT)SelectObject(mem, fonts[UM_F_BODY]);
+    if (w->font_dpi != dpi) {
+        for (i = 0; i < 5; i++) if (w->fonts[i]) DeleteObject(w->fonts[i]);
+        w->fonts[UM_F_TITLE] = make_font(16, dpi, 1, font_face());
+        w->fonts[UM_F_BODY] = make_font(13, dpi, 0, font_face());
+        w->fonts[UM_F_SMALL] = make_font(12, dpi, 0, font_face());
+        w->fonts[UM_F_BTN] = make_font(13, dpi, 1, font_face());
+        w->fonts[UM_F_ROWTITLE] = make_font(13, dpi, 1, font_face());
+        w->font_dpi = dpi;
+    }
+    old_font = (HFONT)SelectObject(mem, w->fonts[UM_F_BODY]);
     SetBkMode(mem, TRANSPARENT);
 
     for (i = 0; i < dl.n; i++) {
@@ -274,7 +264,7 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
             /* 真正的 UTF-8 → UTF-16 解码。原来是逐字节 cast，中文会变
              * 成 "è®¾" 这类乱码（"设" 的 E8 AE BE 被当成三个拉丁码点）。*/
             um_ui_utf8_to_utf16(d->text, wt, UM_UI_MAX_TEXT);
-            SelectObject(mem, fonts[d->font]);
+            SelectObject(mem, w->fonts[d->font]);
             SetTextColor(mem, cref(d->color));
             rc.left = x; rc.top = y;
             rc.right = x + ww; rc.bottom = y + ui_scale(w, 22);
@@ -292,11 +282,12 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
     }
 
     SelectObject(mem, old_font);
-    for (i = 0; i < 5; i++) DeleteObject(fonts[i]);
-    BitBlt(hdc, 0, 0, pw, ph, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old_bmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    if (bmp) {
+        BitBlt(hdc, 0, 0, pw, ph, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+    }
 }
 
 /* ------------------------------------------------------------ 菜单/动作 --- */
@@ -306,41 +297,33 @@ static void fire(struct um_toast_win *w, um_toast_action act, int row)
     if (w->cb) w->cb(act, row, w->user);
 }
 
-/* 重新计算高度、重新锚定到工作区右下角、套圆角区域。
- * update / toggle / 展开按钮共用：原来 update 用 SWP_NOMOVE 从左上角向下
- * 生长，展开后底部会越过工作区（被任务栏遮挡）；展开按钮路径则只改
- * w->height 不改真窗口尺寸（内容被裁、下半区收不到鼠标消息）。 */
-/* 锚定区 = 光标所在显示器的工作区：多屏 + 负坐标虚拟桌面都正确（副屏在
- * 左侧/上方时坐标本来就可以为负）。依次回退 光标所在屏 rcWork ->
- * SPI_GETWORKAREA（主屏）-> SM_CX/CYSCREEN。 */
-static void monitor_workarea(RECT *wa)
+static HMONITOR current_monitor(void)
 {
     POINT pt;
+    return GetCursorPos(&pt) ? MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) : NULL;
+}
 
-    memset(wa, 0, sizeof *wa);
-    if (GetCursorPos(&pt)) {
-        HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        if (mon) {
-            MONITORINFO mi;
-            mi.cbSize = sizeof mi;
-            if (GetMonitorInfoA(mon, &mi)) { *wa = mi.rcWork; return; }
-        }
+static void monitor_workarea(HMONITOR monitor, RECT *wa)
+{
+    MONITORINFO info = {0};
+    info.cbSize = sizeof info;
+    if (monitor && GetMonitorInfoA(monitor, &info)) {
+        *wa = info.rcWork;
+        return;
     }
     if (SystemParametersInfoW(SPI_GETWORKAREA, 0, wa, 0)) return;
-    wa->left = 0; wa->top = 0;
-    wa->right  = GetSystemMetrics(SM_CXSCREEN);
+    wa->left = wa->top = 0;
+    wa->right = GetSystemMetrics(SM_CXSCREEN);
     wa->bottom = GetSystemMetrics(SM_CYSCREEN);
 }
 
-/* 重新计算高度、重新锚定到工作区右下角、套圆角区域。
- * update / toggle / 展开按钮 / WM_DPICHANGED / move_slot 共用。 */
 static void apply_geometry(struct um_toast_win *w)
 {
     RECT wa;
     int  pw, ph, x, y;
 
     w->height = um_toast_measure_height(&w->model, &w->state);
-    monitor_workarea(&wa);
+    monitor_workarea(w->monitor, &wa);
 
     /* fit：把窗口等比钳进工作区（<=70% 宽、<=85% 高）。设计空间布局不变，
      * 只是整体缩小 —— 任何分辨率/缩放下都不会超出所在显示器，也不需要
@@ -357,33 +340,45 @@ static void apply_geometry(struct um_toast_win *w)
         w->fit = fit;
     }
 
+    {
+        int max = um_toast_max_scroll(&w->model, &w->state, w->height);
+        if (w->state.scroll_px > max) w->state.scroll_px = max;
+    }
     pw = ui_scale(w, w->width);
     ph = ui_scale(w, w->height);
     x = wa.right  - pw - ui_scale(w, UM_UI_MARGIN);
     y = wa.bottom - ph - ui_scale(w, UM_UI_MARGIN);
+    y -= w->slot * (ph + ui_scale(w, 12));
+    if (w->above_px) y -= w->above_px + ui_scale(w, 12);
+    if (y < wa.top + ui_scale(w, UM_UI_MARGIN)) y = wa.top + ui_scale(w, UM_UI_MARGIN);
     /* 不再钳 x/y 到 0：多屏虚拟桌面坐标可以为负，fit 已保证窗口落在所在
      * 显示器的工作区内（2.4.0 的 if (x<0) x=0 会把副屏通知弹回主屏）。 */
     SetWindowPos(w->hwnd, NULL, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
     {
         HRGN rgn = CreateRoundRectRgn(0, 0, pw + 1, ph + 1,
-                                      ui_scale(w, 20), ui_scale(w, 20));
-        SetWindowRgn(w->hwnd, rgn, FALSE);
+                                      ui_scale(w, 18), ui_scale(w, 18));
+        if (rgn && !SetWindowRgn(w->hwnd, rgn, FALSE)) DeleteObject(rgn);
     }
 }
 
 static void show_row_menu(struct um_toast_win *w, int row, int x, int y)
 {
-    HMENU m = CreatePopupMenu();
+    HMENU m;
     POINT pt;
-    int cmd;
-
-    int openable  = (row < w->model.n_rows) ? w->model.rows[row].openable : 0;
-    int ejectable = (row < w->model.n_rows) ? w->model.rows[row].ejectable : 0;
+    int cmd, openable, ejectable;
+    um_volume original;
+    if (row < 0 || row >= w->model.n_rows) return;
+    original = w->model.rows[row];
+    openable = original.openable;
+    ejectable = original.ejectable;
+    if (!openable && !ejectable) return;
+    m = CreatePopupMenu();
+    if (!m) return;
 
     AppendMenuW(m, MF_STRING | (openable ? 0 : MF_GRAYED), 1, L"打开");
     AppendMenuW(m, MF_STRING | (openable ? 0 : MF_GRAYED), 2,
                 L"在资源管理器中显示");
-    AppendMenuW(m, MF_STRING, 3, L"复制路径");
+    AppendMenuW(m, MF_STRING | (openable ? 0 : MF_GRAYED), 3, L"复制路径");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (ejectable ? 0 : MF_GRAYED), 4, L"安全弹出");
 
@@ -396,6 +391,10 @@ static void show_row_menu(struct um_toast_win *w, int row, int x, int y)
                                 pt.x, pt.y, w->hwnd, NULL);
     PostMessageW(w->hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
+    if (row >= w->model.n_rows ||
+        strcmp(original.instance_id, w->model.rows[row].instance_id) ||
+        strcmp(original.path, w->model.rows[row].path) ||
+        original.disk_number != w->model.rows[row].disk_number) return;
     switch (cmd) {
     case 1: fire(w, UM_ACT_OPEN_ROW, row); break;
     case 2: fire(w, UM_ACT_REVEAL, row);   break;
@@ -412,7 +411,7 @@ static void on_click(struct um_toast_win *w, int x, int y)
     if (hit == UM_HIT_NONE) {
         /* 0 行 = 纯文字信息框：整窗即关闭区（保持 2.4.0 文本 toast
          * “点任意处消失”的语义）。有行的面板点空区仍然什么都不做。 */
-        if (w->model.n_rows == 0) fire(w, UM_ACT_CLOSE, -1);
+        if (w->model.n_rows == 0 && !w->model.overview) fire(w, UM_ACT_CLOSE, -1);
         return;
     }
     if (hit == UM_HIT_OPEN) {
@@ -426,6 +425,8 @@ static void on_click(struct um_toast_win *w, int x, int y)
     else if (hit == UM_HIT_CLOSE)  fire(w, UM_ACT_CLOSE, -1);
     else if (hit == UM_HIT_EXPAND) {
         w->state.expanded = !w->state.expanded;
+        w->state.scroll_px = 0;
+        w->state.focus_row = -1;
         apply_geometry(w);            /* 真的改窗口尺寸与锚点，不只是重画 */
         InvalidateRect(w->hwnd, NULL, FALSE);
         fire(w, UM_ACT_TOGGLE_EXPAND, -1);
@@ -444,6 +445,48 @@ static void on_click(struct um_toast_win *w, int x, int y)
 }
 
 /* ---------------------------------------------------------- 窗口过程 ------ */
+
+static void focus_row(struct um_toast_win *w, int row)
+{
+    int visible, first;
+    w->state.focus_row = row;
+    w->state.focus_btn = 0;
+    if (!w->state.expanded && row > 0) {
+        w->state.expanded = 1;
+        apply_geometry(w);
+        fire(w, UM_ACT_TOGGLE_EXPAND, -1);
+    }
+    visible = um_toast_rows_visible(&w->model, &w->state, w->height);
+    first = w->state.scroll_px / UM_UI_ROW_H;
+    if (row < first) w->state.scroll_px = row * UM_UI_ROW_H;
+    else if (row >= first + visible) w->state.scroll_px = (row - visible + 1) * UM_UI_ROW_H;
+}
+
+static void focus_next(struct um_toast_win *w)
+{
+    int visible = w->state.expanded ? w->model.n_rows : um_toast_rows_visible(&w->model, &w->state, w->height);
+    if (w->state.focus_btn == UM_HIT_CLOSE && !w->state.expanded) {
+        int i;
+        for (i = 0; i < w->model.n_rows; i++) {
+            if (w->model.rows[i].openable) {
+                w->state.focus_btn = UM_HIT_OPEN;
+                return;
+            }
+        }
+    }
+    if (w->state.focus_btn == UM_HIT_CLOSE || w->state.focus_btn == UM_HIT_OPEN ||
+        (w->state.focus_row < 0 && !w->state.focus_btn)) {
+        if (visible) focus_row(w, 0);
+        else w->state.focus_btn = UM_HIT_CLOSE;
+    } else if (w->state.focus_btn == UM_HIT_EXPAND) {
+        w->state.focus_btn = UM_HIT_CLOSE;
+    } else if (w->state.focus_row + 1 < visible) {
+        focus_row(w, w->state.focus_row + 1);
+    } else {
+        w->state.focus_row = -1;
+        w->state.focus_btn = w->model.n_rows > 1 ? UM_HIT_EXPAND : UM_HIT_CLOSE;
+    }
+}
 
 static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -479,8 +522,7 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == UM_TIMER_TICK) {
             if (um_toast_tick(&w->state, UM_TICK_MS)) {
-                w->state.visible = 0;
-                ShowWindow(hw, SW_HIDE);
+                um_toast_win_hide(w);
                 fire(w, UM_ACT_AUTOHIDE, -1);
             } else {
                 /* 倒计时文案只在秒变化（或暂停态翻转）时才需要重画；
@@ -548,7 +590,7 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         int maxs;
         if (!w || !w->state.expanded) return 0;
         maxs = um_toast_max_scroll(&w->model, &w->state, w->height);
-        w->state.scroll_px -= delta;     /* 向上滚 = 内容上移 */
+        w->state.scroll_px -= (delta / 120) * UM_UI_ROW_H;
         if (w->state.scroll_px < 0) w->state.scroll_px = 0;
         if (w->state.scroll_px > maxs) w->state.scroll_px = maxs;
         InvalidateRect(hw, NULL, FALSE);
@@ -568,20 +610,29 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                 x, y);
         if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS)
             show_row_menu(w, (int)hit - UM_HIT_ROW, x, y);
-        else
+        else if (hit >= UM_HIT_ROW_OPEN && hit < UM_HIT_ROW_OPEN + UM_UI_MAX_ROWS)
+            show_row_menu(w, (int)hit - UM_HIT_ROW_OPEN, x, y);
+        else if (!w->model.n_rows && !w->model.overview)
             fire(w, UM_ACT_CLOSE, -1);
         return 0;
     }
+
+    case WM_CLOSE:
+        fire(w, UM_ACT_CLOSE, -1);
+        return 0;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { fire(w, UM_ACT_CLOSE, -1); return 0; }
         if (wp == VK_RETURN) {
             int row = w->state.focus_row;
-            if (row >= 0) {
-                if (row < w->model.n_rows && w->model.rows[row].openable)
-                    fire(w, UM_ACT_OPEN_ROW, row);
+            if (w->state.focus_btn == UM_HIT_CLOSE) {
+                fire(w, UM_ACT_CLOSE, -1);
+            } else if (w->state.focus_btn == UM_HIT_EXPAND) {
+                um_toast_win_toggle_expand(w);
+                fire(w, UM_ACT_TOGGLE_EXPAND, -1);
+            } else if (row >= 0 && row < w->model.n_rows) {
+                if (w->model.rows[row].openable) fire(w, UM_ACT_OPEN_ROW, row);
             } else {
-                /* 回车 = 主按钮：打开第一个可打开的卷 */
                 int i;
                 for (i = 0; i < w->model.n_rows; i++) {
                     if (w->model.rows[i].openable) { fire(w, UM_ACT_OPEN, i); break; }
@@ -589,21 +640,17 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         }
-        if (wp == VK_TAB) {
-            /* 焦点环：行 → 主按钮 → 展开 → 关闭 → 回到首行 */
-            if (w->state.focus_row + 1 < w->model.n_rows) w->state.focus_row++;
-            else { w->state.focus_row = -1; w->state.focus_btn = 0; }
+        if (wp == VK_TAB && (w->model.n_rows || w->model.overview)) {
+            focus_next(w);
             InvalidateRect(hw, NULL, FALSE);
             return 0;
         }
-        if (wp == VK_UP || wp == VK_DOWN) {
-            if (w->model.n_rows > 0) {
-                w->state.focus_row += (wp == VK_DOWN) ? 1 : -1;
-                if (w->state.focus_row < -1) w->state.focus_row = -1;
-                if (w->state.focus_row >= w->model.n_rows)
-                    w->state.focus_row = w->model.n_rows - 1;
-                InvalidateRect(hw, NULL, FALSE);
-            }
+        if ((wp == VK_UP || wp == VK_DOWN) && w->model.n_rows) {
+            int row = w->state.focus_row + (wp == VK_DOWN ? 1 : -1);
+            if (row < 0) row = 0;
+            if (row >= w->model.n_rows) row = w->model.n_rows - 1;
+            focus_row(w, row);
+            InvalidateRect(hw, NULL, FALSE);
             return 0;
         }
         break;
@@ -624,6 +671,12 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
          * to 0x0 with no way back. */
         int d = (int)HIWORD(wp);
         w->dpi = (d >= 16) ? d : 96;
+        if (lp) {
+            const RECT *suggested = (const RECT *)lp;
+            POINT middle = { suggested->left + (suggested->right - suggested->left) / 2,
+                             suggested->top + (suggested->bottom - suggested->top) / 2 };
+            w->monitor = MonitorFromPoint(middle, MONITOR_DEFAULTTONEAREST);
+        }
         apply_geometry(w);
         InvalidateRect(hw, NULL, FALSE);
         return 0;
@@ -679,8 +732,8 @@ int um_toast_win_enable_dpi_awareness(void)
     if (set_ctx.raw) {
         /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4; passing
          * the magic value by hand avoids depending on the SDK constant. */
-        void *v2 = (void *)(LONG_PTR)-4;
-        if (set_ctx.ctx(v2)) ok = 1;
+        LONG_PTR per_monitor_v2 = -4;
+        if (set_ctx.ctx((void *)per_monitor_v2)) ok = 1;
     }
     if (!ok && set_aware.raw) {
         /* PROCESS_PER_MONITOR_DPI_AWARE == 2 (Win8.1) */
@@ -724,7 +777,7 @@ int um_toast_win_init(void *hinst)
 
 /* 系统是否深色：HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\
  * Personalize\AppsUseLightTheme == 0 表示深色。读不到就按浅色处理。 */
-int um_toast_system_dark(void)
+static int system_dark(void)
 {
 #ifdef _WIN32
     HKEY k;
@@ -743,6 +796,25 @@ int um_toast_system_dark(void)
 #endif
 }
 
+void um_toast_system_theme(um_theme *theme)
+{
+    um_theme_resolve(theme, "auto", system_dark());
+#ifdef _WIN32
+    HIGHCONTRASTW hc = {0};
+    hc.cbSize = sizeof hc;
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0) &&
+        (hc.dwFlags & HCF_HIGHCONTRASTON)) {
+        theme->panel = cref(GetSysColor(COLOR_WINDOW));
+        theme->panel2 = theme->panel;
+        theme->text = cref(GetSysColor(COLOR_WINDOWTEXT));
+        theme->muted = theme->border = theme->progress = theme->text;
+        theme->accent = theme->accent_hover = cref(GetSysColor(COLOR_HIGHLIGHT));
+        theme->on_accent = cref(GetSysColor(COLOR_HIGHLIGHTTEXT));
+        theme->ok = theme->warn = theme->error = theme->text;
+    }
+#endif
+}
+
 um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
                                int topmost, int width, int ttl_ms,
                                um_toast_cb cb, void *user)
@@ -750,7 +822,6 @@ um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
     struct um_toast_win *w = (struct um_toast_win *)calloc(1, sizeof *w);
     DWORD ex;
     HDC   hdc;
-    HRGN  rgn;
     int   pw, ph;
 
     if (!w) return NULL;
@@ -778,20 +849,13 @@ um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
     /* 0 行信息框与设备面板同一个窗口类（同一套渲染内核），只靠标题区分：
      * 标题 "usbmon" = 设备面板，"usbmon-toast" = 文字信息框。 */
     w->hwnd = CreateWindowExW(ex, g_class,
-                              (m->n_rows > 0) ? L"usbmon" : L"usbmon-toast",
+                              (m->n_rows || m->overview) ? L"usbmon" : L"usbmon-toast",
                               WS_POPUP,
                               0, 0, pw, ph, NULL, NULL,
                               g_hinst, NULL);
     if (!w->hwnd) { free(w); return NULL; }
 
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
-    rgn = CreateRoundRectRgn(0, 0, pw + 1, ph + 1, ui_scale(w, 20),
-                             ui_scale(w, 20));
-    SetWindowRgn(w->hwnd, rgn, FALSE);
-    w->alpha = 0;
-    SetLayeredWindowAttributes(w->hwnd, 0, 0, LWA_ALPHA);
-    SetTimer(w->hwnd, UM_TIMER_TICK, UM_TICK_MS, NULL);
-    SetTimer(w->hwnd, UM_TIMER_FADE, 16, NULL);
     return w;
 }
 
@@ -848,29 +912,15 @@ int um_toast_suggest_width(const um_toast_model *m)
  * 槽位变化不改窗口尺寸。 */
 void um_toast_win_move_slot_ex(um_toast_win *w, int slot, int base_px)
 {
-    RECT rc;
-    RECT wa;
-    int  off, y;
-
     if (!w || !w->hwnd) return;
-    if (slot < 0) slot = 0;
-    if (base_px < 0) base_px = 0;
-    if (base_px == 0 && slot == 0) return;
-    if (!GetWindowRect(w->hwnd, &rc)) return;
-    off = base_px + slot * (ui_scale(w, w->height) + ui_scale(w, 12));
-    if (base_px > 0) off += ui_scale(w, 12);   /* 面板与本通知之间的间隙 */
-    y = (int)(rc.top - off);
-    if (um_toast_monitor_workarea(&wa)) {
-        int min_y = (int)(wa.top + ui_scale(w, UM_UI_MARGIN));
-        if (y < min_y) y = min_y;
-    }
-    SetWindowPos(w->hwnd, NULL, (int)rc.left, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    w->slot = slot > 0 ? slot : 0;
+    w->above_px = base_px > 0 ? base_px : 0;
+    apply_geometry(w);
 }
 
 void um_toast_win_move_slot(um_toast_win *w, int slot)
 {
-    um_toast_win_move_slot_ex(w, slot, 0);
+    if (slot > 0) um_toast_win_move_slot_ex(w, slot, 0);
 }
 
 /* 窗口当前物理高度（设备像素）。面板可见时宿主用它作为通知叠放的基线，
@@ -882,21 +932,17 @@ int um_toast_win_pixel_height(const um_toast_win *w)
     return (int)(r.bottom - r.top);
 }
 
-/* 导出当前锚定显示器的工作区（调用方提供 RECT）。参数用 void* 以免本头
- * 文件引入 windows.h。返回 1 表示成功。 */
-int um_toast_monitor_workarea(void *rc_work)
-{
-    RECT wa;
-    if (!rc_work) return 0;
-    monitor_workarea(&wa);
-    *(RECT *)rc_work = wa;
-    return 1;
-}
-
 void um_toast_win_update(um_toast_win *w, const um_toast_model *m)
 {
     if (!w || !m) return;
+    if (w->state.focus_row >= 0) {
+        int focus = w->state.focus_row;
+        if (focus >= m->n_rows ||
+            strcmp(w->model.rows[focus].instance_id, m->rows[focus].instance_id))
+            w->state.focus_row = -1;
+    }
     w->model = *m;
+    if (m->n_rows <= 1) w->state.expanded = 0;
     apply_geometry(w);      /* 尺寸变化时同步窗口与锚点，再重画 */
     InvalidateRect(w->hwnd, NULL, FALSE);
 }
@@ -904,7 +950,12 @@ void um_toast_win_update(um_toast_win *w, const um_toast_model *m)
 void um_toast_win_show(um_toast_win *w)
 {
     if (!w) return;
-    um_toast_state_init(&w->state, w->state.ttl_ms);
+    if (!w->state.visible) {
+        w->monitor = current_monitor();
+        um_toast_state_init(&w->state, w->state.ttl_ms);
+    } else {
+        w->state.remaining_ms = w->state.ttl_ms;
+    }
     w->state.visible = 1;
     w->alpha = 0;
     w->last_sec = -1;
@@ -935,12 +986,14 @@ void um_toast_win_set_theme(um_toast_win *w, const um_theme *t)
 
 void um_toast_win_destroy(um_toast_win *w)
 {
+    int i;
     if (!w) return;
     /* DestroyWindow 同步跑 WM_DESTROY（清 GWLP_USERDATA + KillTimer）后才返回。
      * 万一它失败（跨线程/已被系统销毁），也要手动清掉 userdata，绝不能让存活
      * 的 HWND 指向马上被 free 的 w。 */
     if (w->hwnd && !DestroyWindow(w->hwnd))
         SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
+    for (i = 0; i < 5; i++) if (w->fonts[i]) DeleteObject(w->fonts[i]);
     free(w);
 }
 
@@ -965,6 +1018,7 @@ void um_toast_win_toggle_expand(um_toast_win *w)
 {
     if (!w) return;
     w->state.expanded = !w->state.expanded;
+    w->state.scroll_px = 0;
     apply_geometry(w);
     InvalidateRect(w->hwnd, NULL, FALSE);
 }
@@ -973,11 +1027,6 @@ void um_toast_win_toggle_expand(um_toast_win *w)
 void *um_toast_win_hwnd(const um_toast_win *w)
 {
     return w ? (void *)w->hwnd : NULL;
-}
-
-void *um_toast_win_user(const um_toast_win *w)
-{
-    return w ? w->user : NULL;
 }
 
 const um_toast_state *um_toast_win_state(const um_toast_win *w)

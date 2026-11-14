@@ -227,7 +227,7 @@ $Hooks = Join-Path $Root "hooks.json"
     { "name": "demo-notepad", "match_keys": ["*"],
       "command": ["C:\\Windows\\System32\\notepad.exe", "--never-used"], "enabled": true },
     { "name": "demo-clone", "match_keys": ["zzz*"],
-      "command": ["usbmon-clone.exe"], "enabled": true }
+      "command": ["C:\\Tools\\usbmon-clone.exe"], "enabled": true }
   ]
 }
 "@ | Set-Content -LiteralPath $Hooks -Encoding UTF8
@@ -591,8 +591,8 @@ if ($hwnd -ne [IntPtr]::Zero) {
     Start-Sleep -Milliseconds 800
     $menuLeft = Truncate-From (Read-TrayLog) "menu left"
     if ($menuLeft -ne "") {
-        if ($menuLeft -match '安全弹出' -or $menuLeft -match '当前没有检测到 USB 存储设备') {
-            Ok "left-click menu built from a fresh scan (volume entries or honest empty state)"
+        if ($menuLeft -match '打开设备概览') {
+            Ok "left-click menu built from the current inventory (volume entries or honest empty state)"
         } else {
             Bad "left menu has neither volume entries nor empty state: $(($menuLeft -replace "`n", ' | ').Trim())"
         }
@@ -636,10 +636,8 @@ if ($hwnd -ne [IntPtr]::Zero) {
 
 # --- 14b) async safe-eject: worker thread + marshaled result toast -----------
 # UMWM_TRAY_EJECT_TEST (0x8007), honored only under USBMON_TRAY_TEST: drives
-# tray_do_eject with letter 'Q' (0x51) — almost certainly absent on a runner,
-# so the worker's CreateFileW fails fast, but the WHOLE async chain runs:
-# GUI thread returns immediately, worker runs the IOCTL attempt, the result
-# toast is marshaled back via PostThreadMessageW and the tray log records it.
+# simulates an absent device. The worker returns a PnP failure without
+# touching hardware. The window message updates the result toast and test log.
 if ($hwnd -ne [IntPtr]::Zero) {
     [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8007, [UIntPtr]0x51, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 1500     # progress toast + worker + result toast

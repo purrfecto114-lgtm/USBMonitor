@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 #define J_MAX_DEPTH 24
 #define J_MAX_NODES 2048
@@ -25,7 +26,8 @@ typedef struct {
 static jval *jnew(jtype t)
 {
     jval *v = (jval *)calloc(1, sizeof *v);
-    return v ? (v->t = t, v) : NULL;
+    if (v) v->t = t;
+    return v;
 }
 
 void json_free(jval *v)
@@ -51,27 +53,38 @@ static void jskip(jparser *ps)
 }
 
 /* returns 1 on success, 0 on allocation failure (caller must abort) */
-static int utf8_emit(char **o, size_t *cap, size_t *len, unsigned int cp)
+static int append(char **out, size_t *cap, size_t *len, const void *bytes, size_t n)
+{
+    if (*len + n + 1 > *cap) {
+        size_t new_cap = (*cap + n + 1) * 2;
+        char *p = realloc(*out, new_cap);
+        if (!p) return 0;
+        *out = p;
+        *cap = new_cap;
+    }
+    memcpy(*out + *len, bytes, n);
+    *len += n;
+    (*out)[*len] = '\0';
+    return 1;
+}
+
+static int utf8_emit(char **out, size_t *cap, size_t *len, unsigned cp)
 {
     unsigned char b[4];
-    int n = 0;
-    if (cp < 0x80)                 { b[0] = (unsigned char)cp; n = 1; }
-    else if (cp < 0x800)          { b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 0x3F); n = 2; }
-    else if (cp < 0x10000)        { b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 0x3F);
-                                    b[2] = 0x80 | (cp & 0x3F); n = 3; }
-    else                          { b[0] = 0xF0 | (cp >> 18); b[1] = 0x80 | ((cp >> 12) & 0x3F);
-                                    b[2] = 0x80 | ((cp >> 6) & 0x3F); b[3] = 0x80 | (cp & 0x3F); n = 4; }
-    if (*len + (size_t)n + 1 > *cap) {
-        size_t newcap = (*cap + (size_t)n + 1) * 2;
-        char *np = (char *)realloc(*o, newcap);
-        if (!np) return 0;          /* keep *o intact; *cap unchanged */
-        *o = np;
-        *cap = newcap;
+    size_t n;
+    if (!cp) return 0;  /* A hook argument cannot represent an embedded NUL. */
+    if (cp < 0x80) {
+        b[0] = (unsigned char)cp; n = 1;
+    } else if (cp < 0x800) {
+        b[0] = 0xc0 | (cp >> 6); b[1] = 0x80 | (cp & 0x3f); n = 2;
+    } else if (cp < 0x10000) {
+        b[0] = 0xe0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 0x3f);
+        b[2] = 0x80 | (cp & 0x3f); n = 3;
+    } else {
+        b[0] = 0xf0 | (cp >> 18); b[1] = 0x80 | ((cp >> 12) & 0x3f);
+        b[2] = 0x80 | ((cp >> 6) & 0x3f); b[3] = 0x80 | (cp & 0x3f); n = 4;
     }
-    memcpy(*o + *len, b, (size_t)n);
-    *len += (size_t)n;
-    (*o)[*len] = '\0';
-    return 1;
+    return append(out, cap, len, b, n);
 }
 
 static int hex4(jparser *ps, unsigned int *out)
@@ -138,8 +151,10 @@ static char *parse_string_raw(jparser *ps)
             default: ps->failed = 1; free(s); return NULL;
             }
         } else {
-            if (!utf8_emit(&s, &cap, &len, (unsigned char)c)) goto oom;
-            ps->p++;
+            size_t n = um_utf8_sequence((const unsigned char *)ps->p,
+                                         (size_t)(ps->end - ps->p));
+            if (!n || !append(&s, &cap, &len, ps->p, n)) goto oom;
+            ps->p += n;
         }
     }
     if (ps->p >= ps->end) { free(s); ps->failed = 1; return NULL; }
@@ -170,7 +185,7 @@ static jval *parse_object(jparser *ps)
         if (ps->p >= ps->end || *ps->p != ':') { free(key); json_free(v); ps->failed = 1; return NULL; }
         ps->p++;
         jval *val = parse_value(ps);
-        if (ps->failed) { free(key); json_free(v); return NULL; }
+        if (!val) { free(key); json_free(v); ps->failed = 1; return NULL; }
 
         {
             char **nkeys = (char **)realloc(v->keys, sizeof(char *) * (size_t)(v->nk + 1));
@@ -208,7 +223,7 @@ static jval *parse_array(jparser *ps)
 
     for (;;) {
         jval *item = parse_value(ps);
-        if (ps->failed) { json_free(v); return NULL; }
+        if (!item) { json_free(v); ps->failed = 1; return NULL; }
         {
             jval **nitems = (jval **)realloc(v->items, sizeof(jval *) * (size_t)(v->n + 1));
             if (!nitems) { json_free(item); json_free(v); ps->failed = 1; return NULL; }
@@ -221,6 +236,42 @@ static jval *parse_array(jparser *ps)
         if (ps->p < ps->end && *ps->p == ']') { ps->p++; return v; }
         ps->failed = 1; json_free(v); return NULL;
     }
+}
+
+static int digit(char c) { return c >= '0' && c <= '9'; }
+
+static jval *parse_number(jparser *ps)
+{
+    const char *start = ps->p, *p = start;
+    char *end;
+    double number;
+    jval *val;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else {
+        if (!digit(*p)) goto invalid;
+        while (digit(*p)) p++;
+    }
+    if (*p == '.') {
+        if (!digit(*++p)) goto invalid;
+        while (digit(*p)) p++;
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!digit(*p)) goto invalid;
+        while (digit(*p)) p++;
+    }
+    number = strtod(start, &end);
+    if (end != p || !isfinite(number)) goto invalid;
+    ps->p = p;
+    val = jnew(J_NUM);
+    if (val) val->num = number;
+    return val;
+
+invalid:
+    ps->failed = 1;
+    return NULL;
 }
 
 static jval *parse_value(jparser *ps)
@@ -239,7 +290,7 @@ static jval *parse_value(jparser *ps)
         char *s = parse_string_raw(ps);
         if (ps->failed) return NULL;
         v = jnew(J_STR);
-        if (!v) { free(s); return NULL; }
+        if (!v) { free(s); ps->failed = 1; return NULL; }
         v->str = s;
         return v;
     }
@@ -253,15 +304,7 @@ static jval *parse_value(jparser *ps)
         if (!strncmp(ps->p, "null", 4) && ps->end - ps->p >= 4) {
             ps->p += 4; return jnew(J_NULL);
         }
-        if (*ps->p == '-' || (*ps->p >= '0' && *ps->p <= '9')) {
-            char *endp = NULL;
-            double d = strtod(ps->p, &endp);
-            if (endp == ps->p || endp > ps->end) { ps->failed = 1; return NULL; }
-            v = jnew(J_NUM);
-            if (v) v->num = d;
-            ps->p = endp;
-            return v;
-        }
+        if (*ps->p == '-' || digit(*ps->p)) return parse_number(ps);
         ps->failed = 1;
         return NULL;
     }
@@ -273,6 +316,7 @@ jval *json_parse(const char *text)
     jval *v;
     ps.p = text;
     ps.end = text + strlen(text);
+    if (!strncmp(text, "\xef\xbb\xbf", 3)) ps.p += 3;
     ps.depth = 0;
     ps.nodes = 0;
     ps.failed = 0;

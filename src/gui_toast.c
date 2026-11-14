@@ -42,21 +42,22 @@
 
 /* ---------------------------------------------------------------- palette */
 
-#define COL_BG     "#22272e"
-#define COL_BORDER "#3a4150"
-#define COL_TITLE  "#f2f4f7"
-#define COL_BODY   "#c9ced6"
-#define COL_DIM    "#8b929c"
-#define COL_ACCENT_ADD    "#35b46a"
-#define COL_ACCENT_REMOVE "#8b929c"
+#define COL_BG           "#111923"
+#define COL_BORDER       "#374a60"
+#define COL_TITLE        "#f2f6fc"
+#define COL_BODY         "#e5edf7"
+#define COL_DIM          "#b4c3d5"
+#define COL_ACCENT_ADD   "#6be1b5"
+#define COL_ACCENT_REMOVE "#ffa6a3"
+#define COL_HEADER       "#1b2837"
 
-#define TOAST_W      400
-#define PAD          14
-#define TITLE_SIZE   15
-#define BODY_SIZE    11
-#define MARGIN_RIGHT 24
+#define TOAST_W       420
+#define PAD           16
+#define TITLE_SIZE    14
+#define BODY_SIZE     11
+#define MARGIN_RIGHT  24
 #define MARGIN_BOTTOM 48
-#define SLOT_GAP     12
+#define SLOT_GAP      12
 
 /* ---------------------------------------------------------------- state --- */
 
@@ -81,12 +82,9 @@ typedef struct {
     XftFont   *f_title, *f_body;
     XftColor   c_title, c_body, c_dim;
     GC         gc;
-    unsigned long px_bg, px_border, px_accent;
-    char      *lines[8];            /* heap strings, drawn top to bottom   */
+    unsigned long px_bg, px_border, px_accent, px_header;
+    char       lines[5][256];
     int        n_lines;
-    int        title_idx;           /* which line is the title (0)         */
-    int        body_first;          /* first body line uses COL_BODY       */
-    int        n_body_dim_from;     /* from this line on, dim color        */
 } toast_win;
 
 /* ------------------------------------------------------------- utilities -- */
@@ -159,17 +157,15 @@ static void build_lines(const toast_args *a, toast_win *t)
     char buf[512];
     int i = 0;
 
-    t->lines[i++] = strdup(a->remove ? "USB 设备已拔出" : "USB 设备已插入");
-    t->title_idx = 0;
-    t->body_first = 1;
-    t->n_body_dim_from = 2;
+    snprintf(t->lines[i++], sizeof t->lines[0], "%s",
+             a->remove ? "USB 设备已拔出" : "USB 设备已插入");
 
     /* line 1: model (key) — or just the key when the model is empty */
     if (a->model[0])
         snprintf(buf, sizeof buf, "%s (%s)", a->model, a->key);
     else
         snprintf(buf, sizeof buf, "%s", a->key[0] ? a->key : "USB 存储设备");
-    t->lines[i++] = strdup(buf);
+    snprintf(t->lines[i++], sizeof t->lines[0], "%.255s", buf);
 
     if (!a->remove) {
         if (a->size > 0) {
@@ -181,17 +177,17 @@ static void build_lines(const toast_args *a, toast_win *t)
                 else
                     snprintf(buf, sizeof buf, "容量 %s", sz);
             }
-            t->lines[i++] = strdup(buf);
+            snprintf(t->lines[i++], sizeof t->lines[0], "%.255s", buf);
         }
         if (a->mount[0])
             snprintf(buf, sizeof buf, "挂载点 %s", a->mount);
         else
             snprintf(buf, sizeof buf, "未挂载");
-        t->lines[i++] = strdup(buf);
+        snprintf(t->lines[i++], sizeof t->lines[0], "%.255s", buf);
 
         if (a->serial[0]) {
             snprintf(buf, sizeof buf, "序列 %s", a->serial);
-            t->lines[i++] = strdup(buf);
+            snprintf(t->lines[i++], sizeof t->lines[0], "%.255s", buf);
         }
     }
     t->n_lines = i;
@@ -253,32 +249,51 @@ static int open_fonts(toast_win *t)
     return 0;
 }
 
+static void draw_text(toast_win *t, XftFont *font, XftColor *color,
+                      int x, int y, const char *line)
+{
+    XGlyphInfo extent, ellipsis;
+    const FcChar8 *text = (const FcChar8 *)line;
+    static const FcChar8 dots[] = "...";
+    int len = (int)strlen(line), limit = t->w - x - PAD;
+    XftTextExtentsUtf8(t->dpy, font, text, len, &extent);
+    if (extent.xOff > limit) {
+        XftTextExtentsUtf8(t->dpy, font, dots, 3, &ellipsis);
+        do {
+            do { len--; } while (len > 0 && (text[len] & 0xc0) == 0x80);
+            XftTextExtentsUtf8(t->dpy, font, text, len, &extent);
+        } while (len > 0 && extent.xOff + ellipsis.xOff > limit);
+        if (ellipsis.xOff <= limit) XftDrawStringUtf8(t->draw, color, font,
+                                                     x + extent.xOff, y, dots, 3);
+    }
+    if (len) XftDrawStringUtf8(t->draw, color, font, x, y, text, len);
+}
+
 static void draw_all(toast_win *t)
 {
-    int y = PAD;
-    int i;
+    int y = PAD, i;
 
     XSetForeground(t->dpy, t->gc, t->px_bg);
     XFillRectangle(t->dpy, t->win, t->gc, 0, 0, t->w, t->h);
+    XSetForeground(t->dpy, t->gc, t->px_header);
+    XFillRectangle(t->dpy, t->win, t->gc, PAD, PAD, 32, 32);
     XSetForeground(t->dpy, t->gc, t->px_accent);
-    XFillRectangle(t->dpy, t->win, t->gc, 0, 0, 4, t->h);
+    XDrawRectangle(t->dpy, t->win, t->gc, PAD + 9, PAD + 12, 13, 11);
+    XDrawRectangle(t->dpy, t->win, t->gc, PAD + 12, PAD + 7, 7, 5);
+    XDrawPoint(t->dpy, t->win, t->gc, PAD + 14, PAD + 9);
+    XDrawPoint(t->dpy, t->win, t->gc, PAD + 17, PAD + 9);
     XSetForeground(t->dpy, t->gc, t->px_border);
     XDrawRectangle(t->dpy, t->win, t->gc, 0, 0, t->w - 1, t->h - 1);
 
-    for (i = 0; i < t->n_lines; i++) {
-        const XftColor *col;
-        const XftFont *f;
-        if (i == t->title_idx) { f = t->f_title; col = &t->c_title; }
-        else {
-            f = t->f_body;
-            col = (i < t->n_body_dim_from) ? &t->c_body : &t->c_dim;
-        }
-        y += (int)f->ascent;
-        XftDrawStringUtf8(t->draw, (XftColor *)col, (XftFont *)f,
-                          PAD + 4, y,
-                          (const FcChar8 *)t->lines[i],
-                          (int)strlen(t->lines[i]));
-        y += (int)f->descent + 5;
+    if (!t->draw || !t->f_title || !t->f_body) { XFlush(t->dpy); return; }
+    draw_text(t, t->f_title, &t->c_title, PAD + 44,
+              PAD + (32 + t->f_title->ascent - t->f_title->descent) / 2, t->lines[0]);
+    y += 44;
+    XDrawLine(t->dpy, t->win, t->gc, PAD, y - 5, t->w - PAD, y - 5);
+    for (i = 1; i < t->n_lines; i++) {
+        y += t->f_body->ascent;
+        draw_text(t, t->f_body, i == 1 ? &t->c_body : &t->c_dim, PAD, y, t->lines[i]);
+        y += t->f_body->descent + 5;
     }
     XFlush(t->dpy);
 }
@@ -304,7 +319,8 @@ int main(int argc, char **argv)
     struct timespec now;
     double deadline;
     int screen_w, screen_h, x, y;
-    int i;
+    int slot_pitch;
+    unsigned color_mask = 0;
 
     parse_args(argc, argv, &a);
     memset(&t, 0, sizeof t);
@@ -325,21 +341,20 @@ int main(int argc, char **argv)
         /* no usable font: draw a plain colored card (still informative
          * through its presence + colors; never crash) */
         fprintf(stderr, "usbmon-toast: no fonts, drawing minimal card\n");
-        t.f_title = t.f_body = NULL;
         t.n_lines = 0;
     }
 
     {
-        int line_h_title = t.f_title ? t.f_title->ascent + t.f_title->descent + 5 : 20;
-        int line_h_body  = t.f_body  ? t.f_body->ascent  + t.f_body->descent + 5   : 16;
-        int body_lines   = (t.n_lines > 1) ? t.n_lines - 1 : 0;
-        t.w = TOAST_W;
-        t.h = PAD + line_h_title + (body_lines * line_h_body) + PAD - 5;
-        if (t.h < 60) t.h = 60;
+        int body_height = t.f_body ? t.f_body->ascent + t.f_body->descent + 5 : 16;
+        int body_lines = t.n_lines > 1 ? t.n_lines - 1 : 0;
+        t.w = screen_w > TOAST_W + MARGIN_RIGHT ? TOAST_W : screen_w - 2;
+        if (t.w < 1) t.w = 1;
+        t.h = 2 * PAD + 44 + body_lines * body_height;
+        slot_pitch = 2 * PAD + 44 + 4 * body_height + SLOT_GAP;
     }
 
     x = screen_w - t.w - MARGIN_RIGHT;
-    y = screen_h - t.h - MARGIN_BOTTOM - a.slot * (t.h + SLOT_GAP);
+    y = screen_h - t.h - MARGIN_BOTTOM - a.slot * slot_pitch;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
 
@@ -347,13 +362,15 @@ int main(int argc, char **argv)
     cm  = DefaultColormap(t.dpy, t.scr);
 
     t.px_bg     = (unsigned long)alloc_color(t.dpy, &t, COL_BG,      0x2e2722UL);
-    t.px_border = (unsigned long)alloc_color(t.dpy, &t, COL_BORDER,  0x50413aUL);
+    t.px_border = (unsigned long)alloc_color(t.dpy, &t, COL_BORDER, 0x374a60UL);
+    t.px_header = (unsigned long)alloc_color(t.dpy, &t, COL_HEADER, 0x1b2837UL);
     t.px_accent = (unsigned long)alloc_color(t.dpy, &t,
                     a.remove ? COL_ACCENT_REMOVE : COL_ACCENT_ADD, 0x6ab435UL);
 
     t.win = XCreateSimpleWindow(t.dpy, RootWindow(t.dpy, t.scr),
                                 x, y, (unsigned)t.w, (unsigned)t.h, 1,
                                 t.px_border, t.px_bg);
+    XStoreName(t.dpy, t.win, "usbmon-toast");
     attrs.override_redirect = True;
     attrs.event_mask = ExposureMask | ButtonPressMask;
     attrs.background_pixel = t.px_bg;
@@ -365,11 +382,11 @@ int main(int argc, char **argv)
         t.gc = XCreateGC(t.dpy, t.win, 0, &gcv);
     }
 
-    if (t.f_title) {
-        t.draw = XftDrawCreate(t.dpy, t.win, vis, cm);
-        XftColorAllocName(t.dpy, vis, cm, COL_TITLE, &t.c_title);
-        XftColorAllocName(t.dpy, vis, cm, COL_BODY,  &t.c_body);
-        XftColorAllocName(t.dpy, vis, cm, COL_DIM,   &t.c_dim);
+    if (t.f_title && t.f_body) {
+        if (XftColorAllocName(t.dpy, vis, cm, COL_TITLE, &t.c_title)) color_mask |= 1;
+        if (XftColorAllocName(t.dpy, vis, cm, COL_BODY, &t.c_body)) color_mask |= 2;
+        if (XftColorAllocName(t.dpy, vis, cm, COL_DIM, &t.c_dim)) color_mask |= 4;
+        if (color_mask == 7) t.draw = XftDrawCreate(t.dpy, t.win, vis, cm);
     }
 
     XMapWindow(t.dpy, t.win);
@@ -405,14 +422,13 @@ int main(int argc, char **argv)
 
 done:
     if (t.draw) XftDrawDestroy(t.draw);
-    if (t.f_title) XftColorFree(t.dpy, vis, cm, &t.c_title);
-    if (t.f_title) XftColorFree(t.dpy, vis, cm, &t.c_body);
-    if (t.f_title) XftColorFree(t.dpy, vis, cm, &t.c_dim);
+    if (color_mask & 1) XftColorFree(t.dpy, vis, cm, &t.c_title);
+    if (color_mask & 2) XftColorFree(t.dpy, vis, cm, &t.c_body);
+    if (color_mask & 4) XftColorFree(t.dpy, vis, cm, &t.c_dim);
     if (t.f_title) XftFontClose(t.dpy, t.f_title);
     if (t.f_body && t.f_body != t.f_title) XftFontClose(t.dpy, t.f_body);
     XFreeGC(t.dpy, t.gc);
     XDestroyWindow(t.dpy, t.win);
     XCloseDisplay(t.dpy);
-    for (i = 0; i < t.n_lines; i++) free(t.lines[i]);
     return 0;
 }

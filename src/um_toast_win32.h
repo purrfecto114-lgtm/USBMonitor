@@ -38,7 +38,7 @@ int  um_toast_win_init(void *hinstance);
 int  um_toast_win_enable_dpi_awareness(void);
 
 /* 系统是否处于深色模式（AppsUseLightTheme == 0）。 */
-int  um_toast_system_dark(void);
+void um_toast_system_theme(um_theme *theme);
 
 /* 创建（不显示）：model 拷贝进窗口，theme 同理。
  * width 为设计空间（96DPI）像素宽，0 = 默认 UM_UI_WIDTH；
@@ -65,10 +65,6 @@ void um_toast_win_move_slot_ex(um_toast_win *w, int slot, int base_px);
 /* 窗口当前物理高度（设备像素，含 fit/dpi）；失败返回 0。用于取面板占位。 */
 int  um_toast_win_pixel_height(const um_toast_win *w);
 
-/* 当前锚定显示器（光标所在屏）的工作区；参数是调用方提供的 RECT*。
- * 用 void* 是为了本头文件不必引入 windows.h。返回 1 表示成功。 */
-int  um_toast_monitor_workarea(void *rc_work);
-
 /* 新事件到达时刷新内容（1.1.1 的 consume/refresh）。 */
 void um_toast_win_update(um_toast_win *w, const um_toast_model *m);
 
@@ -86,9 +82,6 @@ void um_toast_win_toggle_expand(um_toast_win *w);
 
 /* 窗口句柄（真机冒烟测试直接投递 WM_KEYDOWN/菜单消息用；可为 NULL）。 */
 void *um_toast_win_hwnd(const um_toast_win *w);
-
-/* 透传给回调的 user 指针（NULL 安全；槽位替换时回收旧 carrier 用）。 */
-void *um_toast_win_user(const um_toast_win *w);
 
 /* 交互状态只读视图（宿主/测试断言 scroll/hover/焦点用；恒非 NULL）。 */
 const um_toast_state *um_toast_win_state(const um_toast_win *w);
