@@ -1,5 +1,4 @@
 # build artifacts
-bin/
 usbmon
 usbmon-toast
 usbmon-asan

@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.6.0-rc.1] — 2026-11-14
+## [2.6.0] · 2026-11-07
 
 - Windows 统一设备枚举、事件和面板数据，支持无盘符存储，区分目录挂载、不可访问卷和空读卡器。
 - Linux 使用内核 block uevent 唤醒，测试目录保留 inotify。修复 X11 插入通知缺容量。

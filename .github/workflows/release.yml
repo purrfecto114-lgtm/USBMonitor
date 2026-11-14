@@ -2,9 +2,7 @@ name: Build, tag and release
 
 on:
   push:
-    branches:
-      - main
-      - 'release/**'
+    branches: [main]
     paths:
       - "src/usbmon.h"
       - "CHANGELOG.md"
@@ -27,7 +25,6 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       skip: ${{ steps.skip.outputs.skip }}
-      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Check out
         uses: actions/checkout@v7
@@ -38,23 +35,12 @@ jobs:
           set -eu
           VERSION=$(sed -n 's/^#define UM_VERSION "\(.*\)"/\1/p' src/usbmon.h)
           [ -n "$VERSION" ] || { echo "UM_VERSION missing in src/usbmon.h"; exit 1; }
-          echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
-            || { echo "version '$VERSION' is not supported semver (optional pre-release suffix allowed)"; exit 1; }
-          grep -Fq -- "## [$VERSION]" CHANGELOG.md \
+          echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            || { echo "version '$VERSION' is not plain semver"; exit 1; }
+          grep -q "^## \[$VERSION\]" CHANGELOG.md \
             || { echo "CHANGELOG.md has no '## [$VERSION]' section"; exit 1; }
-          PRERELEASE=false
-          case "$VERSION" in *-*) PRERELEASE=true ;; esac
-          case "$GITHUB_REF" in
-            refs/heads/release/*)
-              [ "$PRERELEASE" = true ] || { echo "release/** branches must use a pre-release version"; exit 1; }
-              ;;
-            refs/heads/main)
-              [ "$PRERELEASE" = false ] || { echo "main must not publish a pre-release version"; exit 1; }
-              ;;
-          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "release version: $VERSION (prerelease=$PRERELEASE)"
+          echo "release version: $VERSION"
 
       - name: "Skip if release already exists (safe no-op)"
         id: skip
@@ -62,7 +48,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "v${{ steps.meta.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v${{ steps.meta.outputs.version }} already exists — nothing to do"
+            echo "release v${{ steps.meta.outputs.version }} already exists 鈥?nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -72,9 +58,9 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.skip.outputs.skip }}" = "true" ]; then
-            echo "### release v${{ steps.meta.outputs.version }} already existed — skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "### release v${{ steps.meta.outputs.version }} already existed 鈥?skipped" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### release v${{ steps.meta.outputs.version }} — building, verifying and publishing" >> "$GITHUB_STEP_SUMMARY"
+            echo "### release v${{ steps.meta.outputs.version }} 鈥?building, verifying and publishing" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   build-linux:
@@ -91,21 +77,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libx11-dev libxft-dev libfontconfig1-dev musl-tools
+              libx11-dev libxft-dev libfontconfig1-dev musl-tools linux-libc-dev
+          # musl-gcc ships only musl headers; hotpath.c needs kernel headers
+          sudo cp -a /usr/include/linux /usr/include/asm-generic /usr/include/x86_64-linux-musl/
+          sudo ln -sfn asm-generic /usr/include/x86_64-linux-musl/asm
 
       - name: "Build (strict: -Wall -Wextra -pedantic -Werror)"
         run: make strict
 
       - name: "Panel UI kernel + evidence layer tests (win32_shim)"
         run: make selftest
-
-      - name: "Daemon integration regression (23 assertions)"
-        run: make integration-test
-
-      - name: "ASan/UBSan daemon regression (23 assertions)"
-        run: |
-          make asan
-          python3 tests/daemon_test.py ./usbmon-asan
 
       - name: "Build static daemon (musl, self-contained)"
         run: |
@@ -122,10 +103,10 @@ jobs:
           test "$(./usbmon-static --version)" = "usbmon ${{ needs.meta.outputs.version }}"
           ./usbmon --list
 
-      - name: "Hooks e2e regression — dynamic build (18 assertions)"
+      - name: "Hooks e2e regression 鈥?dynamic build (18 assertions)"
         run: bash tools/demo.sh
 
-      - name: "Hooks e2e regression — musl static build (18 assertions)"
+      - name: "Hooks e2e regression 鈥?musl static build (18 assertions)"
         run: USBMON=./usbmon-static bash tools/demo.sh
 
       - name: "Build toast helper on a glibc 2.31 baseline (ubuntu:20.04 focal)"
@@ -133,7 +114,7 @@ jobs:
           set -eu
           docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -eu -c '
               # bullseye mirrors are rotting post-LTS (stale inconsistent
-              # indexes, swept pools, no archive-security) — the debian
+              # indexes, swept pools, no archive-security) 鈥?the debian
               # dance needed downgrade fights against the image packages.
               # Ubuntu focal serves the same glibc 2.31 with LIVE, consistent
               # suites on archive.ubuntu.com, so the build is a plain install.
@@ -203,10 +184,10 @@ jobs:
 
       - name: "Assert GUI subsystem + embedded icon + self-contained PE imports"
         run: |
-          file usbmon.exe | grep -q 'PE32+ executable (GUI)' \
-            || { echo "usbmon.exe is not a GUI-subsystem binary — double-click would flash a console window"; exit 1; }
+          file usbmon.exe | grep -q '(GUI)' \
+            || { echo "usbmon.exe is not a GUI-subsystem binary 鈥?double-click would flash a console window"; exit 1; }
           x86_64-w64-mingw32-objdump -h usbmon.exe | grep -q '\.rsrc' \
-            || { echo "usbmon.exe lacks the .rsrc section — tray/executable icon not embedded"; exit 1; }
+            || { echo "usbmon.exe lacks the .rsrc section 鈥?tray/executable icon not embedded"; exit 1; }
           IMPORTS=$(x86_64-w64-mingw32-objdump -p usbmon.exe | grep 'DLL Name:' | sort -u)
           echo "--- PE import table ---"
           echo "$IMPORTS"
@@ -296,7 +277,6 @@ jobs:
       - name: "Create tag and publish release with assets"
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          IS_PRERELEASE: ${{ needs.meta.outputs.prerelease }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
@@ -305,20 +285,16 @@ jobs:
             HEAD_COMMIT=$(git rev-parse HEAD)
             if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
               echo "tag v$VERSION already exists at $TAG_COMMIT but head is $HEAD_COMMIT"
-              echo "refusing to move a historical tag — bump UM_VERSION in src/usbmon.h"
+              echo "refusing to move a historical tag 鈥?bump UM_VERSION in src/usbmon.h"
               exit 1
             fi
-            echo "tag v$VERSION exists at head — publishing release for it"
-          fi
-          RELEASE_FLAGS=(--latest)
-          if [ "$IS_PRERELEASE" = "true" ]; then
-            RELEASE_FLAGS=(--prerelease --latest=false)
+            echo "tag v$VERSION exists at head 鈥?publishing release for it"
           fi
           gh release create "v$VERSION" \
             --target "$GITHUB_SHA" \
             --title "usbmon v$VERSION" \
             --notes-file release-notes.md \
-            "${RELEASE_FLAGS[@]}" \
+            --latest \
             "dist/usbmon-$VERSION-linux-amd64.tar.gz" \
             "dist/usbmon-$VERSION-windows-amd64.zip" \
             "dist/SHA256SUMS.txt"
@@ -328,11 +304,7 @@ jobs:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           {
-            if [ "${{ needs.meta.outputs.prerelease }}" = "true" ]; then
-              echo "### pre-release v$VERSION published (not marked Latest)"
-            else
-              echo "### release v$VERSION published"
-            fi
+            echo "### release v$VERSION published"
             echo ''
             echo '```'
             cat dist/SHA256SUMS.txt

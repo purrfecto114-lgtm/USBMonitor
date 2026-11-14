@@ -1,15 +1,15 @@
-# USBMonitor 2.6.0-rc.1
+# USBMonitor 2.6.0
 
 原生 C99 外接存储监控。Windows 提供托盘与设备概览，Linux 提供命令行和可选的 X11 通知。守护进程合并短时间内的设备事件，并按间隔复核设备清单。
 
-这是 2.6.0 的预发布候选版（`2.6.0-rc.1`），尚未替代最新稳定版。诊断记录包含基线结果、技术取舍、已测范围和真机验收项。[诊断与验证](docs/DIAGNOSTIC.md)
+诊断记录包含基线结果、技术取舍、已测范围和真机验收项。[诊断与验证](docs/DIAGNOSTIC.md) · [界面预览](docs/USBMonitor-preview.png)
 
 ## 开始使用
 
 | 平台 | 入口 | 操作 |
 | --- | --- | --- |
-| Windows x64 | 下载 Release 资产 `usbmon-2.6.0-rc.1-windows-amd64.zip`，解压后双击 `usbmon.exe` | 托盘左键查看卷和设备概览，右键重新扫描、打开日志与配置目录、管理自启动或退出。 |
-| Linux x86-64 | 下载 `usbmon-2.6.0-rc.1-linux-amd64.tar.gz`，解压后运行 `./usbmon` | 静态守护进程。有 X11 和 Xft 时，同目录下的 `usbmon-toast` 显示通知。 |
+| Windows x64 | 双击 `bin/windows-amd64/usbmon.exe` | 托盘左键查看卷和设备概览，右键重新扫描、打开日志与配置目录、管理自启动或退出。 |
+| Linux x86-64 | `./bin/linux-amd64/usbmon` | 直接启动静态守护进程。有 X11 和 Xft 时，同目录下的 `usbmon-toast` 显示通知。 |
 
 在 Windows 终端中将下列命令里的 `./usbmon` 换成 `./usbmon.exe`。Windows 可执行文件使用 GUI 子系统，自动化脚本应显式等待进程退出，例如 PowerShell 的 `Start-Process -Wait -PassThru`。
 
@@ -77,4 +77,4 @@ Linux GUI 构建需要 `pkg-config`、`libx11-dev` 和 `libxft-dev`。静态守�
 
 `src/main.c` 负责调度，`src/state.c` 负责快照持久化。Windows 的 `um_enum.c` 采集设备证据，`scan_win32.c` 将同一批证据投影到存储事件和 UI。Linux 的 `scan_linux.c` 读取 sysfs，`hotpath.c` 接收设备变化。原生窗口、托盘动作与 UI 布局分别位于 `gui_win32.c`、`tray_win32.c` 和 `um_toast_ui.c`。
 
-下载 Linux、Windows 资产和 `SHA256SUMS.txt` 后，将它们放在同一目录执行 `sha256sum -c SHA256SUMS.txt`，检查发行包完整性。
+发行包内 `bin/SHA256SUMS.txt` 对应已构建二进制。可在 `bin` 目录执行 `sha256sum -c SHA256SUMS.txt` 检查完整性。

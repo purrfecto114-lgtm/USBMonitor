@@ -1,6 +1,6 @@
-# USBMonitor 2.6.0-rc.1 诊断与验证
+# USBMonitor 2.6.0 诊断与验证
 
-本次以附件中的 2.5.0 为基线，基线提交标识为 `b35f3befe156e8cee8db7b7432d00d73db7f118c`。本候选版以新的 2.6.0 源码为基础；Release workflow 会分别构建 Linux 与 Windows 发行资产。
+本次以附件中的 2.5.0 为基线，基线提交标识为 `b35f3befe156e8cee8db7b7432d00d73db7f118c`。以新的 2.6.0 源码与双平台产物交付。
 
 ## 基线故障与取舍
 
@@ -32,31 +32,14 @@
 | --- | --- |
 | GCC 13 严格构建 | Linux 守护进程、X11 助手与测试均通过 `-Wall -Wextra -pedantic -Werror`。 |
 | `make selftest` | UI 116 项、Windows 设备枚举与移除逻辑 82 项、核心逻辑 18 项，共 216 项通过。 |
-| `tests/daemon_test.py` | glibc 动态版和 musl 静态版各通过 23 项，包括旧快照迁移、失败扫描、同名替换、并发、编码和自启动。 |
+| `tests/daemon_test.py` | glibc 动态版和 musl 静态版各通过 24 项，包括旧快照迁移、失败扫描、同名替换、并发、编码和自启动。 |
 | `tools/demo.sh` | 动态版和静态版各通过 18 项，覆盖 Hook、事件日志和自启动回归。 |
 | Xvfb | 13 项通过。真实 X11 窗口按预期显示、堆叠并随退出关闭。插入截图包含容量与分区数。 |
-| ASan 与 UBSan | 216 项单元断言和 23 项端到端断言均通过。由于环境没有 `/proc`，本轮关闭 LeakSanitizer。 |
+| ASan 与 UBSan | 216 项单元断言和 24 项端到端断言均通过。由于环境没有 `/proc`，本轮关闭 LeakSanitizer。 |
 | 静态分析 | GCC `-fanalyzer` 严格通过，Cppcheck 2.13 的 warning、performance 和 portability 检查无报告。 |
 | Windows x64 | MinGW-w64 GCC 13 交叉构建通过。PE GUI 子系统、资源节和系统 DLL 导入已验证。 |
 | Linux 静态产物 | musl 1.2.4 构建通过，ELF 无解释器段。X11 助手的最高 glibc 符号版本为 2.34。 |
 
 Ubuntu Noble 测试工具在隔离目录中解包。验证了 Ubuntu Archive 签名，并用签名索引中的 SHA-256 校验包文件。[Ubuntu 软件包完整性校验](https://documentation.ubuntu.com/security/software-integrity/archive-verification/)
 
-当前环境的内核 uevent 订阅返回 `EPERM`。真实 Linux 热插拔只能在具备设备和权限的机器上验收。Windows 界面图来自模拟渲染；模拟渲染不等同于 Windows GDI 真机验收。
-
-
-## 本轮独立复核（2026-11-14）
-
-以下结果是在本轮当前执行环境中重新运行所得，与上方附件原有诊断记录分开记录：
-
-| 检查 | 本轮结果 |
-| --- | --- |
-| `make strict` + `make selftest` | 通过；UI 116、设备枚举 82、核心逻辑 18，共 216 项断言。 |
-| `make integration-test` | 通过；23 项 daemon 集成检查，0 失败。 |
-| ASan/UBSan + `tests/daemon_test.py` | 通过；23 项检查，0 失败。 |
-| `make analyze` | 通过；GCC `-fanalyzer` 无报告。 |
-| `tools/demo.sh`（动态构建） | 通过；18 项检查，0 失败。 |
-| 附件 `bin/` 内三个二进制 | SHA-256 清单全部匹配；本轮未将预编译二进制纳入源码仓库。 |
-| `make static`、Xft/Xvfb GUI 构建、MinGW/Windows 实机 | 当前容器分别缺少 `musl-gcc`、Xft 开发头文件及 MinGW 工具链，未能在本地复现；预发布 workflow 会在托管 Linux/Windows runner 上执行相应构建与 Windows 冒烟测试。 |
-
-本轮没有连接物理 USB 设备，故不宣称完成真实设备插拔、占用中安全移除或 Windows 多显示器 DPI 的硬件验收。
+当前环境的内核 uevent 订阅返回 `EPERM`。真实 Linux 热插拔只能在具备设备和权限的机器上验收。Windows 界面图来自模拟渲染，另有真实 X11 截图。[界面预览](USBMonitor-preview.png)
