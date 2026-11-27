@@ -688,7 +688,9 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             }
         } else if (wp == UM_TIMER_ANIM) {
             int elapsed = (int)GetTickCount() - w->anim_start;
-            int t = elapsed / UM_ANIM_MS;
+            /* t 是 0..100 的百分比（不是毫秒）：ease-out 公式按百分比算。 */
+            int t = elapsed * 100 / UM_ANIM_MS;
+            if (elapsed < 0) t = 0;
             if (t >= 100) {
                 w->animating = 0;
                 KillTimer(hw, UM_TIMER_ANIM);

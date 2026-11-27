@@ -17,6 +17,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - 键盘 Tab / 方向键只遍历可见行，隐藏的非存储设备不会被选中。
+- 展开/收起缓动的百分比换算：动画在 160ms 内真正结束，不再数秒停在过渡高度。
 
 ## [2.6.1] · 2026-11-15
 
