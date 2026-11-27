@@ -17,6 +17,12 @@ static int          g_win_alpha;
 static int          g_next_menu_cmd;
 static int          g_menu_items;
 
+/* 触摸注入队列 + 触摸提升成鼠标的签名（供触摸/鼠标抑制回归）。 */
+#define SHIM_MAXTOUCH 16
+static TOUCHINPUT g_touch[SHIM_MAXTOUCH];
+static int         g_ntouch, g_touch_head;
+static unsigned long long g_extra_info;
+
 static int g_font_px = 13, g_font_bold = 0;
 static int g_font_px_arr[SHIM_MAXOBJ], g_font_bold_arr[SHIM_MAXOBJ];
 static unsigned long g_text_color = 0x000000;
@@ -51,7 +57,43 @@ void shim_reset(void)
     g_screen_w = 1920; g_screen_h = 1080;
     g_work_w = 1920; g_work_h = 1040;
     g_dpi = 96;
+    g_ntouch = g_touch_head = 0;
+    g_extra_info = 0;
 }
+
+void shim_touch_reset(void) { g_ntouch = g_touch_head = 0; }
+
+void shim_touch_push(DWORD flags, int x100, int y100, DWORD id)
+{
+    TOUCHINPUT *t;
+    if (g_ntouch >= SHIM_MAXTOUCH) return;
+    t = &g_touch[g_ntouch++];
+    memset(t, 0, sizeof *t);
+    t->x = x100; t->y = y100; t->dwID = id; t->dwFlags = flags;
+}
+
+BOOL RegisterTouchWindow(HWND hw, ULONG flags)
+{
+    (void)hw; (void)flags; return TRUE;
+}
+
+BOOL GetTouchInputInfo(void *h, UINT count, TOUCHINPUT *out, int cb)
+{
+    UINT i;
+    (void)h;
+    if (!out || cb < (int)sizeof(TOUCHINPUT)) return FALSE;
+    for (i = 0; i < count && g_touch_head < g_ntouch; i++)
+        out[i] = g_touch[g_touch_head++];
+    g_ntouch = g_touch_head = 0;
+    return TRUE;
+}
+
+BOOL CloseTouchInputHandle(void *h) { (void)h; return TRUE; }
+
+void shim_set_extra_info(unsigned long long v) { g_extra_info = v; }
+unsigned long long shim_get_extra_info(void) { return g_extra_info; }
+unsigned long long GetMessageExtraInfo(void) { return g_extra_info; }
+DWORD GetTickCount(void) { return 0; }
 
 void shim_set_next_menu_result(int cmd) { g_next_menu_cmd = cmd; }
 

@@ -25,12 +25,15 @@ typedef void *HMENU;
 typedef void *HMODULE;
 typedef void *HKEY;
 typedef uint32_t DWORD;
+typedef unsigned long ULONG;
 typedef unsigned char BYTE;
 typedef int BOOL;
 typedef unsigned int UINT;
 typedef unsigned long COLORREF;
 typedef long LONG;
-typedef long LONG_PTR;
+/* LP64/LLP64 都要放得下函数指针：Linux 上 long == 64 位，Windows 上 long
+ * 只有 32 位；显式用 int64_t 才能在本机 MinGW 上也跑 shim 测试。 */
+typedef int64_t LONG_PTR;
 typedef unsigned long long WPARAM;
 typedef long long LPARAM;
 typedef long long LRESULT;
@@ -88,7 +91,33 @@ typedef struct {
 #define WM_DPICHANGED    0x02E0
 #define WM_NULL          0x0000
 #define WM_MOUSEWHEEL    0x020A
+#define WM_TOUCH         0x0240
 #define WHEEL_DELTA      120
+
+/* 触摸仿真：测试用 shim_touch_push 注入事件，再 shim_send(WM_TOUCH, n, 1)。
+ * TOUCHINPUT.x/y 与 Win32 一致，单位是 1/100 像素。 */
+typedef unsigned long ULONG_PTR;
+#define TWF_WANTPALM      0x00000002
+#define TOUCHEVENTF_DOWN  0x0001
+#define TOUCHEVENTF_MOVE  0x0002
+#define TOUCHEVENTF_UP    0x0004
+typedef struct {
+    LONG x, y;
+    DWORD dwID;
+    DWORD dwFlags;
+    DWORD dwTime;
+    ULONG_PTR dwExtraInfo;
+} TOUCHINPUT;
+void shim_touch_reset(void);
+void shim_touch_push(DWORD flags, int x100, int y100, DWORD id);
+BOOL RegisterTouchWindow(HWND hw, ULONG flags);
+BOOL GetTouchInputInfo(void *h, UINT count, TOUCHINPUT *out, int cb);
+BOOL CloseTouchInputHandle(void *h);
+/* 注入系统“触摸被提升成鼠标”的签名（GetMessageExtraInfo）。 */
+void shim_set_extra_info(unsigned long long v);
+unsigned long long shim_get_extra_info(void);
+unsigned long long GetMessageExtraInfo(void);
+DWORD GetTickCount(void);
 
 #define VK_ESCAPE 0x1B
 #define VK_RETURN 0x0D

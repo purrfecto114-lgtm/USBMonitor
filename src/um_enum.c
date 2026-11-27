@@ -7,7 +7,7 @@
 #include <wchar.h>
 #include <wctype.h>
 
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
 #include <windows.h>
 #include <winioctl.h>
 #include <setupapi.h>

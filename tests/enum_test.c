@@ -249,7 +249,11 @@ int main(void)
                 }
                 CHECK(found);
             }
-            CHECK(strstr(m.subtitle, "个设备") != NULL);
+            /* 默认视图只讲存储设备；全部设备视图在 subtitle_all。 */
+            CHECK(strstr(m.subtitle, "个存储设备") != NULL);
+            CHECK(strstr(m.subtitle_all, "个设备") != NULL);
+            CHECK(m.n_storage >= 1 && m.n_storage <= m.n_rows);
+            CHECK(m.n_volumes >= 1);
         }
     }
 

@@ -52,6 +52,28 @@ static unsigned long accent_of(const um_theme *t, int kind)
     }
 }
 
+/* 主题没有 alpha 通道：用整数混合模拟半透明叠色。pct = 0..100。 */
+static unsigned long blend(unsigned long a, unsigned long b, int pct)
+{
+    int ar = (int)((a >> 16) & 0xFF), ag = (int)((a >> 8) & 0xFF), ab = (int)(a & 0xFF);
+    int br = (int)((b >> 16) & 0xFF), bg = (int)((b >> 8) & 0xFF), bb = (int)(b & 0xFF);
+    int r, g, bl;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    r  = (ar * (100 - pct) + br * pct) / 100;
+    g  = (ag * (100 - pct) + bg * pct) / 100;
+    bl = (ab * (100 - pct) + bb * pct) / 100;
+    return ((unsigned long)r << 16) | ((unsigned long)g << 8) | (unsigned long)bl;
+}
+
+/* 面板底色亮 = 浅色主题（图标壳体需要另一套配色）。 */
+static int theme_is_light(const um_theme *t)
+{
+    unsigned long c = t->panel;
+    int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+    return (r * 299 + g * 587 + b * 114) / 1000 > 140;
+}
+
 /* ------------------------------------------------------------ 文案工具集 -- */
 
 void um_ui_format_bytes(unsigned long long v, char *out, size_t n)
@@ -136,7 +158,15 @@ static um_draw *push(um_drawlist *out)
     return &out->items[out->n++];
 }
 
-/* 注：纯矩形图元未使用（当前布局只用圆角矩形），不定义 push_rect。 */
+static void push_rect(um_drawlist *o, int x, int y, int w, int h,
+                      unsigned long c, um_ui_hit hit)
+{
+    um_draw *d = push(o);
+    if (!d) return;
+    d->kind = UM_D_RECT; d->x = x; d->y = y; d->w = w; d->h = h;
+    d->color = c; d->hit = hit;
+}
+
 static void push_round(um_drawlist *o, int x, int y, int w, int h,
                        unsigned long c, int r, um_ui_hit hit)
 {
@@ -157,24 +187,17 @@ static void push_text(um_drawlist *o, int x, int y, int w, um_font f,
 }
 
 static void push_icon(um_drawlist *o, int x, int y, int w, int h,
-                      const char *status, unsigned long badge, unsigned long fg)
+                      const char *status, unsigned long badge, unsigned long fg,
+                      int theme_light)
 {
     um_draw *d = push(o);
     if (!d) return;
     d->kind = UM_D_ICON; d->x = x; d->y = y; d->w = w; d->h = h;
-    d->color = fg; d->color2 = badge;
+    d->color = fg; d->color2 = badge; d->theme_light = theme_light;
     snprintf(d->text, sizeof d->text, "%s", status);
 }
 
 /* --------------------------------------------------------------- 布局器 --- */
-
-static int model_has_openable(const um_toast_model *m)
-{
-    int i;
-    for (i = 0; i < m->n_rows; i++)
-        if (m->rows[i].openable) return 1;
-    return 0;
-}
 
 /* 图标状态：非存储设备用各自的标识（后端据此画不同角标/配色） */
 static const char *icon_status_for(um_dev_kind kind)
@@ -199,28 +222,99 @@ static void stroke(um_drawlist *out, int x, int y, int w, int h, int radius,
     if (out->n > index) out->items[index].stroke = 1;
 }
 
+static void push_line(um_drawlist *out, int x, int y, int dx, int dy,
+                      unsigned long color, int width, um_ui_hit hit)
+{
+    um_draw *d = push(out);
+    if (!d) return;
+    d->kind = UM_D_LINE;
+    d->x = x; d->y = y; d->w = dx; d->h = dy;
+    d->color = color; d->stroke = width > 0 ? width : 1; d->hit = hit;
+}
+
 static int row_top(void) { return 90; }
 static int button_top(int height) { return height - UM_UI_PAD - UM_UI_BTN_H; }
 
+/* ------------------------------------------------------- 视图过滤（新增）-- */
+
+int um_toast_row_is_storage(const um_volume *v)
+{
+    if (!v) return 0;
+    switch (v->kind) {
+    case UM_KIND_USB_STORAGE:
+    case UM_KIND_STORAGE_NO_LETTER:
+    case UM_KIND_EMPTY_SLOT:
+    case UM_KIND_LOCKED_VOLUME:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int um_toast_visible_count(const um_toast_model *m, const um_toast_state *s)
+{
+    int i, n = 0;
+    if (!m) return 0;
+    if (s->show_others) return m->n_rows;
+    for (i = 0; i < m->n_rows; i++)
+        if (um_toast_row_is_storage(&m->rows[i])) n++;
+    return n;
+}
+
+int um_toast_has_other(const um_toast_model *m)
+{
+    int i;
+    if (!m) return 0;
+    for (i = 0; i < m->n_rows; i++)
+        if (!um_toast_row_is_storage(&m->rows[i])) return 1;
+    return 0;
+}
+
+int um_toast_visible_row(const um_toast_model *m, const um_toast_state *s,
+                         int visible_index)
+{
+    int i, n = 0;
+    if (!m || visible_index < 0) return -1;
+    for (i = 0; i < m->n_rows; i++) {
+        if (!s->show_others && !um_toast_row_is_storage(&m->rows[i])) continue;
+        if (n == visible_index) return i;
+        n++;
+    }
+    return -1;
+}
+
+int um_toast_first_openable_row(const um_toast_model *m, const um_toast_state *s)
+{
+    int i, total = um_toast_visible_count(m, s);
+    for (i = 0; i < total; i++) {
+        int row = um_toast_visible_row(m, s, i);
+        if (row >= 0 && m->rows[row].openable) return row;
+    }
+    return -1;
+}
+
 int um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int height)
 {
-    int rows;
-    if (!m->n_rows) return 0;
+    int rows, total = um_toast_visible_count(m, s);
+    if (!total) return 0;
     if (!s->expanded) return 1;
     rows = (button_top(height) - 6 - row_top()) / UM_UI_ROW_H;
     if (rows < 1) rows = 1;
-    return rows < m->n_rows ? rows : m->n_rows;
+    return rows < total ? rows : total;
 }
 
 int um_toast_measure_height(const um_toast_model *m, const um_toast_state *s)
 {
+    int total = um_toast_visible_count(m, s);
     if (!m->n_rows && !m->overview) return m->status[0] ? 166 : 148;
-    if (s->expanded && m->n_rows > 1) {
-        int height = row_top() + m->n_rows * UM_UI_ROW_H + UM_UI_PAD + UM_UI_BTN_H + 6;
+    if (s->expanded && total > 1) {
+        int height = row_top() + total * UM_UI_ROW_H + UM_UI_PAD + UM_UI_BTN_H + 6;
         return height < UM_UI_EXPANDED_H ? height : UM_UI_EXPANDED_H;
     }
     return UM_UI_COLLAPSED_H;
 }
+
+/* ------------------------------------------------------------- 组件 ------ */
 
 static void button(um_drawlist *out, const um_theme *t, const um_toast_state *s,
                    int x, int y, int w, int h, um_ui_hit hit, const char *label,
@@ -236,113 +330,269 @@ static void button(um_drawlist *out, const um_theme *t, const um_toast_state *s,
               primary ? t->on_accent : t->text, UM_A_CENTER, label);
 }
 
+/* 底部文字按钮：无边框、hover 才有浅底（原型 A/B/C 的 foot 样式）。 */
+static void link_button(um_drawlist *out, const um_theme *t,
+                        const um_toast_state *s, int x, int y, int w, int h,
+                        um_ui_hit hit, const char *label)
+{
+    int hover = s->hover_btn == (int)hit;
+    unsigned long bg = hover ? blend(t->panel2, t->text, 8) : t->panel;
+    push_round(out, x, y, w, h, bg, 8, hit);
+    push_text(out, x, y + (h - 16) / 2, w, UM_F_SMALL,
+              hover ? t->text : t->muted, UM_A_CENTER, label);
+}
+
+/* 行内"打开卷"：透明底 + 细边框 + accent 文字。 */
+static void row_open_button(um_drawlist *out, const um_theme *t,
+                            const um_toast_state *s, int x, int y, int w, int h,
+                            um_ui_hit hit, const char *label)
+{
+    int hover = s->hover_btn == (int)hit;
+    unsigned long bg = hover ? blend(t->panel2, t->accent, 12) : t->panel2;
+    push_round(out, x, y, w, h, bg, 8, hit);
+    stroke(out, x, y, w, h, 8, hover ? t->accent : t->border);
+    push_text(out, x, y + (h - 16) / 2, w, UM_F_SMALL, t->accent, UM_A_CENTER, label);
+}
+
+/* 右上角 ✖：24×24 命中区，两笔 2px 线。 */
+static void close_button(um_drawlist *out, const um_theme *t,
+                         const um_toast_state *s, int x, int y)
+{
+    int hover = s->hover_btn == (int)UM_HIT_CLOSE;
+    unsigned long fg = hover ? t->text : t->muted;
+    push_round(out, x, y, 24, 24,
+               hover ? blend(t->panel2, t->text, 10) : t->panel, 7,
+               UM_HIT_CLOSE);
+    push_line(out, x + 7, y + 7, 10, 10, fg, 2, UM_HIT_NONE);
+    push_line(out, x + 17, y + 7, -10, 10, fg, 2, UM_HIT_NONE);
+}
+
+/* 8 点旋转指示：图标位变成加载环（原型 D）。 */
+static void spinner(um_drawlist *out, const um_theme *t,
+                    const um_toast_state *s, int x, int y, int size)
+{
+    static const int dx[8] = { 0, 9, 13, 9, 0, -9, -13, -9 };
+    static const int dy[8] = { -13, -9, 0, 9, 13, 9, 0, -9 };
+    int cx = x + size / 2, cy = y + size / 2, i;
+    push_round(out, x, y, size, size, t->panel2, 12, UM_HIT_NONE);
+    for (i = 0; i < 8; i++) {
+        int k = (i + s->spinner_phase) & 7;
+        unsigned long c = blend(t->panel2, t->accent, 15 + k * 11);
+        push_round(out, cx + dx[i] - 1, cy + dy[i] - 1, 3, 3, c, 2,
+                   UM_HIT_NONE);
+    }
+}
+
+/* 底部 3px 剩余时间条：暂停时停住并转暖色。 */
+static void progress_bar(um_drawlist *out, const um_theme *t,
+                         const um_toast_state *s, int width, int height)
+{
+    int fill = 0;
+    if (s->ttl_ms > 0 && s->remaining_ms > 0) {
+        int remain = s->remaining_ms > s->ttl_ms ? s->ttl_ms : s->remaining_ms;
+        fill = (int)((long long)width * remain / s->ttl_ms);
+        if (fill < 1) fill = 1;
+    }
+    push_rect(out, 0, height - 3, width, 3, t->progress, UM_HIT_NONE);
+    if (fill > 0)
+        push_rect(out, 0, height - 3, fill, 3,
+                  s->paused ? t->warn : t->accent, UM_HIT_NONE);
+}
+
+/* --------------------------------------------------------------- 布局器 --- */
+
 void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
                      const um_theme *t, int width, int height, um_drawlist *out)
 {
     const int p = UM_UI_PAD;
+    const int light = theme_is_light(t);
     int by = button_top(height);
-    int badge = m->count[0] ? 62 : 0;
+    int total = um_toast_visible_count(m, s);
+    int has_other = um_toast_has_other(m);
     int rows = um_toast_rows_visible(m, s, height);
     int first = s->expanded ? s->scroll_px / UM_UI_ROW_H : 0;
-    int i, has_open = !s->expanded && model_has_openable(m);
+    int first_open = um_toast_first_openable_row(m, s);
+    int i;
     unsigned long accent = accent_of(t, m->accent_kind);
-    char countdown[64];
+    const char *subtitle = (s->show_others && m->subtitle_all[0])
+                           ? m->subtitle_all : m->subtitle;
+    const char *count = (s->show_others && m->count_all[0])
+                        ? m->count_all : m->count;
+    const char *summary = (s->show_others && m->summary_all[0])
+                          ? m->summary_all : m->summary;
+    char summary_buf[UM_UI_MAX_TEXT];
+    int badge_w = count[0] ? 60 : 0;   /* 54 徽章 + 6 间距 */
+    int head_w;
 
     out->n = 0;
     push_round(out, 0, 0, width, height, t->panel, 18, UM_HIT_NONE);
     stroke(out, 1, 1, width - 2, height - 2, 17, t->border);
+
+    /* 标题区：图标 / 标题 / 副标题 / 数量徽章 / 右上 ✖ */
     push_round(out, p, p, 38, 38, t->panel2, 12, UM_HIT_NONE);
-    push_icon(out, p + 6, p + 6, 27, 27,
-              m->accent_kind == 1 ? "add" : m->accent_kind == 3 ? "remove" : "usb",
-              accent, t->text);
-    push_text(out, p + 49, p + 1, width - 2 * p - 49 - badge, UM_F_TITLE,
-              t->text, UM_A_LEFT, m->headline);
-    push_text(out, p + 49, p + 24, width - 2 * p - 49 - badge, UM_F_SMALL,
-              t->muted, UM_A_LEFT, m->subtitle);
-    if (badge) {
-        push_round(out, width - p - 54, p + 3, 54, 26, t->panel2, 12, UM_HIT_NONE);
-        push_text(out, width - p - 54, p + 9, 54, UM_F_SMALL,
-                  t->text, UM_A_CENTER, m->count);
+    if (m->scanning) {
+        spinner(out, t, s, p, p, 38);
+    } else {
+        push_icon(out, p + 6, p + 6, 27, 27,
+                  m->accent_kind == 1 ? "add" :
+                  m->accent_kind == 3 ? "remove" : "usb",
+                  accent, t->text, light);
     }
-    if (m->summary[0] || m->status[0]) {
+    head_w = width - (p + 49) - p - badge_w - 24 - 6;
+    if (head_w < 60) head_w = 60;
+    push_text(out, p + 49, p + 1, head_w, UM_F_TITLE,
+              t->text, UM_A_LEFT, m->headline);
+    push_text(out, p + 49, p + 24, head_w, UM_F_SMALL,
+              t->muted, UM_A_LEFT, subtitle);
+    if (badge_w) {
+        push_round(out, width - p - 24 - 6 - 54, p + 3, 54, 26,
+                   t->panel2, 12, UM_HIT_NONE);
+        push_text(out, width - p - 24 - 6 - 54, p + 9, 54, UM_F_SMALL,
+                  t->text, UM_A_CENTER, count);
+    }
+    close_button(out, t, s, width - p - 24, p + 1);
+
+    /* 摘要行 */
+    if (!summary[0] && !m->status[0]) {
+        if (total > 0)
+            snprintf(summary_buf, sizeof summary_buf, "%d 个存储设备已就绪", total);
+        else if (m->n_rows)
+            snprintf(summary_buf, sizeof summary_buf, "%s", "未检测到存储设备");
+        else
+            snprintf(summary_buf, sizeof summary_buf, "%s", "当前没有检测到外接设备");
+        summary = summary_buf;
+    }
+    if (m->scanning) {
+        if (summary[0]) {
+            push_round(out, p, 62, 3, 18, accent, 2, UM_HIT_NONE);
+            push_text(out, p + 12, 63, width - 2 * p - 12, UM_F_BODY,
+                      t->muted, UM_A_LEFT, summary);
+        }
+        if (m->status[0])
+            push_text(out, p + 12, 86, width - 2 * p - 12, UM_F_SMALL,
+                      t->muted, UM_A_LEFT, m->status);
+    } else if (m->status[0] || summary[0]) {
         push_round(out, p, 62, 3, 18, accent, 2, UM_HIT_NONE);
         push_text(out, p + 12, 63, width - 2 * p - 12, UM_F_BODY,
-                  t->muted, UM_A_LEFT, m->status[0] ? m->status : m->summary);
+                  t->muted, UM_A_LEFT, m->status[0] ? m->status : summary);
     }
 
-    if (first + rows > m->n_rows) first = m->n_rows - rows;
-    for (i = 0; i < rows; i++) {
-        int index = first + i, y = row_top() + i * UM_UI_ROW_H;
-        const um_volume *v = &m->rows[index];
-        int row_w = width - 2 * p - (s->expanded && rows < m->n_rows ? 8 : 0);
-        int row_h = UM_UI_ROW_H - 8;
-        int right = p + row_w;
-        int text_w = row_w - 58 - (s->expanded && v->openable ? 80 : 12);
-        int hover = index == s->hover_row || index == s->focus_row;
-        unsigned long edge = hover ? t->accent : t->border;
-        const char *capacity = v->capacity;
-        char formatted[128];
-
-        push_round(out, p, y, row_w, row_h, t->panel2, 12,
-                   (um_ui_hit)(UM_HIT_ROW + index));
-        stroke(out, p, y, row_w, row_h, 12, edge);
-        push_icon(out, p + 12, y + 13, 29, 29, icon_status_for(v->kind),
-                  v->openable ? t->accent : t->muted, t->text);
-        push_text(out, p + 54, y + 10, text_w, UM_F_ROWTITLE, t->text, UM_A_LEFT, v->title);
-        push_text(out, p + 54, y + 30, text_w, UM_F_SMALL, t->muted, UM_A_LEFT, v->subtitle);
-        if (!capacity[0] && v->total) {
-            um_ui_capacity_line(v, formatted, sizeof formatted);
-            capacity = formatted;
-        }
-        if (capacity[0])
-            push_text(out, p + 54, y + 52, row_w - (v->pct >= 0 ? 152 : 64),
-                      UM_F_SMALL, t->muted, UM_A_LEFT, capacity);
-        if (v->total && v->pct >= 0) {
-            int pct = v->pct > 100 ? 100 : v->pct;
-            push_round(out, right - 80, y + 56, 68, 5, t->progress, 3, UM_HIT_NONE);
-            if (pct > 0) push_round(out, right - 80, y + 56, 68 * pct / 100, 5,
-                                    t->accent, 3, UM_HIT_NONE);
-        }
-        if (s->expanded && v->openable)
-            button(out, t, s, right - 74, y + 12, 62, 31,
-                   (um_ui_hit)(UM_HIT_ROW_OPEN + index), "打开", 0);
-    }
-    if (s->expanded && rows > 0 && rows < m->n_rows) {
-        int track = rows * UM_UI_ROW_H - 8;
-        int thumb = track * rows / m->n_rows;
-        if (thumb < 16) thumb = 16;
-        push_round(out, width - p - 4, row_top(), 4, track, t->progress, 2, UM_HIT_NONE);
-        push_round(out, width - p - 4, row_top() + (track - thumb) * first / (m->n_rows - rows),
-                   4, thumb, t->muted, 2, UM_HIT_NONE);
-    }
-
-    if (s->paused) snprintf(countdown, sizeof countdown, "计时已暂停");
-    else um_ui_countdown(s->remaining_ms, countdown, sizeof countdown);
+    /* 0 行：纯文字信息框 / 扫描提示，点任意处关闭 */
     if (!m->n_rows && !m->overview) {
-        push_text(out, p, by + 12, width - 2 * p, UM_F_SMALL,
-                  t->muted, UM_A_RIGHT, countdown);
+        progress_bar(out, t, s, width, height);
         return;
     }
-    if (!m->n_rows)
+
+    /* 行区 */
+    if (total == 0) {
         push_round(out, p, row_top(), width - 2 * p, UM_UI_ROW_H - 8,
                    t->panel2, 12, UM_HIT_NONE);
-    if (!m->n_rows)
-        push_text(out, p, row_top() + 27, width - 2 * p, UM_F_BODY,
-                  t->muted, UM_A_CENTER, "接入设备后会自动更新");
+        push_text(out, p, row_top() + 18, width - 2 * p, UM_F_BODY,
+                  t->muted, UM_A_CENTER,
+                  m->n_rows ? "未检测到存储设备" : "接入设备后会自动更新");
+        if (has_other)
+            push_text(out, p, row_top() + 42, width - 2 * p, UM_F_SMALL,
+                      t->muted, UM_A_CENTER, "点击下方“显示其他设备”查看全部");
+    } else {
+        if (first + rows > total) first = total - rows;
+        if (first < 0) first = 0;
+        for (i = 0; i < rows; i++) {
+            int index = um_toast_visible_row(m, s, first + i);
+            int y = row_top() + i * UM_UI_ROW_H;
+            const um_volume *v;
+            int row_w, row_h, right, text_w, stor, show_open, show_tag;
+            int ctrl_w, meta_w, hover;
+            unsigned long edge;
+            const char *cap = "";
+            char cap_buf[64];
 
-    if (m->n_rows > 1)
-        button(out, t, s, p, by, 90, UM_UI_BTN_H, UM_HIT_EXPAND,
-               s->expanded ? "收起列表" : "展开列表", 0);
-    {
-        int close_x = p + (m->n_rows > 1 ? 98 : 0);
-        int text_x = close_x + 70;
-        int text_right = has_open ? width - p - 126 : width - p;
-        button(out, t, s, close_x, by, 66, UM_UI_BTN_H, UM_HIT_CLOSE, "关闭", 0);
-        push_text(out, text_x, by + 14, text_right - text_x, UM_F_SMALL,
-                  t->muted, UM_A_RIGHT, countdown);
+            if (index < 0) continue;
+            v = &m->rows[index];
+            row_w = width - 2 * p - (s->expanded && total > rows ? 8 : 0);
+            row_h = UM_UI_ROW_H - 8;
+            right = p + row_w;
+            stor = um_toast_row_is_storage(v);
+            show_open = s->expanded && stor && v->openable;
+            show_tag = !stor;
+            ctrl_w = show_open ? 74 : show_tag ? 68 : 0;
+            meta_w = (stor && (v->total || v->capacity[0])) ? 76 : 0;
+            text_w = row_w - 58 - ctrl_w - meta_w - 8;
+            if (text_w < 40) text_w = 40;
+            hover = index == s->hover_row || index == s->focus_row;
+            edge = hover ? t->accent : t->border;
+
+            push_round(out, p, y, row_w, row_h, t->panel2, 12,
+                       (um_ui_hit)(UM_HIT_ROW + index));
+            stroke(out, p, y, row_w, row_h, 12, edge);
+            push_round(out, p + 12, y + 13, 29, 29,
+                       blend(t->panel2, (stor && v->openable) ? t->accent : t->muted, 10),
+                       9, UM_HIT_NONE);
+            push_icon(out, p + 16, y + 17, 21, 21, icon_status_for(v->kind),
+                      v->openable ? t->accent : t->muted, t->text, light);
+            push_text(out, p + 54, y + 10, text_w, UM_F_ROWTITLE,
+                      t->text, UM_A_LEFT, v->title);
+            push_text(out, p + 54, y + 30, text_w, UM_F_SMALL,
+                      t->muted, UM_A_LEFT, v->subtitle);
+
+            if (stor) {
+                if (v->total) {
+                    um_ui_format_bytes(v->total, cap_buf, sizeof cap_buf);
+                    cap = cap_buf;
+                } else if (v->capacity[0]) {
+                    cap = v->capacity;
+                }
+                if (cap[0])
+                    push_text(out, right - ctrl_w - 72, y + 13, 68,
+                              UM_F_SMALL, t->muted, UM_A_RIGHT, cap);
+                if (v->total && v->pct >= 0) {
+                    int pct = v->pct > 100 ? 100 : v->pct;
+                    push_round(out, right - ctrl_w - 68, y + 35, 64, 4,
+                               t->progress, 2, UM_HIT_NONE);
+                    if (pct > 0)
+                        push_round(out, right - ctrl_w - 68, y + 35,
+                                   64 * pct / 100, 4, accent, 2, UM_HIT_NONE);
+                }
+            }
+            if (show_tag) {
+                push_round(out, right - 64, y + 27, 52, 22, t->panel2, 11,
+                           UM_HIT_NONE);
+                stroke(out, right - 64, y + 27, 52, 22, 11, t->border);
+                push_text(out, right - 64, y + 31, 52, UM_F_SMALL,
+                          t->muted, UM_A_CENTER, "非存储");
+            }
+            if (show_open)
+                row_open_button(out, t, s, right - 74, y + 12, 62, 31,
+                                (um_ui_hit)(UM_HIT_ROW_OPEN + index), "打开卷");
+        }
+        if (s->expanded && rows > 0 && rows < total) {
+            int track = rows * UM_UI_ROW_H - 8;
+            int thumb = track * rows / total;
+            if (thumb < 16) thumb = 16;
+            push_round(out, width - p - 4, row_top(), 4, track,
+                       t->progress, 2, UM_HIT_NONE);
+            push_round(out, width - p - 4,
+                       row_top() + (track - thumb) * first / (total - rows),
+                       4, thumb, t->muted, 2, UM_HIT_NONE);
+        }
     }
-    if (has_open)
-        button(out, t, s, width - p - 118, by, 118, UM_UI_BTN_H, UM_HIT_OPEN, "打开卷", 1);
+
+    /* 底部：收起/展开、显示其他设备、打开U盘 */
+    {
+        int lx = p;
+        if (total > 1) {
+            link_button(out, t, s, lx, by + 5, 90, 32, UM_HIT_EXPAND,
+                        s->expanded ? "收起列表" : "展开列表");
+            lx += 98;
+        }
+        if (has_other)
+            link_button(out, t, s, lx, by + 5, 112, 32, UM_HIT_SHOW_OTHERS,
+                        s->show_others ? "隐藏其他设备" : "显示其他设备");
+        if (!s->expanded && first_open >= 0)
+            button(out, t, s, width - p - 118, by, 118, UM_UI_BTN_H,
+                   UM_HIT_OPEN, "打开U盘", 1);
+    }
+
+    progress_bar(out, t, s, width, height);
 }
 
 um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
@@ -369,7 +619,11 @@ um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
 int um_toast_max_scroll(const um_toast_model *m, const um_toast_state *s,
                         int height)
 {
-    return s->expanded ? (m->n_rows - um_toast_rows_visible(m, s, height)) * UM_UI_ROW_H : 0;
+    int total, rows;
+    if (!s->expanded) return 0;
+    total = um_toast_visible_count(m, s);
+    rows = um_toast_rows_visible(m, s, height);
+    return (total - rows > 0) ? (total - rows) * UM_UI_ROW_H : 0;
 }
 
 /* ============================================================== 新增能力 ==

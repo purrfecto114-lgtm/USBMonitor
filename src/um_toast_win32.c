@@ -2,7 +2,7 @@
 #include "um_toast_ui.h"
 #include "um_toast_win32.h"
 
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
 #include <windows.h>
 #include <shellapi.h>
 #else
@@ -19,10 +19,14 @@
 
 /* ------------------------------------------------------------------ 窗口 -- */
 
-#define UM_TIMER_TICK   1
-#define UM_TIMER_FADE   2
-#define UM_TICK_MS      100
-#define UM_FADE_STEP    34
+#define UM_TIMER_TICK      1
+#define UM_TIMER_FADE      2
+#define UM_TIMER_LONGPRESS 3
+#define UM_TIMER_ANIM      4
+#define UM_TICK_MS         100
+#define UM_FADE_STEP       34
+#define UM_LONGPRESS_MS    550
+#define UM_ANIM_MS         160
 
 struct um_toast_win {
     HWND             hwnd;
@@ -39,15 +43,26 @@ struct um_toast_win {
     int              topmost;
     int              tracking;          /* TrackMouseEvent 已注册 */
     int              alpha;             /* 0..255 淡入 */
-    int              last_sec;          /* 上次重画时的倒计时秒（-1 = 已暂停） */
     um_toast_cb      cb;
     void            *user;
+
+    /* 触摸：只跟踪第一根手指（面板不是多点手势界面）。 */
+    int              touch_active;
+    DWORD            touch_id;
+    int              touch_x, touch_y;  /* 按下点（逻辑坐标） */
+    int              touch_last_y;
+    int              touch_moved;
+    int              touch_long_fired;
+    int              touch_scrolling;
+
+    /* 展开/收起高度缓动（真 Win32；shim 测试保持瞬时）。 */
+    int              anim_from, anim_to, anim_start, animating;
 };
 
 static HINSTANCE g_hinst;              /* um_toast_win_init 设定一次 */
 
 /* 文本绘制的签名差异：Windows 要 LPCWSTR(16 位)，shim 用显式 uint16_t。 */
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
 #define UM_TXT(x) ((LPCWSTR)(x))
 #else
 #define UM_TXT(x) ((const uint16_t *)(x))
@@ -77,6 +92,18 @@ static int to_logical(const struct um_toast_win *w, int phys)
 {
     double f = ui_factor(w);
     return (f < 0.01) ? phys : (int)(phys / f);
+}
+
+/* 触摸被系统“提升”成鼠标消息时，GetMessageExtraInfo 的签名是 0xFF5157xx。
+ * 不忽略它们的话，一次轻点会先走 WM_TOUCH 再走 WM_LBUTTONUP，动作触发
+ * 两次（按钮还会闪两下）。 */
+static int is_touch_mouse(void)
+{
+#ifndef UM_WIN32_SHIM
+    return ((ULONG_PTR)GetMessageExtraInfo() & 0xFFFFFF00UL) == 0xFF515700UL;
+#else
+    return shim_get_extra_info() != 0;
+#endif
 }
 
 /* 传给 make_font 的 DPI：等价于把字号直接乘 ui_factor，避免两套取整。 */
@@ -110,13 +137,17 @@ static const wchar_t *font_face(void)
 /* 与 1.1.1 usb_svg() 同构的 USB 图标：外壳 + trident + 右下角状态角标。 */
 static void draw_usb_icon(HDC hdc, int x, int y, int w, int h,
                           const char *status, unsigned long badge_rgb,
-                          unsigned long fg_rgb)
+                          unsigned long fg_rgb, int theme_light)
 {
-    HBRUSH shell = CreateSolidBrush(cref(0x2d3746));
-    HBRUSH socket = CreateSolidBrush(cref(0x3d4a5c));
+    /* 浅色主题不能沿用暗色壳体（会像一块深色补丁）。 */
+    unsigned long shell_c  = theme_light ? 0xdfe8f4 : 0x2d3746;
+    unsigned long socket_c = theme_light ? 0xf7fafd : 0x3d4a5c;
+    unsigned long pen_c    = theme_light ? 0xb9c9dc : 0x55708f;
+    HBRUSH shell = CreateSolidBrush(cref(shell_c));
+    HBRUSH socket = CreateSolidBrush(cref(socket_c));
     HBRUSH badge = CreateSolidBrush(cref(badge_rgb));
     HBRUSH light = CreateSolidBrush(cref(fg_rgb));
-    HPEN   pen = CreatePen(PS_SOLID, 1, cref(0x55708f));
+    HPEN   pen = CreatePen(PS_SOLID, 1, cref(pen_c));
     HPEN   mark = CreatePen(PS_SOLID, 2, cref(0xffffff));
     HPEN   oldp;
     HBRUSH oldb;
@@ -255,8 +286,16 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
             DeleteObject(pen);
             break;
         }
-        case UM_D_LINE:
+        case UM_D_LINE: {
+            int lw = ui_scale(w, d->stroke > 0 ? d->stroke : 1);
+            HPEN lp = CreatePen(PS_SOLID, lw, cref(d->color));
+            HPEN op = (HPEN)SelectObject(mem, lp);
+            MoveToEx(mem, x, y, NULL);
+            LineTo(mem, x + ww, y + hh);
+            SelectObject(mem, op);
+            DeleteObject(lp);
             break;
+        }
         case UM_D_TEXT: {
             uint16_t wt[UM_UI_MAX_TEXT];
             RECT rc;
@@ -276,7 +315,8 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
             break;
         }
         case UM_D_ICON:
-            draw_usb_icon(mem, x, y, ww, hh, d->text, d->color2, d->color);
+            draw_usb_icon(mem, x, y, ww, hh, d->text, d->color2, d->color,
+                          d->theme_light);
             break;
         }
     }
@@ -322,12 +362,13 @@ static void monitor_workarea(HMONITOR monitor, RECT *wa)
     wa->bottom = GetSystemMetrics(SM_CYSCREEN);
 }
 
-static void apply_geometry(struct um_toast_win *w)
+static void apply_geometry_at(struct um_toast_win *w, int height)
 {
     RECT wa;
     int  pw, ph, x, y;
 
-    w->height = um_toast_measure_height(&w->model, &w->state);
+    if (height < 1) height = 1;
+    w->height = height;
     monitor_workarea(w->monitor, &wa);
 
     /* fit：把窗口等比钳进工作区（<=70% 宽、<=85% 高）。设计空间布局不变，
@@ -364,6 +405,30 @@ static void apply_geometry(struct um_toast_win *w)
                                       ui_scale(w, 18), ui_scale(w, 18));
         if (rgn && !SetWindowRgn(w->hwnd, rgn, FALSE)) DeleteObject(rgn);
     }
+}
+
+static void apply_geometry(struct um_toast_win *w)
+{
+    apply_geometry_at(w, um_toast_measure_height(&w->model, &w->state));
+}
+
+/* 展开/收起：真 Win32 上 160ms ease-out 高度缓动；shim 测试保持瞬时
+ * （测试断言的是最终几何，动画会让时序不稳定）。 */
+static void animate_to_height(struct um_toast_win *w, int target)
+{
+#ifndef UM_WIN32_SHIM
+    if (!w->hwnd || target == w->height) {
+        apply_geometry_at(w, target);
+        return;
+    }
+    w->anim_from = w->height;
+    w->anim_to = target;
+    w->anim_start = (int)GetTickCount();
+    w->animating = 1;
+    SetTimer(w->hwnd, UM_TIMER_ANIM, 16, NULL);
+#else
+    apply_geometry_at(w, target);
+#endif
 }
 
 static void show_row_menu(struct um_toast_win *w, int row, int x, int y)
@@ -409,10 +474,34 @@ static void show_row_menu(struct um_toast_win *w, int row, int x, int y)
     }
 }
 
-static void on_click(struct um_toast_win *w, int x, int y)
+/* “显示其他设备 / 隐藏其他设备”：开关 + 按需展开/收起。 */
+static void toggle_others(struct um_toast_win *w)
+{
+    int target;
+    w->state.show_others = !w->state.show_others;
+    w->state.scroll_px = 0;
+    w->state.hover_row = -1;
+    /* 显示其他设备时若列表不止一行，直接展开；隐藏时若只剩 ≤1 行，
+     * 收回折叠态（折叠态只放得下 1 行，否则开关看起来毫无反应）。 */
+    if (w->state.show_others) {
+        if (um_toast_visible_count(&w->model, &w->state) > 1)
+            w->state.expanded = 1;
+    } else if (um_toast_visible_count(&w->model, &w->state) <= 1) {
+        w->state.expanded = 0;
+    }
+    target = um_toast_measure_height(&w->model, &w->state);
+    animate_to_height(w, target);
+    InvalidateRect(w->hwnd, NULL, FALSE);
+    fire(w, UM_ACT_TOGGLE_OTHERS, -1);
+}
+
+/* 轻点 / 鼠标点击共用：命中测试 → 动作。打开动作由宿主在回调里收起面板
+ * （gui_win32.c），这样通知叠放基线能立刻按“面板已隐藏”重算。 */
+static void panel_press(struct um_toast_win *w, int x, int y)
 {
     um_ui_hit hit = um_toast_hit_test(&w->model, &w->state,
                                       w->width, w->height, x, y);
+    int row;
     if (hit == UM_HIT_NONE) {
         /* 0 行 = 纯文字信息框：整窗即关闭区（保持 2.4.0 文本 toast
          * “点任意处消失”的语义）。有行的面板点空区仍然什么都不做。 */
@@ -420,76 +509,123 @@ static void on_click(struct um_toast_win *w, int x, int y)
         return;
     }
     if (hit == UM_HIT_OPEN) {
-        int i;
-        /* 打开"第一个可打开"的卷，而不是死板的 rows[0] */
-        for (i = 0; i < w->model.n_rows; i++) {
-            if (w->model.rows[i].openable) { fire(w, UM_ACT_OPEN, i); break; }
-        }
+        row = um_toast_first_openable_row(&w->model, &w->state);
+        if (row >= 0) fire(w, UM_ACT_OPEN, row);
         return;
     }
-    else if (hit == UM_HIT_CLOSE)  fire(w, UM_ACT_CLOSE, -1);
-    else if (hit == UM_HIT_EXPAND) {
+    if (hit == UM_HIT_CLOSE) { fire(w, UM_ACT_CLOSE, -1); return; }
+    if (hit == UM_HIT_EXPAND) {
+        int target;
         w->state.expanded = !w->state.expanded;
         w->state.scroll_px = 0;
         w->state.focus_row = -1;
-        apply_geometry(w);            /* 真的改窗口尺寸与锚点，不只是重画 */
+        target = um_toast_measure_height(&w->model, &w->state);
+        animate_to_height(w, target);
         InvalidateRect(w->hwnd, NULL, FALSE);
         fire(w, UM_ACT_TOGGLE_EXPAND, -1);
-    } else if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS) {
+        return;
+    }
+    if (hit == UM_HIT_SHOW_OTHERS) {
+        toggle_others(w);
+        return;
+    }
+    if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS) {
         /* 无盘符 / 非存储设备（智能笔、网卡、拓展坞、空槽、未解锁卷）
          * 没有"打开"语义：点了不能假装成功，也不该弹错 */
-        int row = (int)hit - UM_HIT_ROW;
+        row = (int)hit - UM_HIT_ROW;
         if (row < w->model.n_rows && w->model.rows[row].openable)
             fire(w, UM_ACT_OPEN_ROW, row);
     } else if (hit >= UM_HIT_ROW_OPEN &&
-             hit < UM_HIT_ROW_OPEN + UM_UI_MAX_ROWS) {
-        int row = (int)hit - UM_HIT_ROW_OPEN;
+               hit < UM_HIT_ROW_OPEN + UM_UI_MAX_ROWS) {
+        row = (int)hit - UM_HIT_ROW_OPEN;
         if (row < w->model.n_rows && w->model.rows[row].openable)
             fire(w, UM_ACT_OPEN_ROW, row);
     }
+}
+
+static void on_click(struct um_toast_win *w, int x, int y)
+{
+    panel_press(w, x, y);
+}
+
+/* 长按：对命中行弹右键菜单（Windows 面板长按菜单）。 */
+static void um_toast_hit_press(struct um_toast_win *w, int x, int y)
+{
+    um_ui_hit hit = um_toast_hit_test(&w->model, &w->state,
+                                      w->width, w->height, x, y);
+    int row = -1;
+    if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS)
+        row = (int)hit - UM_HIT_ROW;
+    else if (hit >= UM_HIT_ROW_OPEN && hit < UM_HIT_ROW_OPEN + UM_UI_MAX_ROWS)
+        row = (int)hit - UM_HIT_ROW_OPEN;
+    if (row >= 0 && row < w->model.n_rows)
+        show_row_menu(w, row, x, y);
 }
 
 /* ---------------------------------------------------------- 窗口过程 ------ */
 
+/* 键盘导航按“可见序号”走，隐藏的非存储行不能被 Tab/方向键选中。 */
+static int visible_pos_of(const struct um_toast_win *w, int row)
+{
+    int i, total = um_toast_visible_count(&w->model, &w->state);
+    for (i = 0; i < total; i++)
+        if (um_toast_visible_row(&w->model, &w->state, i) == row) return i;
+    return -1;
+}
+
+static int visible_row_at(const struct um_toast_win *w, int pos)
+{
+    int total = um_toast_visible_count(&w->model, &w->state);
+    if (total <= 0) return -1;
+    if (pos < 0) pos = 0;
+    if (pos >= total) pos = total - 1;
+    return um_toast_visible_row(&w->model, &w->state, pos);
+}
+
 static void focus_row(struct um_toast_win *w, int row)
 {
-    int visible, first;
+    int visible, first, pos;
     w->state.focus_row = row;
     w->state.focus_btn = 0;
-    if (!w->state.expanded && row > 0) {
+    pos = visible_pos_of(w, row);
+    if (!w->state.expanded && pos > 0) {
         w->state.expanded = 1;
-        apply_geometry(w);
+        animate_to_height(w, um_toast_measure_height(&w->model, &w->state));
         fire(w, UM_ACT_TOGGLE_EXPAND, -1);
     }
     visible = um_toast_rows_visible(&w->model, &w->state, w->height);
     first = w->state.scroll_px / UM_UI_ROW_H;
-    if (row < first) w->state.scroll_px = row * UM_UI_ROW_H;
-    else if (row >= first + visible) w->state.scroll_px = (row - visible + 1) * UM_UI_ROW_H;
+    if (pos < first) w->state.scroll_px = pos * UM_UI_ROW_H;
+    else if (pos >= first + visible)
+        w->state.scroll_px = (pos - visible + 1) * UM_UI_ROW_H;
 }
 
 static void focus_next(struct um_toast_win *w)
 {
-    int visible = w->state.expanded ? w->model.n_rows : um_toast_rows_visible(&w->model, &w->state, w->height);
+    int total = um_toast_visible_count(&w->model, &w->state);
+    int pos = visible_pos_of(w, w->state.focus_row);
+    /* 折叠态一次只显示一行，Tab 走完这一行就该到按钮区；展开态才逐行走。 */
+    int visible = w->state.expanded ? total
+                                    : um_toast_rows_visible(&w->model, &w->state, w->height);
     if (w->state.focus_btn == UM_HIT_CLOSE && !w->state.expanded) {
-        int i;
-        for (i = 0; i < w->model.n_rows; i++) {
-            if (w->model.rows[i].openable) {
-                w->state.focus_btn = UM_HIT_OPEN;
-                return;
-            }
+        if (um_toast_first_openable_row(&w->model, &w->state) >= 0) {
+            w->state.focus_btn = UM_HIT_OPEN;
+            return;
         }
     }
     if (w->state.focus_btn == UM_HIT_CLOSE || w->state.focus_btn == UM_HIT_OPEN ||
         (w->state.focus_row < 0 && !w->state.focus_btn)) {
-        if (visible) focus_row(w, 0);
+        if (total) focus_row(w, visible_row_at(w, 0));
         else w->state.focus_btn = UM_HIT_CLOSE;
     } else if (w->state.focus_btn == UM_HIT_EXPAND) {
         w->state.focus_btn = UM_HIT_CLOSE;
-    } else if (w->state.focus_row + 1 < visible) {
-        focus_row(w, w->state.focus_row + 1);
+    } else if (w->state.focus_btn == UM_HIT_SHOW_OTHERS) {
+        w->state.focus_btn = UM_HIT_CLOSE;
+    } else if (pos >= 0 && pos + 1 < visible) {
+        focus_row(w, visible_row_at(w, pos + 1));
     } else {
         w->state.focus_row = -1;
-        w->state.focus_btn = w->model.n_rows > 1 ? UM_HIT_EXPAND : UM_HIT_CLOSE;
+        w->state.focus_btn = total > 1 ? UM_HIT_EXPAND : UM_HIT_CLOSE;
     }
 }
 
@@ -524,19 +660,17 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_TIMER:
+    case WM_TIMER: {
         if (wp == UM_TIMER_TICK) {
             if (um_toast_tick(&w->state, UM_TICK_MS)) {
                 um_toast_win_hide(w);
                 fire(w, UM_ACT_AUTOHIDE, -1);
             } else {
-                /* 倒计时文案只在秒变化（或暂停态翻转）时才需要重画；
-                 * 100ms 无条件全量重画会白白重建 drawlist（约 80KB）。 */
-                int sec = w->state.paused ? -1 : w->state.remaining_ms / 1000;
-                if (sec != w->last_sec) {
-                    w->last_sec = sec;
-                    InvalidateRect(hw, NULL, FALSE);
-                }
+                /* 底部 3px 剩余时间条要连续走动；扫描指示也要转。
+                 * 10fps 重建一次 drawlist（约 80KB）只在面板可见的 10 秒内发生。 */
+                if (w->model.scanning)
+                    w->state.spinner_phase = (w->state.spinner_phase + 1) & 7;
+                InvalidateRect(hw, NULL, FALSE);
             }
         } else if (wp == UM_TIMER_FADE) {
             w->alpha += UM_FADE_STEP;
@@ -545,13 +679,37 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hw, UM_TIMER_FADE);
             }
             SetLayeredWindowAttributes(hw, 0, (BYTE)w->alpha, LWA_ALPHA);
+        } else if (wp == UM_TIMER_LONGPRESS) {
+            KillTimer(hw, UM_TIMER_LONGPRESS);
+            if (w->touch_active && !w->touch_long_fired &&
+                !w->touch_moved && w->touch_scrolling == 0) {
+                w->touch_long_fired = 1;
+                um_toast_hit_press(w, w->touch_x, w->touch_y);
+            }
+        } else if (wp == UM_TIMER_ANIM) {
+            int elapsed = (int)GetTickCount() - w->anim_start;
+            int t = elapsed / UM_ANIM_MS;
+            if (t >= 100) {
+                w->animating = 0;
+                KillTimer(hw, UM_TIMER_ANIM);
+                apply_geometry_at(w, w->anim_to);
+                InvalidateRect(hw, NULL, FALSE);
+            } else {
+                /* ease-out quadratic：1-(1-t)^2 = t*(200-t)/10000 */
+                int e = t * (200 - t);
+                int h = w->anim_from + (w->anim_to - w->anim_from) * e / 10000;
+                apply_geometry_at(w, h);
+                InvalidateRect(hw, NULL, FALSE);
+            }
         }
         return 0;
+    }
 
     case WM_MOUSEMOVE: {
         int x = (int)(short)LOWORD(lp), y = (int)(short)HIWORD(lp);
         um_ui_hit hit;
         int row = -1;
+        if (is_touch_mouse()) return 0;
         if (!w->tracking) {
             TRACKMOUSEEVENT tme;
             tme.cbSize = sizeof tme;
@@ -602,7 +760,67 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_TOUCH: {
+        /* 轻点=点击；展开态上下拖动=滚动；长按=行菜单。只跟踪第一根手指。 */
+        UINT count = (UINT)wp, i;
+        TOUCHINPUT ti[4];
+        if (count > 4) count = 4;
+        if (!count || !GetTouchInputInfo((HANDLE)lp, count, ti, sizeof ti[0])) {
+            CloseTouchInputHandle((HANDLE)lp);
+            return 0;
+        }
+        for (i = 0; i < count; i++) {
+            int x = to_logical(w, ti[i].x / 100);
+            int y = to_logical(w, ti[i].y / 100);
+            if (ti[i].dwFlags & TOUCHEVENTF_DOWN) {
+                if (w->touch_active) continue;      /* 第二根手指忽略 */
+                w->touch_active = 1;
+                w->touch_id = ti[i].dwID;
+                w->touch_x = x;
+                w->touch_y = y;
+                w->touch_last_y = y;
+                w->touch_moved = 0;
+                w->touch_long_fired = 0;
+                w->touch_scrolling = w->state.expanded &&
+                                     y >= 90 &&
+                                     y < w->height - UM_UI_PAD - UM_UI_BTN_H;
+                um_toast_pause(&w->state);
+                SetTimer(hw, UM_TIMER_LONGPRESS, UM_LONGPRESS_MS, NULL);
+            } else if (ti[i].dwFlags & TOUCHEVENTF_MOVE) {
+                int dy;
+                int maxs;
+                if (!w->touch_active || ti[i].dwID != w->touch_id) continue;
+                dy = y - w->touch_last_y;
+                if (w->touch_scrolling && dy) {
+                    maxs = um_toast_max_scroll(&w->model, &w->state, w->height);
+                    w->state.scroll_px -= dy;
+                    if (w->state.scroll_px < 0) w->state.scroll_px = 0;
+                    if (w->state.scroll_px > maxs) w->state.scroll_px = maxs;
+                    InvalidateRect(hw, NULL, FALSE);
+                }
+                w->touch_last_y = y;
+                if (abs(x - w->touch_x) > 8 || abs(y - w->touch_y) > 8) {
+                    w->touch_moved = 1;
+                    KillTimer(hw, UM_TIMER_LONGPRESS);
+                }
+            } else if (ti[i].dwFlags & TOUCHEVENTF_UP) {
+                if (!w->touch_active || ti[i].dwID != w->touch_id) continue;
+                w->touch_active = 0;
+                KillTimer(hw, UM_TIMER_LONGPRESS);
+                if (!w->touch_long_fired && !w->touch_moved)
+                    panel_press(w, w->touch_x, w->touch_y);
+                w->touch_long_fired = 0;
+                w->touch_moved = 0;
+                w->touch_scrolling = 0;
+                um_toast_resume(&w->state);
+            }
+        }
+        CloseTouchInputHandle((HANDLE)lp);
+        return 0;
+    }
+
     case WM_LBUTTONUP:
+        if (is_touch_mouse()) return 0;
         on_click(w, to_logical(w, (int)(short)LOWORD(lp)),
                  to_logical(w, (int)(short)HIWORD(lp)));
         return 0;
@@ -611,6 +829,7 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         int x = to_logical(w, (int)(short)LOWORD(lp));
         int y = to_logical(w, (int)(short)HIWORD(lp));
         um_ui_hit hit;
+        if (is_touch_mouse()) return 0;
         hit = um_toast_hit_test(&w->model, &w->state, w->width, w->height,
                                 x, y);
         if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS)
@@ -635,13 +854,13 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             } else if (w->state.focus_btn == UM_HIT_EXPAND) {
                 um_toast_win_toggle_expand(w);
                 fire(w, UM_ACT_TOGGLE_EXPAND, -1);
+            } else if (w->state.focus_btn == UM_HIT_SHOW_OTHERS) {
+                toggle_others(w);
             } else if (row >= 0 && row < w->model.n_rows) {
                 if (w->model.rows[row].openable) fire(w, UM_ACT_OPEN_ROW, row);
             } else {
-                int i;
-                for (i = 0; i < w->model.n_rows; i++) {
-                    if (w->model.rows[i].openable) { fire(w, UM_ACT_OPEN, i); break; }
-                }
+                int first = um_toast_first_openable_row(&w->model, &w->state);
+                if (first >= 0) fire(w, UM_ACT_OPEN, first);
             }
             return 0;
         }
@@ -650,11 +869,14 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hw, NULL, FALSE);
             return 0;
         }
-        if ((wp == VK_UP || wp == VK_DOWN) && w->model.n_rows) {
-            int row = w->state.focus_row + (wp == VK_DOWN ? 1 : -1);
-            if (row < 0) row = 0;
-            if (row >= w->model.n_rows) row = w->model.n_rows - 1;
-            focus_row(w, row);
+        if ((wp == VK_UP || wp == VK_DOWN) &&
+            um_toast_visible_count(&w->model, &w->state) > 0) {
+            int pos = visible_pos_of(w, w->state.focus_row);
+            int row;
+            if (pos < 0) pos = (wp == VK_DOWN) ? -1 : 0;
+            pos += (wp == VK_DOWN) ? 1 : -1;
+            row = visible_row_at(w, pos);
+            if (row >= 0) focus_row(w, row);
             InvalidateRect(hw, NULL, FALSE);
             return 0;
         }
@@ -665,6 +887,8 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (w) {
             KillTimer(hw, UM_TIMER_TICK);
             KillTimer(hw, UM_TIMER_FADE);
+            KillTimer(hw, UM_TIMER_LONGPRESS);
+            KillTimer(hw, UM_TIMER_ANIM);
         }
         return 0;
 
@@ -706,7 +930,7 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 
 int um_toast_win_enable_dpi_awareness(void)
 {
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
     /* PerMonitorV2 first (Win10 1703+): once the process is DPI-aware,
      * GetDeviceCaps(LOGPIXELSY) stops being virtualized to 96 and reports the
      * real DPI.  WM_DPICHANGED then arrives when the window is dragged across
@@ -768,7 +992,7 @@ int um_toast_win_init(void *hinst)
     if (!h) return 0;
     g_hinst = h;
     memset(&wc, 0, sizeof wc);
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
     wc.lpfnWndProc = toast_proc;
 #else
     wc.lpfnWndProc = (LONG_PTR)toast_proc;   /* shim 用 LONG_PTR 存函数指针 */
@@ -784,7 +1008,7 @@ int um_toast_win_init(void *hinst)
  * Personalize\AppsUseLightTheme == 0 表示深色。读不到就按浅色处理。 */
 static int system_dark(void)
 {
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
     HKEY k;
     DWORD v = 1, sz = sizeof v;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
@@ -804,7 +1028,7 @@ static int system_dark(void)
 void um_toast_system_theme(um_theme *theme)
 {
     um_theme_resolve(theme, "auto", system_dark());
-#ifdef _WIN32
+#ifndef UM_WIN32_SHIM
     HIGHCONTRASTW hc = {0};
     hc.cbSize = sizeof hc;
     if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0) &&
@@ -859,6 +1083,11 @@ um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
                               0, 0, pw, ph, NULL, NULL,
                               g_hinst, NULL);
     if (!w->hwnd) { free(w); return NULL; }
+
+#ifndef UM_WIN32_SHIM
+    /* Win7+：注册触摸输入（TWF_WANTPALM = 手掌不产生触摸）。失败不影响鼠标。 */
+    RegisterTouchWindow(w->hwnd, TWF_WANTPALM);
+#endif
 
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
     return w;
@@ -947,7 +1176,10 @@ void um_toast_win_update(um_toast_win *w, const um_toast_model *m)
             w->state.focus_row = -1;
     }
     w->model = *m;
-    if (m->n_rows <= 1) w->state.expanded = 0;
+    if (w->state.focus_row >= 0 && visible_pos_of(w, w->state.focus_row) < 0)
+        w->state.focus_row = -1;
+    if (um_toast_visible_count(&w->model, &w->state) <= 1)
+        w->state.expanded = 0;
     apply_geometry(w);      /* 尺寸变化时同步窗口与锚点，再重画 */
     InvalidateRect(w->hwnd, NULL, FALSE);
 }
@@ -963,7 +1195,6 @@ void um_toast_win_show(um_toast_win *w)
     }
     w->state.visible = 1;
     w->alpha = 0;
-    w->last_sec = -1;
     SetLayeredWindowAttributes(w->hwnd, 0, 0, LWA_ALPHA);
     SetTimer(w->hwnd, UM_TIMER_FADE, 16, NULL);
     apply_geometry(w);      /* 每次展示都重锚右下角（多屏/分辨率可能变了） */
@@ -979,6 +1210,9 @@ void um_toast_win_hide(um_toast_win *w)
     w->state.visible = 0;
     KillTimer(w->hwnd, UM_TIMER_TICK);
     KillTimer(w->hwnd, UM_TIMER_FADE);
+    KillTimer(w->hwnd, UM_TIMER_LONGPRESS);
+    KillTimer(w->hwnd, UM_TIMER_ANIM);
+    w->touch_active = 0;
     ShowWindow(w->hwnd, SW_HIDE);
 }
 
@@ -1021,10 +1255,20 @@ int um_toast_win_is_expanded(const um_toast_win *w)
 
 void um_toast_win_toggle_expand(um_toast_win *w)
 {
+    int target;
     if (!w) return;
     w->state.expanded = !w->state.expanded;
     w->state.scroll_px = 0;
-    apply_geometry(w);
+    target = um_toast_measure_height(&w->model, &w->state);
+    animate_to_height(w, target);
+    InvalidateRect(w->hwnd, NULL, FALSE);
+}
+
+void um_toast_win_set_scanning(um_toast_win *w, int scanning)
+{
+    if (!w) return;
+    w->model.scanning = scanning ? 1 : 0;
+    w->state.spinner_phase = 0;
     InvalidateRect(w->hwnd, NULL, FALSE);
 }
 

@@ -58,9 +58,14 @@ static void make_model(um_toast_model *m)
 {
     memset(m, 0, sizeof *m);
     snprintf(m->headline, sizeof m->headline, "%s", "USB 设备监控");
-    snprintf(m->subtitle, sizeof m->subtitle, "%s", "3 个设备 · 3 个卷");
-    snprintf(m->summary, sizeof m->summary, "%s", "USB 已连接：E:、F:、G:");
+    snprintf(m->subtitle, sizeof m->subtitle, "%s", "3 个存储设备 · 3 个卷");
+    snprintf(m->subtitle_all, sizeof m->subtitle_all, "%s", "3 个设备 · 3 个存储设备");
+    snprintf(m->summary, sizeof m->summary, "%s", "3 个存储设备已就绪 · 可安全打开");
+    snprintf(m->summary_all, sizeof m->summary_all, "%s", "设备概览");
     snprintf(m->count, sizeof m->count, "%s", "3 个");
+    snprintf(m->count_all, sizeof m->count_all, "%s", "3 个");
+    m->n_storage = 3;
+    m->n_volumes = 3;
     m->accent_kind = 1;                      /* ok / 绿 */
     fill_volume(&m->rows[0], "E:\\", "Kingston DataTraveler 3.0 (E:)",
                 "可移动磁盘 · E:\\", 62668800000ULL, 42600000000ULL,
@@ -77,6 +82,7 @@ static void make_model(um_toast_model *m)
 int main(void)
 {
     um_toast_model m;
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 崩溃时也能看到最后一条进度 */
     um_theme       theme;
     um_toast_win  *w;
 
@@ -123,8 +129,8 @@ int main(void)
         h = um_toast_hit_test(&m, &s, UM_UI_WIDTH, 230,
                               UM_UI_WIDTH - UM_UI_PAD - 59, 230 - UM_UI_PAD - 21);
         CHECK(h == UM_HIT_OPEN);
-        h = um_toast_hit_test(&m, &s, UM_UI_WIDTH, 230, 16 + 98 + 45,
-                              230 - UM_UI_PAD - 21);
+        /* 右上角 ✖：24×24 命中区，中心 (412,29)。 */
+        h = um_toast_hit_test(&m, &s, UM_UI_WIDTH, 230, 412, 29);
         CHECK(h == UM_HIT_CLOSE);
         h = um_toast_hit_test(&m, &s, UM_UI_WIDTH, 230, 16 + 45,
                               230 - UM_UI_PAD - 21);
@@ -161,6 +167,11 @@ int main(void)
     shim_send(TEST_HWND, WM_LBUTTONUP, 0,
               (LPARAM)((440 - UM_UI_PAD - 59) | ((230 - UM_UI_PAD - 21) << 16)));
     CHECK(g_last_act == UM_ACT_OPEN);
+
+    /* 2.6.2：右上角 ✖ 取代左下角"关闭"按钮。 */
+    g_last_act = -1;
+    shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(412 | (29 << 16)));
+    CHECK(g_last_act == UM_ACT_CLOSE);
 
     g_last_act = -1; g_last_row = -99;
     shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(200 | (100 << 16)));
@@ -653,6 +664,229 @@ int main(void)
             CHECK(g_last_act == UM_ACT_CLOSE);
             um_toast_win_destroy(kw);
         }
+    }
+
+    /* ---- 2.6.2: 默认隐藏非存储设备 / 触摸 / 扫描视觉 / 亮色 ---- */
+
+    printf("== 22. 视图过滤：默认只见存储设备，可见序号映射回模型行 ==\n");
+    {
+        um_toast_model mf;
+        um_toast_state sf;
+        make_model(&mf);
+        memset(&mf.rows[3], 0, sizeof mf.rows[3]);
+        snprintf(mf.rows[3].title, sizeof mf.rows[3].title, "%s", "USB 拓展坞 / 集线器");
+        mf.rows[3].kind = UM_KIND_DOCK_HUB;
+        memset(&mf.rows[4], 0, sizeof mf.rows[4]);
+        snprintf(mf.rows[4].title, sizeof mf.rows[4].title, "%s", "Wacom 智能笔");
+        mf.rows[4].kind = UM_KIND_HID_PEN;
+        mf.n_rows = 5;
+        snprintf(mf.subtitle_all, sizeof mf.subtitle_all, "%s", "5 个设备 · 3 个存储设备");
+        snprintf(mf.count_all, sizeof mf.count_all, "%s", "5 个");
+
+        um_toast_state_init(&sf, 10000);
+        CHECK(um_toast_row_is_storage(&mf.rows[0]) == 1);
+        CHECK(um_toast_row_is_storage(&mf.rows[3]) == 0);
+        CHECK(um_toast_has_other(&mf) == 1);
+        CHECK(um_toast_visible_count(&mf, &sf) == 3);
+        CHECK(um_toast_visible_row(&mf, &sf, 2) == 2);
+        CHECK(um_toast_visible_row(&mf, &sf, 3) == -1);
+        CHECK(um_toast_first_openable_row(&mf, &sf) == 0);
+        CHECK(um_toast_hit_test(&mf, &sf, 440, 230, 412, 29) == UM_HIT_CLOSE);
+        CHECK(um_toast_hit_test(&mf, &sf, 440, 230, 170, 193)
+              == UM_HIT_SHOW_OTHERS);
+
+        sf.show_others = 1;
+        CHECK(um_toast_visible_count(&mf, &sf) == 5);
+        CHECK(um_toast_visible_row(&mf, &sf, 3) == 3);
+        CHECK(um_toast_visible_row(&mf, &sf, 4) == 4);
+        sf.show_others = 0;
+    }
+
+    printf("== 23. 新布局图元：✖ / 进度条 / 打开U盘 / 打开卷 / 非存储标签 ==\n");
+    {
+        um_toast_model mf;
+        um_toast_state sf;
+        um_drawlist dl;
+        um_theme th;
+        int i, close_lines = 0, bars = 0, open_u = 0, open_v = 0, tags = 0;
+        int light_icons = 0;
+
+        make_model(&mf);
+        um_toast_state_init(&sf, 10000);
+        um_theme_resolve(&th, "dark", 1);
+        um_toast_layout(&mf, &sf, &th, 440, 230, &dl);
+        for (i = 0; i < dl.n; i++) {
+            const um_draw *d = &dl.items[i];
+            if (d->kind == UM_D_LINE && d->hit == UM_HIT_NONE) close_lines++;
+            if (d->kind == UM_D_RECT && d->y == 227 && d->h == 3) bars++;
+            if (d->kind == UM_D_TEXT && strcmp(d->text, "打开U盘") == 0) open_u++;
+        }
+        CHECK(close_lines == 2);          /* ✖ 两笔 */
+        CHECK(bars >= 1);                 /* 底部 3px 剩余时间条 */
+        CHECK(open_u == 1);
+        CHECK(open_v == 0);               /* 折叠态没有行内"打开卷" */
+
+        sf.expanded = 1;
+        um_toast_layout(&mf, &sf, &th, 440, 406, &dl);
+        for (i = 0; i < dl.n; i++) {
+            const um_draw *d = &dl.items[i];
+            if (d->kind == UM_D_TEXT && strcmp(d->text, "打开卷") == 0) open_v++;
+        }
+        CHECK(open_v == 3);
+        CHECK(um_toast_hit_test(&mf, &sf, 440, 406, 382, 108)
+              == UM_HIT_ROW_OPEN + 0);
+
+        /* 亮色主题：图标图元必须带 theme_light，后端据此换浅色壳体。 */
+        um_theme_resolve(&th, "light", 1);
+        um_toast_layout(&mf, &sf, &th, 440, 406, &dl);
+        for (i = 0; i < dl.n; i++)
+            if (dl.items[i].kind == UM_D_ICON && dl.items[i].theme_light)
+                light_icons++;
+        CHECK(light_icons >= 1);
+        (void)tags;
+    }
+
+    printf("== 24. 显示其他设备：改状态 + 自动展开 + 拨回折叠 ==\n");
+    {
+        um_toast_model mf;
+        um_toast_win *w2;
+        make_model(&mf);
+        memset(&mf.rows[3], 0, sizeof mf.rows[3]);
+        mf.rows[3].kind = UM_KIND_DOCK_HUB;
+        memset(&mf.rows[4], 0, sizeof mf.rows[4]);
+        mf.rows[4].kind = UM_KIND_HID_PEN;
+        mf.n_rows = 5;
+        snprintf(mf.subtitle_all, sizeof mf.subtitle_all, "%s", "5 个设备 · 3 个存储设备");
+        snprintf(mf.count_all, sizeof mf.count_all, "%s", "5 个");
+
+        w2 = um_toast_win_new(&mf, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(w2 != NULL);
+        um_toast_win_show(w2);
+        CHECK(um_toast_win_height(w2) == 230);
+
+        g_last_act = -1;
+        shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(170 | (193 << 16)));
+        CHECK(g_last_act == UM_ACT_TOGGLE_OTHERS);
+        CHECK(um_toast_win_state(w2)->show_others == 1);
+        CHECK(um_toast_win_is_expanded(w2) == 1);
+        CHECK(um_toast_win_height(w2) == 430);
+
+        /* 展开后按钮区随窗口下移：用当前高度算 y，不能再用折叠态的 193。 */
+        g_last_act = -1;
+        shim_send(TEST_HWND, WM_LBUTTONUP, 0,
+                  (LPARAM)(170 | ((um_toast_win_height(w2) - 37) << 16)));
+        CHECK(g_last_act == UM_ACT_TOGGLE_OTHERS);
+        CHECK(um_toast_win_state(w2)->show_others == 0);
+        /* 隐藏其他设备后仍有 3 个存储设备 → 保持展开（原型 C → B）。 */
+        CHECK(um_toast_visible_count(&mf, um_toast_win_state(w2)) == 3);
+        CHECK(um_toast_win_height(w2) == 406);
+        um_toast_win_destroy(w2);
+    }
+
+    printf("== 25. 触摸：轻点 / 拖动滚动 / 长按菜单 / 鼠标提升抑制 ==\n");
+    {
+        um_toast_model mf;
+        um_toast_win *w2;
+        int i, before;
+        memset(&mf, 0, sizeof mf);
+        snprintf(mf.headline, sizeof mf.headline, "%s", "USB 设备监控");
+        for (i = 0; i < 10; i++) {
+            mf.rows[i].kind = UM_KIND_USB_STORAGE;
+            mf.rows[i].openable = 1;
+            mf.rows[i].pct = -1;
+            snprintf(mf.rows[i].title, sizeof mf.rows[i].title, "设备 %d", i);
+            snprintf(mf.rows[i].letters[0], 4, "%c:", 'E' + i);
+            mf.rows[i].n_letters = 1;
+        }
+        mf.n_rows = 10;
+        w2 = um_toast_win_new(&mf, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(w2 != NULL);
+        um_toast_win_show(w2);
+
+        /* 轻点底部"打开U盘"= 鼠标点击。 */
+        shim_touch_reset();
+        shim_touch_push(TOUCHEVENTF_DOWN, 36500, 19300, 1);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        shim_touch_push(TOUCHEVENTF_UP, 36500, 19300, 1);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        CHECK(g_last_act == UM_ACT_OPEN);
+
+        /* 长按行 → 行菜单（不会在抬手时再触发一次打开）。 */
+        shim_set_next_menu_result(4);
+        g_last_act = -1;
+        shim_touch_reset();
+        shim_touch_push(TOUCHEVENTF_DOWN, 20000, 10000, 2);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        shim_send(TEST_HWND, WM_TIMER, 3, 0);
+        shim_touch_push(TOUCHEVENTF_UP, 20000, 10000, 2);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        CHECK(g_last_act == UM_ACT_EJECT);
+
+        /* 展开态上下拖动 = 滚动，抬手不误触打开。 */
+        um_toast_win_toggle_expand(w2);
+        g_last_act = -1;
+        shim_touch_reset();
+        shim_touch_push(TOUCHEVENTF_DOWN, 20000, 20000, 3);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        shim_touch_push(TOUCHEVENTF_MOVE, 20000, 8000, 3);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        shim_touch_push(TOUCHEVENTF_UP, 20000, 8000, 3);
+        shim_send(TEST_HWND, WM_TOUCH, 1, 1);
+        CHECK(um_toast_win_state(w2)->scroll_px == 120);
+        CHECK(g_last_act == -1);
+
+        /* 系统把触摸提升成鼠标时不能双触发。 */
+        g_last_act = -1;
+        before = g_n_acts;
+        shim_set_extra_info(0xFF515700ULL);
+        shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(200 | (100 << 16)));
+        CHECK(g_n_acts == before);
+        shim_set_extra_info(0);
+        um_toast_win_destroy(w2);
+    }
+
+    printf("== 26. 扫描视觉：8 点旋转 + 相位推进 ==\n");
+    {
+        um_toast_model ms;
+        um_toast_win *ws;
+        memset(&ms, 0, sizeof ms);
+        snprintf(ms.headline, sizeof ms.headline, "%s", "正在扫描设备");
+        snprintf(ms.subtitle, sizeof ms.subtitle, "%s", "USB 设备监控");
+        snprintf(ms.count, sizeof ms.count, "…");
+        snprintf(ms.summary, sizeof ms.summary, "%s", "正在枚举存储设备与卷…");
+        ms.scanning = 1;
+        ws = um_toast_win_new(&ms, &theme, 1, 0, 0, on_action, NULL);
+        CHECK(ws != NULL);
+        um_toast_win_show(ws);
+        shim_reset();
+        shim_paint(TEST_HWND);
+        CHECK(g_ndraws > 8);              /* 8 个点 + 底环 + 边框 … */
+        shim_send(TEST_HWND, WM_TIMER, 1, 0);
+        CHECK(um_toast_win_state(ws)->spinner_phase == 1);
+        um_toast_win_set_scanning(ws, 0);
+        shim_reset();
+        shim_paint(TEST_HWND);
+        CHECK(g_ndraws > 8);              /* 恢复正常图标后仍能画 */
+        um_toast_win_destroy(ws);
+    }
+
+    printf("== 27. 单一存储设备：不显示展开，仍有 ✖ 与进度条 ==\n");
+    {
+        um_toast_model m1;
+        um_toast_state s1;
+        um_drawlist dl;
+        um_theme th;
+        int i, expand_hits = 0;
+        make_model(&m1);
+        m1.n_rows = 1;
+        m1.n_storage = 1;
+        um_toast_state_init(&s1, 10000);
+        um_theme_resolve(&th, "dark", 1);
+        um_toast_layout(&m1, &s1, &th, 440, 230, &dl);
+        for (i = 0; i < dl.n; i++) if (dl.items[i].hit == UM_HIT_EXPAND) expand_hits++;
+        CHECK(expand_hits == 0);
+        CHECK(um_toast_hit_test(&m1, &s1, 440, 230, 412, 29) == UM_HIT_CLOSE);
+        CHECK(um_toast_hit_test(&m1, &s1, 440, 230, 365, 193) == UM_HIT_OPEN);
     }
 
     printf("\n%d checks, %d failures\n", g_checks, g_fails);

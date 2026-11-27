@@ -391,11 +391,12 @@ namespace UsbmonDemo {
 
 # --- 16-20) device panel (DEDICATED daemon instance; run before test 8) ------
 # Runners have no USB devices to plug, so USBMON_PANEL_TEST feeds a fixed
-# 3-device evidence set (dual-partition stick E:+F:, a dock, an HID pen)
-# through the FULL production path: daemon-thread model build -> heap
-# um_toast_model marshaled via UMWM_PANEL -> GUI-thread copy -> single-
-# instance window.  Panel shows dump their content and every action
-# callback logs a line, so the whole chain is assertable headlessly.
+# 4-device evidence set (dual-partition stick E:+F:, an SD card, a dock, an
+# HID pen) through the FULL production path: daemon-thread model build ->
+# heap um_toast_model marshaled via UMWM_PANEL -> GUI-thread copy -> single-
+# instance window.  The default view hides non-storage rows; the panel dump
+# and every action callback log a line, so the whole chain is assertable
+# headlessly.
 $PanelFile = Join-Path $Root "panel-test.txt"
 $LogP = Join-Path $Root "panel.jsonl"
 $env:USBMON_PANEL_TEST = $PanelFile
@@ -422,24 +423,6 @@ if ($panelHwnd -ne [IntPtr]::Zero) {
     Bad "device panel window (class usbmonToast2) not found"
 }
 
-# 17) panel content: model -> window -> dump (storage + dock + pen rows)
-$panelTxt = ""
-if (Test-Path -LiteralPath $PanelFile) {
-    $panelTxt = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
-}
-$needP = @('panel show', 'USB 设备监控', '3 个设备 · 2 个卷',
-           'E:、F: 可移动磁盘', 'USB 拓展坞 / 集线器', 'USB HID 设备')
-$missingP = @($needP | Where-Object { $panelTxt -notlike "*$_*" })
-if ($panelTxt -ne "" -and $missingP.Count -eq 0) {
-    Ok "panel content: headline/subtitle + storage(E:+F:) + dock + pen rows"
-} else {
-    Bad "panel content missing: $($missingP -join ' | ')"
-}
-
-# 18) row click + bottom 打开 button both fire open actions
-#     (logical geometry: window width 440; row0 center (100, 117);
-#      button row center y = H-37; main button center x = 365; the client
-#      rect gives the actual scale, so this holds at any DPI)
 function Send-PanelClick([IntPtr]$Hwnd, [double]$X, [double]$Y, [double]$Scale) {
     $px = [int]([math]::Round($X * $Scale))
     $py = [int]([math]::Round($Y * $Scale))
@@ -451,38 +434,134 @@ function Send-PanelClick([IntPtr]$Hwnd, [double]$X, [double]$Y, [double]$Scale) 
     Start-Sleep -Milliseconds 60
     [UsbmonDemo.Win32]::PostMessageW($Hwnd, 0x0202, [UIntPtr]::Zero, $lp) | Out-Null
 }
+
+# 17) panel content: model -> window -> dump.  Default view = storage only.
+$panelTxt = ""
+if (Test-Path -LiteralPath $PanelFile) {
+    $panelTxt = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+}
+$needP = @('panel show', 'USB 设备监控', '2 个存储设备 · 3 个卷',
+           'rows 2 total 4', 'E:、F: 可移动磁盘', 'SD 卡')
+$missingP = @($needP | Where-Object { $panelTxt -notlike "*$_*" })
+$hiddenP = @('USB 拓展坞 / 集线器', 'USB HID 设备')
+$leakedP = @($hiddenP | Where-Object { $panelTxt -like "*$_*" })
+if ($panelTxt -ne "" -and $missingP.Count -eq 0 -and $leakedP.Count -eq 0) {
+    Ok "panel content: storage-only default view (dock/pen hidden)"
+} else {
+    Bad "panel content: missing=$($missingP -join ' | ') leaked=$($leakedP -join ' | ')"
+}
+
+# 17b) "显示其他设备" flips the view: all 4 rows, all-device subtitle/count.
 if ($panelHwnd -ne [IntPtr]::Zero) {
     $rcp = New-Object UsbmonDemo.Win32+RECT
     [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcp) | Out-Null
     $scaleP = $rcp.Right / 440.0
     $logicalH = $rcp.Bottom / $scaleP
-    Send-PanelClick $panelHwnd 100 117 $scaleP                  # row 0
-    Send-PanelClick $panelHwnd 365 ($logicalH - 37) $scaleP     # main 打开 button
-    Start-Sleep -Milliseconds 400
+    Send-PanelClick $panelHwnd 170 193 $scaleP
+    Start-Sleep -Milliseconds 300
+    $panelAll = ""
+    if (Test-Path -LiteralPath $PanelFile) {
+        $panelAll = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+    }
+    $needAll = @('4 个设备 · 2 个存储设备', 'USB 拓展坞 / 集线器', 'USB HID 设备')
+    $missAll = @($needAll | Where-Object { $panelAll -notlike "*$_*" })
+    if ($missAll.Count -eq 0) {
+        Ok "显示其他设备: all-device subtitle + dock + pen rows"
+    } else {
+        Bad "显示其他设备 missing: $($missAll -join ' | ')"
+    }
+    # 拨回默认视图（仍保持展开，3 个存储设备 → 406px）
+    $rcpA = New-Object UsbmonDemo.Win32+RECT
+    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcpA) | Out-Null
+    $scaleA = $rcpA.Right / 440.0
+    $logicalA = $rcpA.Bottom / $scaleA
+    Send-PanelClick $panelHwnd 170 ($logicalA - 37) $scaleA
+    Start-Sleep -Milliseconds 300
+}
+
+# 18) row click + bottom 打开 button both fire open actions
+#     Opening now closes the panel immediately; WM_COMMAND/ID_PANEL on the
+#     listener reopens it so both actions stay assertable in one run.
+#     (logical geometry: window width 440; row0 center (100, 117);
+#      button row center y = H-37; main button center x = 365; the client
+#      rect gives the actual scale, so this holds at any DPI)
+function Reopen-Panel() {
+    $listener = [UsbmonDemo.Win32]::FindListenerHwnd([uint32]$procP.Id)
+    if ($listener -ne [IntPtr]::Zero) {
+        # WM_COMMAND / ID_PANEL == 1 (see listener_proc in gui_win32.c)
+        [UsbmonDemo.Win32]::PostMessageW($listener, 0x0111, [UIntPtr][uint64]1, [IntPtr]::Zero) | Out-Null
+    }
+    Start-Sleep -Milliseconds 300
+}
+function Panel-Rect() {
+    $r = New-Object UsbmonDemo.Win32+RECT
+    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$r) | Out-Null
+    return $r
+}
+
+if ($panelHwnd -ne [IntPtr]::Zero) {
+    # 17b left the panel in the expanded view; collapse it first.
+    $rcp = Panel-Rect
+    $scaleP = $rcp.Right / 440.0
+    $logicalH = $rcp.Bottom / $scaleP
+    if ($logicalH -gt 300) { Send-PanelClick $panelHwnd 61 ($logicalH - 37) $scaleP }
+    Start-Sleep -Milliseconds 300
+
+    # 18a) row click fires open_row AND closes the panel immediately.
+    Send-PanelClick $panelHwnd 100 117 $scaleP
+    Start-Sleep -Milliseconds 300
+    $hiddenAfterRow = -not [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)
+    Reopen-Panel
+
+    # 18b) bottom 打开U盘 fires open AND closes the panel immediately.
+    $rcp = Panel-Rect
+    $scaleP = $rcp.Right / 440.0
+    Send-PanelClick $panelHwnd 365 ($rcp.Bottom / $scaleP - 37) $scaleP
+    Start-Sleep -Milliseconds 300
+    $hiddenAfterMain = -not [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)
     $panelTxt2 = ""
     if (Test-Path -LiteralPath $PanelFile) {
         $panelTxt2 = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
     }
     if ($panelTxt2 -match 'action open_row row=0 E:' -and
-        $panelTxt2 -match 'action open row=0 E:') {
-        Ok "panel row click + 打开 button fire open actions (callback -> tray volume action)"
+        $panelTxt2 -match 'action open row=0 E:' -and
+        $hiddenAfterRow -and $hiddenAfterMain) {
+        Ok "panel open actions fire and close the panel immediately"
     } else {
-        Bad "panel open actions missing from log (got: $($panelTxt2 -replace "`n", ' | '))"
+        Bad "panel open actions: row=$hiddenAfterRow main=$hiddenAfterMain log=$($panelTxt2 -replace "`n", ' | ')"
     }
 
     # 19) 展开 grows the real window (SetWindowPos geometry, not repaint only)
+    Reopen-Panel
+    $rcp = Panel-Rect
     $h0 = $rcp.Bottom
-    Send-PanelClick $panelHwnd 61 ($logicalH - 37) $scaleP      # expand button
+    $scaleP = $rcp.Right / 440.0
+    Send-PanelClick $panelHwnd 61 ($rcp.Bottom / $scaleP - 37) $scaleP
     Start-Sleep -Milliseconds 400
-    $rcp2 = New-Object UsbmonDemo.Win32+RECT
-    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcp2) | Out-Null
+    $rcp2 = Panel-Rect
     if ($rcp2.Bottom - $h0 -gt 20) {
         Ok "展开 grows the real window height (${h0}px -> $($rcp2.Bottom)px)"
     } else {
         Bad "展开 did not resize the window (${h0}px -> $($rcp2.Bottom)px)"
     }
 
+    # 19b) 右上角 ✖ closes the panel (24x24 at logical (400,17)).
+    $scaleX = $rcp2.Right / 440.0
+    Send-PanelClick $panelHwnd 412 29 $scaleX
+    Start-Sleep -Milliseconds 300
+    $visX = [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)
+    $panelX = ""
+    if (Test-Path -LiteralPath $PanelFile) {
+        $panelX = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
+    }
+    if (-not $visX -and $panelX -match 'action close') {
+        Ok "✖ closes the panel and logs the close action"
+    } else {
+        Bad "✖: visible=$visX, close logged=$($panelX -match 'action close')"
+    }
+
     # 20) Esc hides the panel + logs the close action
+    Reopen-Panel
     [UsbmonDemo.Win32]::PostMessageW($panelHwnd, 0x0100, [UIntPtr]0x1B, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 400
     $vis = [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)

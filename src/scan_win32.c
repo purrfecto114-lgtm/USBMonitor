@@ -3,7 +3,7 @@
 
 #include <string.h>
 
-#ifndef _WIN32
+#ifdef UM_WIN32_SHIM
 #include "win32_shim.h"
 #else
 #include <windows.h>
@@ -85,7 +85,7 @@ static const char *kind_name(um_dev_kind kind)
 
 int um_enum_to_model(const um_evidence *evs, int n, um_toast_model *out)
 {
-    int i, volumes = 0;
+    int i, volumes = 0, storage = 0;
     memset(out, 0, sizeof *out);
     for (i = 0; i < n && out->n_rows < UM_UI_MAX_ROWS; i++) {
         const um_evidence *e = &evs[i];
@@ -142,12 +142,30 @@ int um_enum_to_model(const um_evidence *evs, int n, um_toast_model *out)
             snprintf(row->capacity, sizeof row->capacity, "设备容量 %s", size);
         }
         volumes += e->volumes;
+        if (um_toast_row_is_storage(row)) storage++;
     }
     out->overview = 1;
+    out->n_storage = storage;
+    out->n_volumes = volumes;
     snprintf(out->headline, sizeof out->headline, "USB 设备监控");
-    snprintf(out->subtitle, sizeof out->subtitle, "%d 个设备 · %d 个卷", out->n_rows, volumes);
-    snprintf(out->count, sizeof out->count, "%d 个", out->n_rows);
-    snprintf(out->summary, sizeof out->summary, "%s",
-             out->n_rows ? "设备概览" : "当前没有检测到外接设备");
+    /* 默认视图只讲存储设备；"显示其他设备"才讲全部设备（2.6.2）。 */
+    snprintf(out->subtitle, sizeof out->subtitle, "%d 个存储设备 · %d 个卷",
+             storage, volumes);
+    snprintf(out->subtitle_all, sizeof out->subtitle_all, "%d 个设备 · %d 个存储设备",
+             out->n_rows, storage);
+    snprintf(out->count, sizeof out->count, "%d 个", storage);
+    snprintf(out->count_all, sizeof out->count_all, "%d 个", out->n_rows);
+    if (storage)
+        snprintf(out->summary, sizeof out->summary, "%d 个存储设备已就绪 · 可安全打开",
+                 storage);
+    else
+        snprintf(out->summary, sizeof out->summary, "未检测到存储设备");
+    if (out->n_rows > storage)
+        snprintf(out->summary_all, sizeof out->summary_all,
+                 "%d 个存储设备 + %d 个其他 USB 设备", storage, out->n_rows - storage);
+    else if (out->n_rows)
+        snprintf(out->summary_all, sizeof out->summary_all, "设备概览");
+    else
+        snprintf(out->summary_all, sizeof out->summary_all, "当前没有检测到外接设备");
     return out->n_rows;
 }

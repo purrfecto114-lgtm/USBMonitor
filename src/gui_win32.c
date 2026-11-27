@@ -26,10 +26,22 @@ static void test_panel(const char *action, int row, const char *arg)
     FILE *f = um_win_test_output("USBMON_PANEL_TEST");
     if (!f) return;
     if (!strcmp(action, "show")) {
-        int i;
-        fprintf(f, "panel show\n  head %s\n  sub %s\n", inventory.headline, inventory.subtitle);
-        for (i = 0; i < inventory.n_rows; i++)
-            fprintf(f, "  row%d %s | %s\n", i, inventory.rows[i].title, inventory.rows[i].subtitle);
+        const um_toast_state *st = panel ? um_toast_win_state(panel) : NULL;
+        int i, total = st ? um_toast_visible_count(&inventory, st)
+                          : inventory.n_storage;
+        fprintf(f, "panel show\n  head %s\n  sub %s\n  count %s\n  rows %d total %d\n",
+                inventory.headline,
+                (st && st->show_others && inventory.subtitle_all[0])
+                    ? inventory.subtitle_all : inventory.subtitle,
+                (st && st->show_others && inventory.count_all[0])
+                    ? inventory.count_all : inventory.count,
+                total, inventory.n_rows);
+        for (i = 0; i < total; i++) {
+            int index = st ? um_toast_visible_row(&inventory, st, i) : i;
+            if (index < 0) continue;
+            fprintf(f, "  row%d %s | %s\n", i, inventory.rows[index].title,
+                    inventory.rows[index].subtitle);
+        }
     } else {
         fprintf(f, "action %s row=%d %s\n", action, row, arg);
     }
@@ -79,6 +91,11 @@ static void panel_action(um_toast_action action, int row, void *user)
         if (action == UM_ACT_COPY) copy_mount((HWND)um_toast_win_hwnd(panel), v->path[0]);
         else if (!getenv("USBMON_PANEL_TEST"))
             um_tray_open(v->path[0], v->disk_number, action == UM_ACT_REVEAL);
+        /* 打开卷后立刻收起面板，让通知叠放基线按"面板不可见"重算。 */
+        if (action == UM_ACT_OPEN || action == UM_ACT_OPEN_ROW) {
+            um_toast_win_hide(panel);
+            place_notice();
+        }
         break;
     case UM_ACT_EJECT:
         if (v && v->ejectable && !getenv("USBMON_PANEL_TEST")) um_tray_eject(v->instance_id);
@@ -90,6 +107,11 @@ static void panel_action(um_toast_action action, int row, void *user)
         break;
     case UM_ACT_AUTOHIDE:
     case UM_ACT_TOGGLE_EXPAND:
+        place_notice();
+        break;
+    case UM_ACT_TOGGLE_OTHERS:
+        /* 冒烟测试据此读取切换后的视图（副标题/计数/可见行）。 */
+        test_panel("show", -1, "");
         place_notice();
         break;
     }
@@ -140,10 +162,36 @@ static void show_panel(int interactive)
     test_panel("show", -1, "");
 }
 
+/* 首次扫描还没完成时也给出面板：8 点旋转 + "正在扫描设备"，而不是一个
+ * 会立刻自动消失的普通通知（2.6.2 扫描视觉）。 */
+static void show_scanning_panel(void)
+{
+    um_toast_model m = {0};
+    um_theme theme;
+    if (!panel) {
+        snprintf(m.headline, sizeof m.headline, "正在扫描设备");
+        snprintf(m.subtitle, sizeof m.subtitle, "USB 设备监控");
+        snprintf(m.count, sizeof m.count, "…");
+        snprintf(m.summary, sizeof m.summary, "正在枚举存储设备与卷…");
+        snprintf(m.status, sizeof m.status, "完成后可在托盘菜单查看设备概览");
+        m.scanning = 1;
+        um_toast_system_theme(&theme);
+        panel = um_toast_win_new(&m, &theme, 1, 0, app->toast_ttl * 1000,
+                                 panel_action, NULL);
+    } else {
+        um_toast_win_set_scanning(panel, 1);
+    }
+    if (!panel) return;
+    um_toast_win_show(panel);
+    SetForegroundWindow((HWND)um_toast_win_hwnd(panel));
+    place_notice();
+    test_panel("scan", -1, "");
+}
+
 void um_gui_win_open_panel(void)
 {
     if (inventory_ready) show_panel(1);
-    else um_gui_win_notice("正在扫描设备", "完成后可在托盘菜单查看设备概览。", 0);
+    else show_scanning_panel();
 }
 
 static LRESULT CALLBACK listener_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
@@ -166,6 +214,11 @@ static LRESULT CALLBACK listener_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case UMWM_EJECT_DONE:
         um_tray_finish_eject((unsigned long)wp);
+        return 0;
+    /* 托盘菜单命令走标准 WM_COMMAND（ID_PANEL == 1，与 tray_win32.c 的
+     * 私有枚举一致）。打开动作收起面板后，冒烟测试也能据此再次打开。 */
+    case WM_COMMAND:
+        if (LOWORD(wp) == 1) um_gui_win_open_panel();
         return 0;
     case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE: {
@@ -274,10 +327,13 @@ void um_gui_win_refresh(um_gui *g, const um_evidence *evidence, int n,
             { .tags = UM_TAG_USB | UM_TAG_STORAGE, .disk_number = 2, .ejectable = 1,
               .letters = (1U << 4) | (1U << 5), .accessible_letters = 1U << 4,
               .volumes = 2, .kind = UM_KIND_USB_STORAGE },
+            { .tags = UM_TAG_USB | UM_TAG_STORAGE, .disk_number = 3, .ejectable = 1,
+              .letters = 1U << 7, .accessible_letters = 1U << 7,
+              .volumes = 1, .kind = UM_KIND_USB_STORAGE, .model = "SD 卡" },
             { .disk_number = -1, .kind = UM_KIND_DOCK_HUB },
             { .disk_number = -1, .kind = UM_KIND_HID_PEN },
         };
-        um_enum_to_model(test, 3, &update->model);
+        um_enum_to_model(test, 4, &update->model);
         update->show = 1;
     } else {
         if (last_n >= 0) {

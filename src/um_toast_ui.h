@@ -102,13 +102,19 @@ typedef struct {
 
 typedef struct {
     char       headline[UM_UI_MAX_TEXT];   /* "USB 设备监控" / "USB 已连接"  */
-    char       subtitle[UM_UI_MAX_TEXT];   /* "2 个设备 · 3 个卷"            */
-    char       summary[UM_UI_MAX_TEXT];    /* "USB 已连接：E:、F:"           */
+    char       subtitle[UM_UI_MAX_TEXT];   /* 默认视图："2 个存储设备 · 3 个卷" */
+    char       subtitle_all[UM_UI_MAX_TEXT]; /* 显示其他设备时："5 个设备 · 2 个存储设备" */
+    char       summary[UM_UI_MAX_TEXT];    /* 默认视图摘要                   */
+    char       summary_all[UM_UI_MAX_TEXT];/* 显示其他设备时摘要             */
     char       status[UM_UI_MAX_TEXT];     /* "正在安全弹出 E:…"（可为空）   */
-    char       count[32];                  /* 右上角 "3 个"                  */
+    char       count[32];                  /* 默认视图右上角 "2 个"          */
+    char       count_all[32];              /* 显示其他设备时 "5 个"          */
     int        accent_kind;                /* 0=accent 1=ok 2=warn 3=error   */
+    int        scanning;                   /* 1 = 正在扫描（加载指示动画）    */
     um_volume  rows[UM_UI_MAX_ROWS];
-    int        n_rows;
+    int        n_rows;                     /* 全部行（含非存储设备）          */
+    int        n_storage;                  /* 其中存储设备行数                */
+    int        n_volumes;                  /* 卷总数（用于副标题）            */
     int        overview;
 } um_toast_model;
 
@@ -117,14 +123,16 @@ typedef struct {
 typedef struct {
     int  visible;
     int  expanded;          /* 折叠=设备视图，展开=分区视图（1.1.1 同款） */
+    int  show_others;       /* 1 = 显示 HUB / 网卡 / HID 等非存储设备    */
     int  hover_row;         /* -1 = 无                                  */
     int  hover_btn;         /* um_ui_hit，0 = 无                        */
-    int  focus_row;         /* 键盘焦点所在行，-1 = 焦点在按钮区         */
+    int  focus_row;         /* 键盘焦点所在行（模型下标），-1 = 按钮区    */
     int  focus_btn;         /* 键盘焦点所在按钮                          */
     int  paused;            /* hover 暂停倒计时                          */
     int  remaining_ms;      /* 剩余自动隐藏时间                          */
     int  ttl_ms;            /* 总时长（默认 10000，与 1.1.1 AUTO_HIDE_MS）*/
     int  scroll_px;         /* 行区滚动偏移                              */
+    int  spinner_phase;     /* 扫描指示旋转相位 0..7                     */
 } um_toast_state;
 
 void um_toast_state_init(um_toast_state *s, int ttl_ms);
@@ -140,10 +148,11 @@ void um_toast_restart(um_toast_state *s);
 typedef enum {
     UM_HIT_NONE   = 0,
     UM_HIT_OPEN   = 1,     /* 底部主按钮 "打开U盘"      */
-    UM_HIT_EXPAND = 2,     /* "展开" / "折叠"           */
-    UM_HIT_CLOSE  = 3,     /* "关闭"                    */
-    UM_HIT_ROW    = 100,   /* + 行号（0..UM_UI_MAX_ROWS）*/
-    UM_HIT_ROW_OPEN = 200  /* + 行号：行内"打开"按钮（展开态） */
+    UM_HIT_EXPAND = 2,     /* "展开列表" / "收起列表"   */
+    UM_HIT_CLOSE  = 3,     /* 右上角 ✖                  */
+    UM_HIT_SHOW_OTHERS = 4,/* "显示其他设备" / "隐藏其他设备" */
+    UM_HIT_ROW    = 100,   /* + 行号（模型下标）         */
+    UM_HIT_ROW_OPEN = 200  /* + 行号：行内"打开卷"（展开态） */
 } um_ui_hit;
 
 /* ------------------------------------------------------------ 绘制图元层 -- */
@@ -172,6 +181,7 @@ typedef struct {
     um_align align;
     int      clip;            /* 文本超出用 "…" 截断                 */
     int      stroke;          /* 1 = 只描边（边框），0 = 填充        */
+    int      theme_light;     /* 图标用：1 = 浅色主题的壳体配色      */
     char     text[UM_UI_MAX_TEXT];
     um_ui_hit hit;            /* 该图元对应的可点击区域（0 = 不可点） */
 } um_draw;
@@ -195,6 +205,17 @@ typedef struct {
 /* 计算窗口内容高度（未乘缩放）。 */
 int  um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int height);
 int  um_toast_measure_height(const um_toast_model *m, const um_toast_state *s);
+
+/* 视图过滤：存储设备（U 盘 / 读卡器 / 无盘符 / 未解锁卷）始终可见；
+ * HUB / 网卡 / HID 只在 state.show_others 时可见。 */
+int  um_toast_row_is_storage(const um_volume *v);
+int  um_toast_visible_count(const um_toast_model *m, const um_toast_state *s);
+int  um_toast_has_other(const um_toast_model *m);
+/* 可见序号 → 模型行号；越界返回 -1。 */
+int  um_toast_visible_row(const um_toast_model *m, const um_toast_state *s,
+                          int visible_index);
+/* 第一个可打开的可见行（模型下标）；没有返回 -1。 */
+int  um_toast_first_openable_row(const um_toast_model *m, const um_toast_state *s);
 
 /* 生成绘制图元。width/height 为逻辑尺寸；scale 为 DPI 缩放分子（96=1x）。 */
 void um_toast_layout(const um_toast_model *m, const um_toast_state *s,

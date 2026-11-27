@@ -16,6 +16,7 @@ typedef enum {
     UM_ACT_COPY,
     UM_ACT_EJECT,
     UM_ACT_TOGGLE_EXPAND,
+    UM_ACT_TOGGLE_OTHERS,
     UM_ACT_CLOSE,
     UM_ACT_AUTOHIDE
 } um_toast_action;
@@ -79,6 +80,8 @@ int  um_toast_win_is_visible(const um_toast_win *w);
 int  um_toast_win_height(const um_toast_win *w);
 int  um_toast_win_is_expanded(const um_toast_win *w);
 void um_toast_win_toggle_expand(um_toast_win *w);
+/* 扫描中：图标位换成 8 点旋转指示，倒计时条继续走；0 = 恢复正常绘制。 */
+void um_toast_win_set_scanning(um_toast_win *w, int scanning);
 
 /* 窗口句柄（真机冒烟测试直接投递 WM_KEYDOWN/菜单消息用；可为 NULL）。 */
 void *um_toast_win_hwnd(const um_toast_win *w);
