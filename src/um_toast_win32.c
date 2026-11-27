@@ -295,6 +295,11 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
 static void fire(struct um_toast_win *w, um_toast_action act, int row)
 {
     if (w->cb) w->cb(act, row, w->user);
+    /* 每次与提示框完成交互后重置自动隐藏倒计时（2.6.1）：
+     * 之前的实现只在 hover 时暂停，点击动作后倒计时停在暂停值，
+     * 面板会很快消失；现在存活动作一律重置为完整时长重新倒数。 */
+    if (act != UM_ACT_CLOSE && act != UM_ACT_AUTOHIDE)
+        um_toast_restart(&w->state);
 }
 
 static HMONITOR current_monitor(void)

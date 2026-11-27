@@ -119,6 +119,14 @@ void um_toast_resume(um_toast_state *s)
     if (s->remaining_ms <= 0) s->remaining_ms = s->ttl_ms;
 }
 
+void um_toast_restart(um_toast_state *s)
+{
+    if (!s->visible) return;
+    /* 交互完成后重置倒计时为完整时长；hover 暂停语义不变——
+     * 鼠标仍悬停时保持暂停，移开后从满时长重新倒数（2.6.1）。 */
+    s->remaining_ms = s->ttl_ms;
+}
+
 /* ------------------------------------------------------------- draw list -- */
 
 static um_draw *push(um_drawlist *out)

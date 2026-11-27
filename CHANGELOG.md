@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.1] · 2026-11-15
+
+### Changed
+
+- **应用与托盘图标恢复 v1.1.1（PySide6 版）的实际图标**：深色圆角外壳卡片 + 内嵌 USB 插座（两个插孔）+ 浅蓝三叉线条 + 右下状态圆点；几何自 v1.1.1 的运行时 SVG 逐点复刻，尺寸层扩为 16/32/48/**256**，大图标场景（资源管理器、任务栏高 DPI）不再放大模糊（`tools/make_icon.py` / `res/usbmon.ico`）
+- **Windows 安装程序**：Release 资产新增 `usbmon-<版本>-windows-setup.exe`（Inno Setup）；安装到 Program Files、开始菜单/桌面快捷方式、可选开机自启（HKCU Run）、运行中守护进程的干净卸载（`tools/installer.iss` + release workflow）
+
+### Fixed
+
+- **面板交互后倒计时重置**：每次与提示框完成交互（打开/行打开/显示/复制/弹出/展开收起）后，自动隐藏倒计时重置为完整时长重新倒数；此前实现只在 hover 时暂停，点击后倒计时停在暂停值，面板仍按剩余时间很快消失。hover 暂停语义不变（`um_toast_win32.c` fire / `um_toast_restart`）
+
 ## [2.6.0] · 2026-11-07
 
 - Windows 统一设备枚举、事件和面板数据，支持无盘符存储，区分目录挂载、不可访问卷和空读卡器。

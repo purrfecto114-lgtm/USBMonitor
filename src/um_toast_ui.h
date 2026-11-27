@@ -133,6 +133,7 @@ void um_toast_state_init(um_toast_state *s, int ttl_ms);
 int  um_toast_tick(um_toast_state *s, int dt_ms);
 void um_toast_pause(um_toast_state *s);
 void um_toast_resume(um_toast_state *s);
+void um_toast_restart(um_toast_state *s);
 
 /* -------------------------------------------------------------- 命中测试 -- */
 

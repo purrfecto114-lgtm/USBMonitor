@@ -179,6 +179,17 @@ int main(void)
     shim_send(TEST_HWND, WM_KEYDOWN, VK_RETURN, 0);
     CHECK(g_last_act == UM_ACT_OPEN);
 
+    /* 2.6.1: 交互完成后倒计时重置为完整时长（而非停在暂停值） */
+    {
+        const um_toast_state *rst = um_toast_win_state(w);
+        CHECK(rst->remaining_ms == rst->ttl_ms);
+        shim_send(TEST_HWND, WM_MOUSEHOVER, 0, 0);
+        shim_send(TEST_HWND, WM_TIMER, 1, 0);
+        CHECK(rst->remaining_ms == rst->ttl_ms);   /* hover 暂停语义保留 */
+        shim_send(TEST_HWND, WM_MOUSELEAVE, 0, 0);
+        CHECK(rst->remaining_ms == rst->ttl_ms);   /* 离开后从满时长倒数 */
+    }
+
     shim_send(TEST_HWND, WM_MOUSEHOVER, 0, 0);
     {
         int before = g_n_acts;
