@@ -127,12 +127,27 @@ static int popup(HMENU menu, const char *name)
 }
 
 static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t run_value[] = L"usbmon";
+/* 2.6.1/2.6.2 安装器写的是 Run\USBMonitor；程序只认 usbmon，导致托盘勾选
+ * 和 --startup-status 一律显示未启用。继续识别并清理这个历史值。 */
+static const wchar_t legacy_value[] = L"USBMonitor";
+
+static int reg_value_exists(HKEY key, const wchar_t *name)
+{
+    DWORD type = 0;
+    return RegGetValueW(key, NULL, name, RRF_RT_REG_SZ, &type, NULL, NULL)
+           == ERROR_SUCCESS;
+}
 
 int um_startup_enabled(void)
 {
-    DWORD type;
-    return RegGetValueW(HKEY_CURRENT_USER, run_key, L"usbmon", RRF_RT_REG_SZ,
-                        &type, NULL, NULL) == ERROR_SUCCESS;
+    HKEY key;
+    int on;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, run_key, 0, KEY_QUERY_VALUE, &key)
+        != ERROR_SUCCESS) return 0;
+    on = reg_value_exists(key, run_value) || reg_value_exists(key, legacy_value);
+    RegCloseKey(key);
+    return on;
 }
 
 int um_startup_install(void)
@@ -145,8 +160,10 @@ int um_startup_install(void)
     if (RegCreateKeyExW(HKEY_CURRENT_USER, run_key, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &key, NULL) != ERROR_SUCCESS) return -1;
     swprintf(command, sizeof command / sizeof *command, L"\"%ls\"", path);
-    result = RegSetValueExW(key, L"usbmon", 0, REG_SZ, (const BYTE *)command,
-                           (DWORD)((wcslen(command) + 1) * sizeof *command));
+    result = RegSetValueExW(key, run_value, 0, REG_SZ, (const BYTE *)command,
+                            (DWORD)((wcslen(command) + 1) * sizeof *command));
+    if (result == ERROR_SUCCESS)
+        RegDeleteValueW(key, legacy_value);   /* 单一真实来源，避免重复启动 */
     RegCloseKey(key);
     return result == ERROR_SUCCESS ? 0 : -1;
 }
@@ -154,12 +171,15 @@ int um_startup_install(void)
 int um_startup_uninstall(void)
 {
     HKEY key;
+    LONG current, legacy;
     LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, run_key, 0, KEY_SET_VALUE, &key);
     if (result == ERROR_FILE_NOT_FOUND) return 0;
     if (result != ERROR_SUCCESS) return -1;
-    result = RegDeleteValueW(key, L"usbmon");
+    current = RegDeleteValueW(key, run_value);
+    legacy = RegDeleteValueW(key, legacy_value);
     RegCloseKey(key);
-    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    return (current == ERROR_SUCCESS || current == ERROR_FILE_NOT_FOUND) &&
+           (legacy == ERROR_SUCCESS || legacy == ERROR_FILE_NOT_FOUND) ? 0 : -1;
 }
 
 const char *um_startup_where(void) { return "注册表 HKCU Run\\usbmon"; }

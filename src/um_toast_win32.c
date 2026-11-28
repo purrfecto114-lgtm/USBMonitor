@@ -297,21 +297,27 @@ static void paint_toast(struct um_toast_win *w, HDC hdc)
             break;
         }
         case UM_D_TEXT: {
-            uint16_t wt[UM_UI_MAX_TEXT];
+            uint16_t wt[UM_UI_MAX_TEXT + 1];
+            int wt_len;
             RECT rc;
             UINT fmt = DT_SINGLELINE | DT_NOPREFIX;
             /* 真正的 UTF-8 → UTF-16 解码。原来是逐字节 cast，中文会变
-             * 成 "è®¾" 这类乱码（"设" 的 E8 AE BE 被当成三个拉丁码点）。*/
-            um_ui_utf8_to_utf16(d->text, wt, UM_UI_MAX_TEXT);
+             * 成 "è®¾" 这类乱码（"设" 的 E8 AE BE 被当成三个拉丁码点）。
+             * 显式传码元数而不是 -1：即使文本被截断也不依赖终止符，绘制端
+             * 永远不会越过缓冲区读内存（超长设备名的兜底）。 */
+            wt_len = um_ui_utf8_to_utf16(d->text, wt, UM_UI_MAX_TEXT + 1);
+            if (wt_len < 0) wt_len = 0;
+            if (wt_len > UM_UI_MAX_TEXT) wt_len = UM_UI_MAX_TEXT;
             SelectObject(mem, w->fonts[d->font]);
             SetTextColor(mem, cref(d->color));
             rc.left = x; rc.top = y;
             rc.right = x + ww; rc.bottom = y + ui_scale(w, 22);
+            if (rc.right < rc.left) rc.right = rc.left;
             if (d->align == UM_A_RIGHT)       fmt |= DT_RIGHT;
             else if (d->align == UM_A_CENTER) fmt |= DT_CENTER;
             else                              fmt |= DT_LEFT;
             if (d->clip) fmt |= DT_END_ELLIPSIS;
-            DrawTextW(mem, UM_TXT(wt), -1, &rc, fmt);
+            DrawTextW(mem, UM_TXT(wt), wt_len, &rc, fmt);
             break;
         }
         case UM_D_ICON:

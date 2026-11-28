@@ -192,6 +192,8 @@ if ($evNames -contains "start" -and $evNames -contains "round" -and $evNames -co
 
 # --- 5b) startup CLI roundtrip: HKCU Run appears/disappears -------------------
 $RunKeyPs = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+# Start from a clean state (our uninstall also removes the legacy value).
+Invoke-Usbmon @("--uninstall-startup") | Out-Null
 $r = Invoke-Usbmon @("--startup-status")
 if ($r.Code -eq 0 -and (($r.Out -join "") -match "未启用")) {
     Ok "--startup-status exits 0 and reports 未启用 (fresh)"
@@ -211,12 +213,29 @@ if ($r.Code -eq 0 -and (($r.Out -join "") -match "已启用")) {
 } else {
     Bad "--startup-status post-install: exit=$($r.Code) out=$($r.Out -join '|')"
 }
+# 2.6.4: the old installer wrote Run\USBMonitor; the app must recognise and
+# migrate it, otherwise the tray checkbox always looked unchecked.
+Set-ItemProperty -Path $RunKeyPs -Name "USBMonitor" -Value '"C:\Legacy\usbmon.exe"' -Force
+$r = Invoke-Usbmon @("--startup-status")
+if ($r.Code -eq 0 -and (($r.Out -join "") -match "已启用")) {
+    Ok "--startup-status recognises legacy Run\USBMonitor"
+} else {
+    Bad "--startup-status legacy: exit=$($r.Code) out=$($r.Out -join '|')"
+}
+Invoke-Usbmon @("--install-startup") | Out-Null
+$legacyAfter = (Get-ItemProperty -Path $RunKeyPs -Name "USBMonitor" -ErrorAction SilentlyContinue).USBMonitor
+if (-not $legacyAfter) {
+    Ok "--install-startup removes the legacy Run\USBMonitor value"
+} else {
+    Bad "--install-startup legacy still present: '$legacyAfter'"
+}
 $r = Invoke-Usbmon @("--uninstall-startup")
 $runVal2 = (Get-ItemProperty -Path $RunKeyPs -Name "usbmon" -ErrorAction SilentlyContinue).usbmon
-if ($r.Code -eq 0 -and -not $runVal2) {
-    Ok "--uninstall-startup removes the HKCU Run value"
+$legacyVal2 = (Get-ItemProperty -Path $RunKeyPs -Name "USBMonitor" -ErrorAction SilentlyContinue).USBMonitor
+if ($r.Code -eq 0 -and -not $runVal2 -and -not $legacyVal2) {
+    Ok "--uninstall-startup removes both HKCU Run values"
 } else {
-    Bad "--uninstall-startup: exit=$($r.Code) value still='$runVal2'"
+    Bad "--uninstall-startup: exit=$($r.Code) usbmon='$runVal2' legacy='$legacyVal2'"
 }
 
 # --- 6) hooks.json is parsed (hook count shows in the start event) -------------

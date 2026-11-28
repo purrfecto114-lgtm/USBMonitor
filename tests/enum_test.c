@@ -341,6 +341,42 @@ int main(void)
         CHECK(evs[0].kind == UM_KIND_DOCK_HUB);
     }
 
+    printf("== 13. Overlong / broken names never overflow the panel ==\n");
+    {
+        um_evidence long_ev = {0};
+        um_toast_model m;
+        um_toast_state st;
+        um_drawlist dl;
+        um_theme th;
+        char huge[2048];
+        char invalid[96];
+
+        memset(huge, 'Z', sizeof huge - 1);
+        huge[sizeof huge - 1] = '\0';
+        long_ev.kind = UM_KIND_USB_STORAGE;
+        long_ev.tags = UM_TAG_USB | UM_TAG_STORAGE;
+        long_ev.disk_number = 42;
+        long_ev.letters = 1U << 4;
+        long_ev.accessible_letters = 1U << 4;
+        long_ev.fs_total = 1000;
+        long_ev.fs_free = 500;
+        um_copy_str(long_ev.model, sizeof long_ev.model, huge);
+        CHECK(um_enum_to_model(&long_ev, 1, &m) == 1);
+        CHECK(strlen(m.rows[0].title) == UM_MODEL_MAX - 1);
+        CHECK(m.rows[0].title[sizeof m.rows[0].title - 1] == '\0');
+
+        /* Truncated multi-byte sequence at the end of a broken descriptor. */
+        memset(invalid, 'Q', sizeof invalid);
+        invalid[sizeof invalid - 2] = (char)0xE4;
+        invalid[sizeof invalid - 1] = '\0';
+        um_copy_str(long_ev.model, sizeof long_ev.model, invalid);
+        CHECK(um_enum_to_model(&long_ev, 1, &m) == 1);
+        um_toast_state_init(&st, 0);
+        um_theme_resolve(&th, "dark", 1);
+        um_toast_layout(&m, &st, &th, 440, 230, &dl);
+        CHECK(dl.n > 0 && dl.n <= 256);
+    }
+
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

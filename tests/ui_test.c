@@ -908,6 +908,49 @@ int main(void)
         CHECK(um_toast_hit_test(&m1, &s1, 440, 230, 365, 193) == UM_HIT_OPEN);
     }
 
+    printf("== 28. long / malformed device names never overflow the GUI ==\n");
+    {
+        char dst[16];
+        char long_name[600];
+        char cjk[400];
+        um_toast_model ml;
+        um_toast_state sl;
+        um_drawlist dl;
+        um_theme th;
+        int i;
+
+        memset(long_name, 'A', sizeof long_name - 1);
+        long_name[sizeof long_name - 1] = '\0';
+        um_ui_clip_text(dst, sizeof dst, long_name);
+        CHECK(strlen(dst) <= sizeof dst - 1);
+        CHECK(strstr(dst, "\xE2\x80\xA6") != NULL);
+
+        /* 3-byte CJK: must not split a code point when making room for "…" */
+        for (i = 0; i + 3 < (int)sizeof cjk; i += 3) {
+            cjk[i] = (char)0xE4; cjk[i + 1] = (char)0xB8; cjk[i + 2] = (char)0xAD;
+        }
+        cjk[i] = '\0';
+        um_ui_clip_text(dst, sizeof dst, cjk);
+        CHECK(strlen(dst) <= sizeof dst - 1);
+        CHECK((unsigned char)dst[9] == 0xE4);   /* last complete CJK lead byte */
+
+        memset(&ml, 0, sizeof ml);
+        um_ui_clip_text(ml.rows[0].title, sizeof ml.rows[0].title, long_name);
+        CHECK(strlen(ml.rows[0].title) < sizeof ml.rows[0].title);
+        CHECK(ml.rows[0].title[sizeof ml.rows[0].title - 1] == '\0');
+        /* Corrupt n_rows from an external message must be clamped, not read OOB. */
+        ml.n_rows = 100000;
+        ml.overview = 1;
+        um_toast_state_init(&sl, 0);
+        um_theme_resolve(&th, "dark", 1);
+        um_toast_layout(&ml, &sl, &th, 440, 230, &dl);
+        CHECK(dl.n > 0 && dl.n <= 256);
+        CHECK(um_toast_visible_count(&ml, &sl) == UM_UI_MAX_ROWS);
+        CHECK(um_toast_hit_test(&ml, &sl, 440, 230, 10, 10) == UM_HIT_NONE);
+        um_toast_layout(&ml, &sl, &th, 0, 0, &dl);
+        CHECK(dl.n == 0);
+    }
+
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

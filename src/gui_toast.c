@@ -255,7 +255,11 @@ static void draw_text(toast_win *t, XftFont *font, XftColor *color,
     XGlyphInfo extent, ellipsis;
     const FcChar8 *text = (const FcChar8 *)line;
     static const FcChar8 dots[] = "...";
-    int len = (int)strlen(line), limit = t->w - x - PAD;
+    int len, limit;
+    if (!line || !t || !font || !color || !t->draw) return;
+    len = (int)strlen(line);
+    limit = t->w - x - PAD;
+    if (len <= 0 || limit <= 0) return;   /* 窄窗口/空文本：不进入截断循环 */
     XftTextExtentsUtf8(t->dpy, font, text, len, &extent);
     if (extent.xOff > limit) {
         XftTextExtentsUtf8(t->dpy, font, dots, 3, &ellipsis);

@@ -48,6 +48,7 @@ Name: "autostart"; Description: "开机自动启动 USB 设备监控"; \
 ; repo root is addressed with ..\.
 Source: "..\winbin\usbmon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -56,18 +57,25 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
     Tasks: desktopicon
 
-[Registry]
-; HKCU — no admin needed at runtime; autostart launches the tray daemon.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-    ValueType: string; ValueName: "{#AppName}"; \
-    ValueData: """{app}\{#AppExeName}"""; \
-    Tasks: autostart; Flags: uninsdeletevalue
+; Autostart is registered by the app itself (--install-startup), NOT by a
+; [Registry] HKCU entry.  With PrivilegesRequired=admin an HKCU write from
+; Setup can land in the *elevated* account's hive; runasoriginaluser makes
+; the child process use the interactive user's credentials, and the app
+; writes the Run\usbmon value that the tray checkbox and --startup-status
+; actually read.  The app also removes the old Run\USBMonitor value left by
+; earlier installers.
 
 [Run]
+; Register login autostart as the original (non-elevated) user.
+Filename: "{app}\{#AppExeName}"; Parameters: "--install-startup"; \
+    Tasks: autostart; Flags: runhidden runasoriginaluser skipifdoesntexist
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; \
     Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; Remove login autostart (both the current and the legacy value name).
+Filename: "{app}\{#AppExeName}"; Parameters: "--uninstall-startup"; \
+    Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartup"
 ; Stop a running daemon before removal (best effort; fails silently).
 Filename: "{cmd}"; Parameters: "/C taskkill /IM {#AppExeName} /F >nul 2>&1"; \
     Flags: runhidden; RunOnceId: "KillDaemon"

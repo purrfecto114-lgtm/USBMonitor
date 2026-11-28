@@ -234,6 +234,11 @@ int  um_toast_max_scroll(const um_toast_model *m, const um_toast_state *s,
 
 /* ------------------------------------------------------------ 文案工具集 -- */
 
+/* 安全的 UI 文本截断：按 UTF-8 码点边界截断并在末尾加 "…"，绝不切出半个
+ * 多字节字符、绝不缺少终止符。超长设备名/型号只能被缩短，不能让绘制端
+ * 读到越界内存或把非法字节流交给 GDI/Xft。 */
+void um_ui_clip_text(char *dst, size_t n, const char *src);
+
 void um_ui_format_bytes(unsigned long long v, char *out, size_t n);
 void um_ui_countdown(int remaining_ms, char *out, size_t n);
 void um_ui_capacity_line(const um_volume *v, char *out, size_t n);

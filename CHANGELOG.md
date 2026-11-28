@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.4] · 2026-11-28
+
+### Changed
+
+- **README 默认英文并提供语言切换**：`README.md` 改为英文，`README.zh-CN.md` 保留中文，两者互链；安装包同时附带两份说明。
+- **安装器自启动改由程序注册**：不再由安装器直接写 `HKCU Run`（提权安装时可能落到错误账号），改为 `runasoriginaluser` 调用 `--install-startup`，与托盘勾选和 `--startup-status` 使用同一个 `Run\usbmon` 值。
+
+### Fixed
+
+- 识别并清理旧安装器遗留的 `HKCU Run\USBMonitor`；此前程序只认 `usbmon`，导致托盘始终显示未启用、卸载后残留。
+- 面板文本统一做 UTF-8 安全截断（绝不切断多字节字符、始终保留终止符），GDI 绘制使用显式长度；超长设备名/型号不再有越界读取风险。
+- 布局与命中测试对外部模型的行数、尺寸做边界夹逼；X11 助手的空文本/窄窗口提前返回，避免异常输入进入截断循环。
+
 ## [2.6.3] · 2026-11-28
 
 ### Changed

@@ -106,13 +106,17 @@ int um_enum_to_model(const um_evidence *evs, int n, um_toast_model *out)
             if (!(e->letters & bit)) continue;
             if ((e->accessible_letters & bit) && !row->path[0])
                 snprintf(row->path, sizeof row->path, "%c:\\", 'A' + k);
-            snprintf(row->letters[row->n_letters++], sizeof row->letters[0], "%c:", 'A' + k);
-            used += (size_t)snprintf(letters + used, sizeof letters - used,
-                                     "%s%c:", used ? "、" : "", 'A' + k);
+            if (row->n_letters < UM_UI_MAX_LETTER)
+                snprintf(row->letters[row->n_letters], sizeof row->letters[0],
+                         "%c:", 'A' + k);
+            row->n_letters++;
+            if (used + 5 < sizeof letters)
+                used += (size_t)snprintf(letters + used, sizeof letters - used,
+                                         "%s%c:", used ? "、" : "", 'A' + k);
         }
         row->accessible_letters = e->accessible_letters;
         if (e->model[0])
-            um_copy_str(row->title, sizeof row->title, e->model);
+            um_ui_clip_text(row->title, sizeof row->title, e->model);
         else if (used)
             snprintf(row->title, sizeof row->title, "%.58s %s", letters, kind_name(e->kind));
         else

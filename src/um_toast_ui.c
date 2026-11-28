@@ -179,6 +179,44 @@ static void push_round(um_drawlist *o, int x, int y, int w, int h,
     d->color = c; d->radius = r; d->hit = hit;
 }
 
+/* 返回从 s 开始的一个完整 UTF-8 码点长度；非法序列按 1 字节处理。
+ * 只用于"在哪里可以安全截断"，不用于校验——绘制端仍会把非法字节换成 U+FFFD。 */
+static int utf8_unit_len(const unsigned char *s)
+{
+    unsigned char c = s[0];
+    int n, i;
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) n = 2;
+    else if ((c & 0xF0) == 0xE0) n = 3;
+    else if ((c & 0xF8) == 0xF0) n = 4;
+    else return 1;
+    for (i = 1; i < n; i++)
+        if ((s[i] & 0xC0) != 0x80) return 1;   /* 序列不完整，按单字节消费 */
+    return n;
+}
+
+void um_ui_clip_text(char *dst, size_t n, const char *src)
+{
+    size_t used = 0, limit;
+    int truncated = 0;
+    if (!dst || n == 0) return;
+    if (!src) src = "";
+    limit = n - 1;
+    if (n >= 4) limit -= 3;                    /* 给 "…" 留位置 */
+    while (*src) {
+        int len = utf8_unit_len((const unsigned char *)src);
+        if (used + (size_t)len > limit) { truncated = 1; break; }
+        memcpy(dst + used, src, (size_t)len);
+        used += (size_t)len;
+        src += len;
+    }
+    if (truncated && n >= 4) {
+        memcpy(dst + used, "\xE2\x80\xA6", 3); /* UTF-8 … */
+        used += 3;
+    }
+    dst[used] = '\0';
+}
+
 static void push_text(um_drawlist *o, int x, int y, int w, um_font f,
                       unsigned long c, um_align a, const char *text)
 {
@@ -186,7 +224,7 @@ static void push_text(um_drawlist *o, int x, int y, int w, um_font f,
     if (!d) return;
     d->kind = UM_D_TEXT; d->x = x; d->y = y; d->w = w;
     d->font = f; d->color = c; d->align = a; d->clip = 1;
-    snprintf(d->text, sizeof d->text, "%s", text ? text : "");
+    um_ui_clip_text(d->text, sizeof d->text, text);
 }
 
 static void push_icon(um_drawlist *o, int x, int y, int w, int h,
@@ -197,7 +235,7 @@ static void push_icon(um_drawlist *o, int x, int y, int w, int h,
     if (!d) return;
     d->kind = UM_D_ICON; d->x = x; d->y = y; d->w = w; d->h = h;
     d->color = fg; d->color2 = badge; d->theme_light = theme_light;
-    snprintf(d->text, sizeof d->text, "%s", status);
+    um_ui_clip_text(d->text, sizeof d->text, status);
 }
 
 /* --------------------------------------------------------------- 布局器 --- */
@@ -254,21 +292,28 @@ int um_toast_row_is_storage(const um_volume *v)
     }
 }
 
+/* 模型可能来自外部消息：行数和滚动偏移一律夹逼到合法范围，坏数据只能
+ * 让面板少显示几行，不能越界读 rows[] 或算出负索引。 */
+static int model_rows(const um_toast_model *m)
+{
+    if (!m || m->n_rows <= 0) return 0;
+    return m->n_rows > UM_UI_MAX_ROWS ? UM_UI_MAX_ROWS : m->n_rows;
+}
+
 int um_toast_visible_count(const um_toast_model *m, const um_toast_state *s)
 {
-    int i, n = 0;
-    if (!m) return 0;
-    if (s->show_others) return m->n_rows;
-    for (i = 0; i < m->n_rows; i++)
+    int i, n = 0, rows = model_rows(m);
+    if (!rows) return 0;
+    if (s && s->show_others) return rows;
+    for (i = 0; i < rows; i++)
         if (um_toast_row_is_storage(&m->rows[i])) n++;
     return n;
 }
 
 int um_toast_has_other(const um_toast_model *m)
 {
-    int i;
-    if (!m) return 0;
-    for (i = 0; i < m->n_rows; i++)
+    int i, rows = model_rows(m);
+    for (i = 0; i < rows; i++)
         if (!um_toast_row_is_storage(&m->rows[i])) return 1;
     return 0;
 }
@@ -276,9 +321,9 @@ int um_toast_has_other(const um_toast_model *m)
 int um_toast_visible_row(const um_toast_model *m, const um_toast_state *s,
                          int visible_index)
 {
-    int i, n = 0;
-    if (!m || visible_index < 0) return -1;
-    for (i = 0; i < m->n_rows; i++) {
+    int i, n = 0, rows = model_rows(m);
+    if (!rows || visible_index < 0) return -1;
+    for (i = 0; i < rows; i++) {
         if (!s->show_others && !um_toast_row_is_storage(&m->rows[i])) continue;
         if (n == visible_index) return i;
         n++;
@@ -299,7 +344,7 @@ int um_toast_first_openable_row(const um_toast_model *m, const um_toast_state *s
 int um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int height)
 {
     int rows, total = um_toast_visible_count(m, s);
-    if (!total) return 0;
+    if (!total || !s) return 0;
     if (!s->expanded) return 1;
     rows = (button_top(height) - 6 - row_top()) / UM_UI_ROW_H;
     if (rows < 1) rows = 1;
@@ -308,9 +353,11 @@ int um_toast_rows_visible(const um_toast_model *m, const um_toast_state *s, int 
 
 int um_toast_measure_height(const um_toast_model *m, const um_toast_state *s)
 {
-    int total = um_toast_visible_count(m, s);
-    if (!m->n_rows && !m->overview) return m->status[0] ? 166 : 148;
-    if (s->expanded && total > 1) {
+    int total;
+    if (!m) return UM_UI_COLLAPSED_H;
+    total = um_toast_visible_count(m, s);
+    if (!model_rows(m) && !m->overview) return m->status[0] ? 166 : 148;
+    if (s && s->expanded && total > 1) {
         int height = row_top() + total * UM_UI_ROW_H + UM_UI_PAD + UM_UI_BTN_H + 6;
         return height < UM_UI_EXPANDED_H ? height : UM_UI_EXPANDED_H;
     }
@@ -407,6 +454,10 @@ static void progress_bar(um_drawlist *out, const um_theme *t,
 void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
                      const um_theme *t, int width, int height, um_drawlist *out)
 {
+    if (!out) return;
+    out->n = 0;
+    if (!m || !s || !t || width <= 0 || height <= 0) return;
+    {
     const int p = UM_UI_PAD;
     const int light = theme_is_light(t);
     int by = button_top(height);
@@ -427,7 +478,6 @@ void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
     int badge_w = count[0] ? 60 : 0;   /* 54 徽章 + 6 间距 */
     int head_w;
 
-    out->n = 0;
     push_round(out, 0, 0, width, height, t->panel, 18, UM_HIT_NONE);
     stroke(out, 1, 1, width - 2, height - 2, 17, t->border);
 
@@ -591,6 +641,7 @@ void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
     }
 
     progress_bar(out, t, s, width, height);
+    }
 }
 
 um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
@@ -599,6 +650,7 @@ um_ui_hit um_toast_hit_test(const um_toast_model *m, const um_toast_state *s,
     um_drawlist dl;
     um_theme    tmp;
     int i;
+    if (!m || !s || width <= 0 || height <= 0) return UM_HIT_NONE;
 
     /* 几何与配色无关，用一个临时主题即可（避免 API 里多传一个参数）。 */
     um_theme_resolve(&tmp, "dark", 1);
@@ -618,7 +670,7 @@ int um_toast_max_scroll(const um_toast_model *m, const um_toast_state *s,
                         int height)
 {
     int total, rows;
-    if (!s->expanded) return 0;
+    if (!s || !s->expanded) return 0;
     total = um_toast_visible_count(m, s);
     rows = um_toast_rows_visible(m, s, height);
     return (total - rows > 0) ? (total - rows) * UM_UI_ROW_H : 0;
