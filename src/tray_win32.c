@@ -10,9 +10,15 @@
 #include <wchar.h>
 
 enum {
-    ID_PANEL = 1, ID_RESCAN, ID_LOG, ID_CONFIG, ID_STARTUP, ID_QUIT,
+    ID_PANEL = 1, ID_RESCAN, ID_LOG, ID_CONFIG, ID_STARTUP, ID_QUIT, ID_OTHERS,
     ID_OPEN = 100, ID_REVEAL = 130, ID_EJECT = 160
 };
+
+/* Compile-time guard: the menu IDs must match win_app.h, which the GUI
+ * thread uses for WM_COMMAND dispatch.  File-scope typedefs are the C99
+ * equivalent of a static assert (negative array size on mismatch). */
+typedef char um_tray_id_panel_check[(ID_PANEL == UM_TRAY_ID_PANEL) ? 1 : -1];
+typedef char um_tray_id_others_check[(ID_OTHERS == UM_TRAY_ID_OTHERS) ? 1 : -1];
 
 typedef struct {
     int disk;
@@ -44,6 +50,40 @@ void um_tray_test_log(const char *key, const char *detail)
     fclose(f);
 }
 
+/* ---- "显示其他设备" preference (HKCU\Software\USBMonitor\ShowOthers) ---- */
+
+static int show_others_pref;
+
+static int tray_test_mode(void)
+{
+    return getenv("USBMON_PANEL_TEST") || getenv("USBMON_TRAY_TEST");
+}
+
+static int load_show_others(void)
+{
+    DWORD value = 0, size = sizeof value;
+    if (tray_test_mode()) return 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\USBMonitor", L"ShowOthers",
+                     RRF_RT_REG_DWORD, NULL, &value, &size) != ERROR_SUCCESS)
+        return 0;
+    return value ? 1 : 0;
+}
+
+static void save_show_others(int on)
+{
+    if (tray_test_mode()) return;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\USBMonitor", L"ShowOthers",
+                    REG_DWORD, &on, sizeof on);
+}
+
+void um_tray_toggle_show_others(void)
+{
+    show_others_pref = !show_others_pref;
+    save_show_others(show_others_pref);
+    um_gui_win_set_show_others(show_others_pref);
+    um_tray_test_log("others", show_others_pref ? "on" : "off");
+}
+
 static void dump_menu(FILE *f, HMENU menu, int depth)
 {
     int i;
@@ -52,12 +92,13 @@ static void dump_menu(FILE *f, HMENU menu, int depth)
         char utf8[512];
         MENUITEMINFOW info = {0};
         info.cbSize = sizeof info;
-        info.fMask = MIIM_STRING | MIIM_SUBMENU;
+        info.fMask = MIIM_STRING | MIIM_SUBMENU | MIIM_STATE;
         info.dwTypeData = text;
         info.cch = sizeof text / sizeof *text;
         if (!GetMenuItemInfoW(menu, (UINT)i, TRUE, &info)) continue;
         um_wide_to_utf8(text, utf8, sizeof utf8);
-        fprintf(f, "%*s%s\n", depth * 2, "", utf8);
+        fprintf(f, "%*s%s%s\n", depth * 2, "", (info.fState & MFS_CHECKED) ? "[x] " : "",
+                utf8);
         if (info.hSubMenu) dump_menu(f, info.hSubMenu, depth + 1);
     }
 }
@@ -276,6 +317,8 @@ static void right_menu(void)
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_PANEL, L"打开设备概览");
     AppendMenuW(menu, MF_STRING, ID_RESCAN, L"立即重新扫描");
+    AppendMenuW(menu, MF_STRING | (show_others_pref ? MF_CHECKED : 0),
+                ID_OTHERS, L"显示其他设备");
     AppendMenuW(menu, MF_STRING, ID_LOG, L"打开日志目录");
     AppendMenuW(menu, MF_STRING, ID_CONFIG, L"打开配置目录");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -286,6 +329,7 @@ static void right_menu(void)
     switch (popup(menu, "right")) {
     case ID_PANEL: um_gui_win_open_panel(); break;
     case ID_RESCAN: SetEvent((HANDLE)app->wake_event); break;
+    case ID_OTHERS: um_tray_toggle_show_others(); break;
     case ID_LOG: open_directory(1); break;
     case ID_CONFIG: open_directory(0); break;
     case ID_STARTUP: {
@@ -326,6 +370,8 @@ void um_tray_install(HWND hwnd, um_gui *gui)
     taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
     if (!icon) icon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    show_others_pref = load_show_others();
+    um_gui_win_set_show_others(show_others_pref);
     add_icon("icon_add");
 }
 

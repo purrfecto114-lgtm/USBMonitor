@@ -451,14 +451,17 @@ if ($panelTxt -ne "" -and $missingP.Count -eq 0 -and $leakedP.Count -eq 0) {
     Bad "panel content: missing=$($missingP -join ' | ') leaked=$($leakedP -join ' | ')"
 }
 
-# 17b) "显示其他设备" flips the view: all 4 rows, all-device subtitle/count.
+# 17b) "显示其他设备" moved to the tray menu (2.6.3): WM_COMMAND / ID_OTHERS == 7.
+#      Toggle on, assert all-device view, toggle back off.
+function Send-OthersCommand() {
+    $listener = [UsbmonDemo.Win32]::FindListenerHwnd([uint32]$procP.Id)
+    if ($listener -ne [IntPtr]::Zero) {
+        [UsbmonDemo.Win32]::PostMessageW($listener, 0x0111, [UIntPtr][uint64]7, [IntPtr]::Zero) | Out-Null
+    }
+    Start-Sleep -Milliseconds 400
+}
 if ($panelHwnd -ne [IntPtr]::Zero) {
-    $rcp = New-Object UsbmonDemo.Win32+RECT
-    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcp) | Out-Null
-    $scaleP = $rcp.Right / 440.0
-    $logicalH = $rcp.Bottom / $scaleP
-    Send-PanelClick $panelHwnd 170 193 $scaleP
-    Start-Sleep -Milliseconds 300
+    Send-OthersCommand
     $panelAll = ""
     if (Test-Path -LiteralPath $PanelFile) {
         $panelAll = Get-Content -LiteralPath $PanelFile -Raw -Encoding UTF8
@@ -466,17 +469,12 @@ if ($panelHwnd -ne [IntPtr]::Zero) {
     $needAll = @('4 个设备 · 2 个存储设备', 'USB 拓展坞 / 集线器', 'USB HID 设备')
     $missAll = @($needAll | Where-Object { $panelAll -notlike "*$_*" })
     if ($missAll.Count -eq 0) {
-        Ok "显示其他设备: all-device subtitle + dock + pen rows"
+        Ok "显示其他设备 (tray): all-device subtitle + dock + pen rows"
     } else {
         Bad "显示其他设备 missing: $($missAll -join ' | ')"
     }
-    # 拨回默认视图（仍保持展开，3 个存储设备 → 406px）
-    $rcpA = New-Object UsbmonDemo.Win32+RECT
-    [UsbmonDemo.Win32]::GetClientRect($panelHwnd, [ref]$rcpA) | Out-Null
-    $scaleA = $rcpA.Right / 440.0
-    $logicalA = $rcpA.Bottom / $scaleA
-    Send-PanelClick $panelHwnd 170 ($logicalA - 37) $scaleA
-    Start-Sleep -Milliseconds 300
+    # 拨回默认视图（仍保持展开，2 个存储设备 → 322px）
+    Send-OthersCommand
 }
 
 # 18) row click + bottom 打开 button both fire open actions
@@ -562,7 +560,7 @@ if ($panelHwnd -ne [IntPtr]::Zero) {
 
     # 20) Esc hides the panel + logs the close action
     Reopen-Panel
-    [UsbmonDemo.Win32]::PostMessageW($panelHwnd, 0x0100, [UIntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+    [UsbmonDemo.Win32]::PostMessageW($panelHwnd, 0x0100, [UIntPtr][uint64]0x1B, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 400
     $vis = [UsbmonDemo.Win32]::IsWindowVisible($panelHwnd)
     $panelTxt3 = ""
@@ -689,10 +687,10 @@ if ($hwnd -ne [IntPtr]::Zero) {
     [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8003, [UIntPtr]::Zero, [IntPtr]0x0205) | Out-Null
     Start-Sleep -Milliseconds 800
     $menuRight = Truncate-From (Read-TrayLog) "menu right"
-    $need = @('状态：', '立即重新扫描', '打开日志目录', '随系统启动', '退出')
+    $need = @('状态：', '立即重新扫描', '显示其他设备', '打开日志目录', '随系统启动', '退出')
     $missing = @($need | Where-Object { $menuRight -notmatch [regex]::Escape($_) })
     if ($menuRight -ne "" -and $missing.Count -eq 0) {
-        Ok "right-click menu complete (状态/重新扫描/工具/随系统启动/退出)"
+        Ok "right-click menu complete (状态/重新扫描/显示其他设备/工具/随系统启动/退出)"
     } else {
         Bad "right menu missing: $($missing -join ',') | got: $(($menuRight -replace "`n", ' | ').Trim())"
     }
@@ -718,7 +716,7 @@ if ($hwnd -ne [IntPtr]::Zero) {
 # simulates an absent device. The worker returns a PnP failure without
 # touching hardware. The window message updates the result toast and test log.
 if ($hwnd -ne [IntPtr]::Zero) {
-    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8007, [UIntPtr]0x51, [IntPtr]::Zero) | Out-Null
+    [UsbmonDemo.Win32]::PostMessageW($hwnd, 0x8007, [UIntPtr][uint64]0x51, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 1500     # progress toast + worker + result toast
     $ejectTxt = Read-TrayLog
     if ($ejectTxt -match 'eject (ok|fail)') {

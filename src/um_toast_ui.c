@@ -114,7 +114,8 @@ void um_ui_capacity_line(const um_volume *v, char *out, size_t n)
 void um_toast_state_init(um_toast_state *s, int ttl_ms)
 {
     memset(s, 0, sizeof *s);
-    s->ttl_ms = ttl_ms > 0 ? ttl_ms : 10000;
+    /* 2.6.3: <=0 表示"不自动隐藏"（手动面板），不再回退成默认 10s。 */
+    s->ttl_ms = ttl_ms > 0 ? ttl_ms : 0;
     s->remaining_ms = s->ttl_ms;
     s->hover_row = -1;
     s->focus_row = -1;
@@ -123,6 +124,7 @@ void um_toast_state_init(um_toast_state *s, int ttl_ms)
 int um_toast_tick(um_toast_state *s, int dt_ms)
 {
     if (!s->visible || s->paused) return 0;
+    if (s->ttl_ms <= 0) return 0;        /* 手动面板：永不自动隐藏 */
     s->remaining_ms -= dt_ms;
     if (s->remaining_ms <= 0) { s->remaining_ms = 0; return 1; }
     return 0;
@@ -138,12 +140,13 @@ void um_toast_resume(um_toast_state *s)
 {
     if (!s->paused) return;
     s->paused = 0;
+    if (s->ttl_ms <= 0) return;          /* 手动面板：没有倒计时可续 */
     if (s->remaining_ms <= 0) s->remaining_ms = s->ttl_ms;
 }
 
 void um_toast_restart(um_toast_state *s)
 {
-    if (!s->visible) return;
+    if (!s->visible || s->ttl_ms <= 0) return;
     /* 交互完成后重置倒计时为完整时长；hover 暂停语义不变——
      * 鼠标仍悬停时保持暂停，移开后从满时长重新倒数（2.6.1）。 */
     s->remaining_ms = s->ttl_ms;
@@ -492,7 +495,8 @@ void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
                   m->n_rows ? "未检测到存储设备" : "接入设备后会自动更新");
         if (has_other)
             push_text(out, p, row_top() + 42, width - 2 * p, UM_F_SMALL,
-                      t->muted, UM_A_CENTER, "点击下方“显示其他设备”查看全部");
+                      t->muted, UM_A_CENTER,
+                      "右键托盘图标可选择“显示其他设备”");
     } else {
         if (first + rows > total) first = total - rows;
         if (first < 0) first = 0;
@@ -576,19 +580,13 @@ void um_toast_layout(const um_toast_model *m, const um_toast_state *s,
         }
     }
 
-    /* 底部：收起/展开、显示其他设备、打开U盘 */
+    /* 底部：收起/展开、打开U盘（“显示其他设备”已移到托盘菜单，2.6.3） */
     {
-        int lx = p;
-        if (total > 1) {
-            link_button(out, t, s, lx, by + 5, 90, 32, UM_HIT_EXPAND,
+        if (total > 1)
+            link_button(out, t, s, p, by + 5, 90, 32, UM_HIT_EXPAND,
                         s->expanded ? "收起列表" : "展开列表");
-            lx += 98;
-        }
-        if (has_other)
-            link_button(out, t, s, lx, by + 5, 112, 32, UM_HIT_SHOW_OTHERS,
-                        s->show_others ? "隐藏其他设备" : "显示其他设备");
         if (!s->expanded && first_open >= 0)
-            button(out, t, s, width - p - 118, by, 118, UM_UI_BTN_H,
+            button(out, t, s, width - p - 90, by, 90, UM_UI_BTN_H,
                    UM_HIT_OPEN, "打开U盘", 1);
     }
 

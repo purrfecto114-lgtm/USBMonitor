@@ -2,8 +2,8 @@
 """make_icon.py — generate res/usbmon.ico (16/32/48/256 px).
 
 Pure standard library: no PIL/numpy.  The glyph reproduces the v1.1.1
-(PySide6) runtime icon: dark rounded shell card with an inner USB socket
-block, a soft-blue USB trident and a status badge dot at the bottom right
+(PySide6) runtime icon: light rounded shell card with an inner USB socket
+block, a deep-blue USB trident and a status badge dot at the bottom right
 (status "usb" — badge carries no mark).  Geometry is traced from the
 64x64 SVG in v1.1.1's usb_monitor/app.py `usb_svg()`; everything is
 rasterised through signed-distance fields with 4x supersampling so small
@@ -20,12 +20,12 @@ import zlib
 SIZES = (16, 32, 48, 256)
 SS = 4  # supersample factor
 
-# v1.1.1 dark theme (usb_monitor/app.py Theme)
-SHELL  = (0x2D, 0x37, 0x46)   # icon_shell  #2d3746
-SOCKET = (0x3D, 0x4A, 0x5C)   # icon_socket #3d4a5c
-BORDER = (0x3A, 0x46, 0x56)   # border      #3a4656
-ACCENT = (0x75, 0xA7, 0xFF)   # accent      #75a7ff
-PANEL  = (0x11, 0x19, 0x23)   # panel (badge ring)
+# light theme (usb_monitor/app.py Theme, light palette)
+SHELL  = (0xDF, 0xE8, 0xF4)   # icon_shell  #dfe8f4
+SOCKET = (0xF7, 0xFA, 0xFD)   # icon_socket #f7fafd
+BORDER = (0xCB, 0xD8, 0xE7)   # border      #cbd8e7
+ACCENT = (0x20, 0x51, 0xB0)   # accent      #2051b0
+PANEL  = (0xFA, 0xFC, 0xFF)   # panel (badge ring) #fafcff
 
 # geometry on the v1.1.1 64-unit grid
 SOCKET_RECT  = (19, 5, 26, 18, 5.0)          # x y w h rx

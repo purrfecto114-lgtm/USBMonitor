@@ -15,6 +15,7 @@ static um_gui *app;
 static um_toast_win *panel, *notice;
 static um_toast_model inventory;
 static int inventory_ready;
+static int show_others_pref;    /* 托盘“显示其他设备”偏好（2.6.3） */
 
 const um_toast_model *um_gui_win_inventory(void)
 {
@@ -109,12 +110,18 @@ static void panel_action(um_toast_action action, int row, void *user)
     case UM_ACT_TOGGLE_EXPAND:
         place_notice();
         break;
-    case UM_ACT_TOGGLE_OTHERS:
-        /* 冒烟测试据此读取切换后的视图（副标题/计数/可见行）。 */
-        test_panel("show", -1, "");
-        place_notice();
-        break;
     }
+}
+
+/* 托盘“显示其他设备”开关：记住偏好并同步到已存在的面板。
+ * 面板不存在时只存偏好，下次创建/显示时应用。 */
+void um_gui_win_set_show_others(int on)
+{
+    show_others_pref = on ? 1 : 0;
+    if (!panel) return;
+    um_toast_win_set_show_others(panel, show_others_pref);
+    test_panel("show", -1, "");
+    if (um_toast_win_is_visible(panel)) place_notice();
 }
 
 static void notice_action(um_toast_action action, int row, void *user)
@@ -147,16 +154,24 @@ void um_gui_win_notice(const char *title, const char *body, int accent)
 static void show_panel(int interactive)
 {
     um_theme theme;
+    /* 手动打开（托盘“设备概览”）不倒计时；事件触发的面板才用 toast_ttl。 */
+    int ttl = interactive ? 0 : app->toast_ttl * 1000;
     if (!inventory_ready) return;
     if (!panel) {
         um_toast_system_theme(&theme);
-        panel = um_toast_win_new(&inventory, &theme, 1, 0, app->toast_ttl * 1000,
+        panel = um_toast_win_new(&inventory, &theme, 1, 0, ttl,
                                  panel_action, NULL);
     } else {
         um_toast_win_update(panel, &inventory);
     }
     if (!panel) return;
+    /* 手动打开或面板本来隐藏时重设 ttl；事件刷新已可见面板时保留原值，
+     * 避免把事件倒计时或手动常驻状态改掉。 */
+    if (interactive || !um_toast_win_is_visible(panel))
+        um_toast_win_set_ttl(panel, ttl);
     um_toast_win_show(panel);
+    /* show() 首次显示会重建状态，偏好必须在 show 之后应用。 */
+    um_toast_win_set_show_others(panel, show_others_pref);
     if (interactive) SetForegroundWindow((HWND)um_toast_win_hwnd(panel));
     place_notice();
     test_panel("show", -1, "");
@@ -176,13 +191,15 @@ static void show_scanning_panel(void)
         snprintf(m.status, sizeof m.status, "完成后可在托盘菜单查看设备概览");
         m.scanning = 1;
         um_toast_system_theme(&theme);
-        panel = um_toast_win_new(&m, &theme, 1, 0, app->toast_ttl * 1000,
-                                 panel_action, NULL);
+        panel = um_toast_win_new(&m, &theme, 1, 0, 0, panel_action, NULL);
     } else {
         um_toast_win_set_scanning(panel, 1);
     }
     if (!panel) return;
+    /* 扫描面板只由手动打开触发：不自动隐藏。 */
+    um_toast_win_set_ttl(panel, 0);
     um_toast_win_show(panel);
+    um_toast_win_set_show_others(panel, show_others_pref);
     SetForegroundWindow((HWND)um_toast_win_hwnd(panel));
     place_notice();
     test_panel("scan", -1, "");
@@ -218,7 +235,8 @@ static LRESULT CALLBACK listener_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     /* 托盘菜单命令走标准 WM_COMMAND（ID_PANEL == 1，与 tray_win32.c 的
      * 私有枚举一致）。打开动作收起面板后，冒烟测试也能据此再次打开。 */
     case WM_COMMAND:
-        if (LOWORD(wp) == 1) um_gui_win_open_panel();
+        if (LOWORD(wp) == UM_TRAY_ID_PANEL) um_gui_win_open_panel();
+        else if (LOWORD(wp) == UM_TRAY_ID_OTHERS) um_tray_toggle_show_others();
         return 0;
     case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE: {
@@ -326,10 +344,12 @@ void um_gui_win_refresh(um_gui *g, const um_evidence *evidence, int n,
         static const um_evidence test[] = {
             { .tags = UM_TAG_USB | UM_TAG_STORAGE, .disk_number = 2, .ejectable = 1,
               .letters = (1U << 4) | (1U << 5), .accessible_letters = 1U << 4,
-              .volumes = 2, .kind = UM_KIND_USB_STORAGE },
+              .volumes = 2, .kind = UM_KIND_USB_STORAGE,
+              .fs_total = 62706522521ULL, .fs_free = 21582211482ULL },
             { .tags = UM_TAG_USB | UM_TAG_STORAGE, .disk_number = 3, .ejectable = 1,
               .letters = 1U << 7, .accessible_letters = 1U << 7,
-              .volumes = 1, .kind = UM_KIND_USB_STORAGE, .model = "SD 卡" },
+              .volumes = 1, .kind = UM_KIND_USB_STORAGE, .model = "SD 卡",
+              .fs_total = 127775277056ULL, .fs_free = 82141183590ULL },
             { .disk_number = -1, .kind = UM_KIND_DOCK_HUB },
             { .disk_number = -1, .kind = UM_KIND_HID_PEN },
         };

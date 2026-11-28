@@ -130,11 +130,13 @@ typedef struct {
     int  focus_btn;         /* 键盘焦点所在按钮                          */
     int  paused;            /* hover 暂停倒计时                          */
     int  remaining_ms;      /* 剩余自动隐藏时间                          */
-    int  ttl_ms;            /* 总时长（默认 10000，与 1.1.1 AUTO_HIDE_MS）*/
+    int  ttl_ms;            /* 总时长；0 = 不自动隐藏（手动面板，2.6.3）  */
     int  scroll_px;         /* 行区滚动偏移                              */
     int  spinner_phase;     /* 扫描指示旋转相位 0..7                     */
 } um_toast_state;
 
+/* ttl_ms > 0 = 自动隐藏总时长；<= 0 = 不自动隐藏（手动打开的面板常驻，
+ * 由用户点 ✖ / Esc 关闭，而不是被倒计时收走）。 */
 void um_toast_state_init(um_toast_state *s, int ttl_ms);
 
 /* 倒计时推进：dt_ms 毫秒。返回 1 表示"该自动隐藏了"。 */
@@ -150,7 +152,6 @@ typedef enum {
     UM_HIT_OPEN   = 1,     /* 底部主按钮 "打开U盘"      */
     UM_HIT_EXPAND = 2,     /* "展开列表" / "收起列表"   */
     UM_HIT_CLOSE  = 3,     /* 右上角 ✖                  */
-    UM_HIT_SHOW_OTHERS = 4,/* "显示其他设备" / "隐藏其他设备" */
     UM_HIT_ROW    = 100,   /* + 行号（模型下标）         */
     UM_HIT_ROW_OPEN = 200  /* + 行号：行内"打开卷"（展开态） */
 } um_ui_hit;

@@ -191,11 +191,11 @@ static void draw_usb_icon(HDC hdc, int x, int y, int w, int h,
     }
     SelectObject(hdc, oldp);
 
-    /* 角标 */
-    SelectObject(hdc, badge);
-    Ellipse(hdc, x + w * 62 / 100, y + h * 56 / 100,
-            x + w * 98 / 100, y + h * 96 / 100);
+    /* 角标：只有"接入/移除/错误"才画（原型里普通设备是纯图标，2.6.3） */
     if (add || rm) {
+        SelectObject(hdc, badge);
+        Ellipse(hdc, x + w * 62 / 100, y + h * 56 / 100,
+                x + w * 98 / 100, y + h * 96 / 100);
         SelectObject(hdc, mark);
         if (add) {
             MoveToEx(hdc, x + w * 71 / 100, y + h * 76 / 100, NULL);
@@ -474,16 +474,20 @@ static void show_row_menu(struct um_toast_win *w, int row, int x, int y)
     }
 }
 
-/* “显示其他设备 / 隐藏其他设备”：开关 + 按需展开/收起。 */
-static void toggle_others(struct um_toast_win *w)
+/* “显示其他设备 / 隐藏其他设备”视图开关（2.6.3 由托盘菜单驱动）。
+ * 只改视图，不触发任何动作回调——托盘侧负责持久化偏好。 */
+void um_toast_win_set_show_others(um_toast_win *w, int on)
 {
     int target;
-    w->state.show_others = !w->state.show_others;
+    if (!w) return;
+    on = on ? 1 : 0;
+    if (w->state.show_others == on) return;
+    w->state.show_others = on;
     w->state.scroll_px = 0;
     w->state.hover_row = -1;
     /* 显示其他设备时若列表不止一行，直接展开；隐藏时若只剩 ≤1 行，
      * 收回折叠态（折叠态只放得下 1 行，否则开关看起来毫无反应）。 */
-    if (w->state.show_others) {
+    if (on) {
         if (um_toast_visible_count(&w->model, &w->state) > 1)
             w->state.expanded = 1;
     } else if (um_toast_visible_count(&w->model, &w->state) <= 1) {
@@ -492,7 +496,6 @@ static void toggle_others(struct um_toast_win *w)
     target = um_toast_measure_height(&w->model, &w->state);
     animate_to_height(w, target);
     InvalidateRect(w->hwnd, NULL, FALSE);
-    fire(w, UM_ACT_TOGGLE_OTHERS, -1);
 }
 
 /* 轻点 / 鼠标点击共用：命中测试 → 动作。打开动作由宿主在回调里收起面板
@@ -523,10 +526,6 @@ static void panel_press(struct um_toast_win *w, int x, int y)
         animate_to_height(w, target);
         InvalidateRect(w->hwnd, NULL, FALSE);
         fire(w, UM_ACT_TOGGLE_EXPAND, -1);
-        return;
-    }
-    if (hit == UM_HIT_SHOW_OTHERS) {
-        toggle_others(w);
         return;
     }
     if (hit >= UM_HIT_ROW && hit < UM_HIT_ROW + UM_UI_MAX_ROWS) {
@@ -618,8 +617,6 @@ static void focus_next(struct um_toast_win *w)
         if (total) focus_row(w, visible_row_at(w, 0));
         else w->state.focus_btn = UM_HIT_CLOSE;
     } else if (w->state.focus_btn == UM_HIT_EXPAND) {
-        w->state.focus_btn = UM_HIT_CLOSE;
-    } else if (w->state.focus_btn == UM_HIT_SHOW_OTHERS) {
         w->state.focus_btn = UM_HIT_CLOSE;
     } else if (pos >= 0 && pos + 1 < visible) {
         focus_row(w, visible_row_at(w, pos + 1));
@@ -856,8 +853,6 @@ static LRESULT CALLBACK toast_proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             } else if (w->state.focus_btn == UM_HIT_EXPAND) {
                 um_toast_win_toggle_expand(w);
                 fire(w, UM_ACT_TOGGLE_EXPAND, -1);
-            } else if (w->state.focus_btn == UM_HIT_SHOW_OTHERS) {
-                toggle_others(w);
             } else if (row >= 0 && row < w->model.n_rows) {
                 if (w->model.rows[row].openable) fire(w, UM_ACT_OPEN_ROW, row);
             } else {
@@ -1062,7 +1057,8 @@ um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
     w->cb = cb;
     w->user = user;
     w->fit = 1.0;                       /* calloc 给的是 0，必须显式初始化 */
-    um_toast_state_init(&w->state, (ttl_ms > 0) ? ttl_ms : 10000);
+    /* 2.6.3: ttl 原样传入；<=0 = 不自动隐藏（手动面板），不再夹成 10s。 */
+    um_toast_state_init(&w->state, ttl_ms);
     w->width  = (width > 0) ? width : UM_UI_WIDTH;
     w->height = um_toast_measure_height(&w->model, &w->state);
 
@@ -1253,6 +1249,16 @@ int um_toast_win_height(const um_toast_win *w)
 int um_toast_win_is_expanded(const um_toast_win *w)
 {
     return (w && w->state.expanded) ? 1 : 0;
+}
+
+void um_toast_win_set_ttl(um_toast_win *w, int ttl_ms)
+{
+    if (!w) return;
+    /* ttl <= 0 = 不自动隐藏（手动打开的面板常驻）。 */
+    w->state.ttl_ms = ttl_ms > 0 ? ttl_ms : 0;
+    w->state.remaining_ms = w->state.ttl_ms;
+    w->state.paused = 0;
+    InvalidateRect(w->hwnd, NULL, FALSE);
 }
 
 void um_toast_win_toggle_expand(um_toast_win *w)

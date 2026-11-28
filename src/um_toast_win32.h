@@ -16,7 +16,6 @@ typedef enum {
     UM_ACT_COPY,
     UM_ACT_EJECT,
     UM_ACT_TOGGLE_EXPAND,
-    UM_ACT_TOGGLE_OTHERS,
     UM_ACT_CLOSE,
     UM_ACT_AUTOHIDE
 } um_toast_action;
@@ -43,7 +42,7 @@ void um_toast_system_theme(um_theme *theme);
 
 /* 创建（不显示）：model 拷贝进窗口，theme 同理。
  * width 为设计空间（96DPI）像素宽，0 = 默认 UM_UI_WIDTH；
- * ttl_ms 为倒计时，0 = 默认 10s。
+ * ttl_ms 为倒计时，<= 0 = 不自动隐藏（手动面板常驻，2.6.3）。
  * n_rows == 0 的模型渲染成"信息框"（纯文字，无按钮，点任意处/Esc 关闭，
  * 窗口标题 "usbmon-toast"）；n_rows > 0 是设备面板（标题 "usbmon"）。 */
 um_toast_win *um_toast_win_new(const um_toast_model *m, const um_theme *t,
@@ -80,6 +79,13 @@ int  um_toast_win_is_visible(const um_toast_win *w);
 int  um_toast_win_height(const um_toast_win *w);
 int  um_toast_win_is_expanded(const um_toast_win *w);
 void um_toast_win_toggle_expand(um_toast_win *w);
+/* 重设自动隐藏时长（毫秒）。ttl_ms <= 0 = 不自动隐藏（手动面板）；
+ * 同时把剩余时间重置为新值并清除 hover 暂停，窗口立即重绘时间条。 */
+void um_toast_win_set_ttl(um_toast_win *w, int ttl_ms);
+/* “显示其他设备”视图开关（托盘菜单/设置驱动，2.6.3）。
+ * on 夹到 0/1；状态未变时直接返回。变化时清滚动/hover，按可见行数
+ * 自动展开或收回折叠态，并缓动到新高度；不触发任何动作回调。 */
+void um_toast_win_set_show_others(um_toast_win *w, int on);
 /* 扫描中：图标位换成 8 点旋转指示，倒计时条继续走；0 = 恢复正常绘制。 */
 void um_toast_win_set_scanning(um_toast_win *w, int scanning);
 

@@ -350,6 +350,40 @@ const char *um_state_dir(char *buf, size_t n)
     return buf;
 }
 
+/* Drop a harmless hooks template next to the real config on first run.
+ * Never overwrites and never creates hooks.json itself: hooks stay opt-in. */
+static void ensure_example_hooks(const char *dir)
+{
+    static const char sample[] =
+        "{\n"
+        "  \"_comment\": \"Rename to hooks.json and set enabled=true after editing the command.\",\n"
+        "  \"hooks\": [\n"
+        "    {\n"
+        "      \"name\": \"example-backup\",\n"
+        "      \"match_keys\": [\"disk*\"],\n"
+        "      \"match_models\": [\"SanDisk*\"],\n"
+#ifdef _WIN32
+        "      \"command\": [\"C:\\\\Tools\\\\backup.exe\", \"--source\", \"{path}\"],\n"
+#else
+        "      \"command\": [\"/usr/local/bin/backup\", \"--source\", \"{path}\"],\n"
+#endif
+        "      \"debounce_seconds\": 3,\n"
+        "      \"enabled\": false\n"
+        "    }\n"
+        "  ]\n"
+        "}\n";
+    char path[600];
+    FILE *f;
+    if (snprintf(path, sizeof path, "%s/hooks.example.json", dir) >= (int)sizeof path)
+        return;
+    f = um_fopen(path, "rb");
+    if (f) { fclose(f); return; }          /* already there: keep user edits */
+    f = um_fopen(path, "wb");              /* LF, UTF-8, no BOM */
+    if (!f) return;
+    (void)fwrite(sample, 1, sizeof sample - 1, f);
+    fclose(f);
+}
+
 const char *um_config_dir(char *buf, size_t n)
 {
 #ifdef _WIN32
@@ -366,6 +400,7 @@ const char *um_config_dir(char *buf, size_t n)
     }
 #endif
     um_mkdir_p(buf);
+    ensure_example_hooks(buf);
     return buf;
 }
 

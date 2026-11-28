@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.3] · 2026-11-28
+
+### Changed
+
+- **「显示其他设备」移入托盘菜单**：托盘右键菜单新增可勾选项，默认隐藏并记住选择（`HKCU\Software\USBMonitor\ShowOthers`）；面板底部不再重复放置该开关，只保留展开/收起与打开U盘。
+- **首次运行生成 Hooks 模板**：配置目录写入 `hooks.example.json`（`enabled: false`、占位命令），编辑后改名为 `hooks.json` 并启用；不会自动启用 hooks。
+- **图标改版**：应用与安装器图标改为浅蓝底 + 深蓝 USB 符号。
+
+### Fixed
+
+- 手动打开「设备概览」不再启动自动隐藏计时器；只有事件触发的面板/通知才倒计时。
+- 面板普通设备图标去掉蓝色状态圆点，与视觉原型一致。
+- Windows 冒烟测试面板补上容量/进度数据；安装器许可页保持 `LicenseFile=..\LICENSE`（MIT）并复核合理。
+
 ## [2.6.2] · 2026-11-27
 
 ### Added

@@ -141,7 +141,7 @@ int main(void)
         CHECK(h == UM_HIT_NONE);
     }
 
-    printf("== 5. 倒计时状态机（tick / hover 暂停 / 恢复）==\n");
+    printf("== 5. 倒计时状态机（tick / hover 暂停 / 恢复 / ttl 0 常驻）==\n");
     {
         um_toast_state s;
         um_toast_state_init(&s, 10000);
@@ -151,17 +151,38 @@ int main(void)
         CHECK(um_toast_tick(&s, 5000) == 0 && s.remaining_ms == 7000);
         um_toast_resume(&s);
         CHECK(um_toast_tick(&s, 7000) == 1);
+
+        /* 2.6.3：ttl 0 = 手动面板，永不自动隐藏。 */
+        um_toast_state_init(&s, 0);
+        CHECK(s.ttl_ms == 0 && s.remaining_ms == 0);
+        s.visible = 1;
+        CHECK(um_toast_tick(&s, 60000) == 0 && s.remaining_ms == 0);
+        um_toast_pause(&s);
+        um_toast_resume(&s);
+        CHECK(s.paused == 0 && s.remaining_ms == 0);
+        um_toast_restart(&s);
+        CHECK(s.remaining_ms == 0 && s.ttl_ms == 0);
     }
 
     printf("== 6. 通过真实窗口过程驱动交互（Win32 消息）==\n");
     um_theme_resolve(&theme, "dark", 1);
     shim_window(NULL, 440, 230);
     CHECK(um_toast_win_init(NULL) == 1);
-    w = um_toast_win_new(&m, &theme, 1, 0, 0, on_action, NULL);
+    w = um_toast_win_new(&m, &theme, 1, 0, 10000, on_action, NULL);
     CHECK(w != NULL);
     if (!w) { printf("fatal: no window\n"); return 1; }
     um_toast_win_show(w);
     CHECK(shim_visible(TEST_HWND) == 1);
+
+    /* 2.6.3：set_ttl 在常驻（0）与倒计时之间切换。 */
+    um_toast_win_set_ttl(w, 0);
+    CHECK(um_toast_win_state(w)->ttl_ms == 0);
+    CHECK(um_toast_win_state(w)->remaining_ms == 0);
+    um_toast_win_set_ttl(w, 5000);
+    CHECK(um_toast_win_state(w)->ttl_ms == 5000);
+    CHECK(um_toast_win_state(w)->remaining_ms == 5000);
+    um_toast_win_set_ttl(w, 10000);
+    CHECK(um_toast_win_state(w)->ttl_ms == 10000);
 
     g_last_act = -1;
     shim_send(TEST_HWND, WM_LBUTTONUP, 0,
@@ -692,8 +713,9 @@ int main(void)
         CHECK(um_toast_visible_row(&mf, &sf, 3) == -1);
         CHECK(um_toast_first_openable_row(&mf, &sf) == 0);
         CHECK(um_toast_hit_test(&mf, &sf, 440, 230, 412, 29) == UM_HIT_CLOSE);
+        /* 2.6.3：底部“显示其他设备”已移除（改到托盘菜单），原位置无命中。 */
         CHECK(um_toast_hit_test(&mf, &sf, 440, 230, 170, 193)
-              == UM_HIT_SHOW_OTHERS);
+              == UM_HIT_NONE);
 
         sf.show_others = 1;
         CHECK(um_toast_visible_count(&mf, &sf) == 5);
@@ -746,7 +768,7 @@ int main(void)
         (void)tags;
     }
 
-    printf("== 24. 显示其他设备：改状态 + 自动展开 + 拨回折叠 ==\n");
+    printf("== 24. 显示其他设备：托盘开关 + 自动展开 + 拨回折叠 ==\n");
     {
         um_toast_model mf;
         um_toast_win *w2;
@@ -764,18 +786,15 @@ int main(void)
         um_toast_win_show(w2);
         CHECK(um_toast_win_height(w2) == 230);
 
+        /* 2.6.3：开关由托盘菜单/宿主驱动，不再点击面板底部。 */
         g_last_act = -1;
-        shim_send(TEST_HWND, WM_LBUTTONUP, 0, (LPARAM)(170 | (193 << 16)));
-        CHECK(g_last_act == UM_ACT_TOGGLE_OTHERS);
+        um_toast_win_set_show_others(w2, 1);
         CHECK(um_toast_win_state(w2)->show_others == 1);
         CHECK(um_toast_win_is_expanded(w2) == 1);
         CHECK(um_toast_win_height(w2) == 430);
+        CHECK(g_last_act == -1);          /* 只改视图，不触发动作 */
 
-        /* 展开后按钮区随窗口下移：用当前高度算 y，不能再用折叠态的 193。 */
-        g_last_act = -1;
-        shim_send(TEST_HWND, WM_LBUTTONUP, 0,
-                  (LPARAM)(170 | ((um_toast_win_height(w2) - 37) << 16)));
-        CHECK(g_last_act == UM_ACT_TOGGLE_OTHERS);
+        um_toast_win_set_show_others(w2, 0);
         CHECK(um_toast_win_state(w2)->show_others == 0);
         /* 隐藏其他设备后仍有 3 个存储设备 → 保持展开（原型 C → B）。 */
         CHECK(um_toast_visible_count(&mf, um_toast_win_state(w2)) == 3);
