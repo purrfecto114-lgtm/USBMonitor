@@ -47,15 +47,20 @@ Name: "autostart"; Description: "开机自动启动 USB 设备监控"; \
 ; Paths are relative to this script (tools\), so the build output at the
 ; repo root is addressed with ..\.
 Source: "..\winbin\usbmon.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Ship the light icon next to the exe so shortcuts point at a *new* icon
+; source path.  Explorer caches icons by path; reusing the exe path keeps
+; showing the old dark glyph after an in-place upgrade.
+Source: "..\res\usbmon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
+    IconFilename: "{app}\usbmon.ico"; IconIndex: 0
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
-    Tasks: desktopicon
+    IconFilename: "{app}\usbmon.ico"; IconIndex: 0; Tasks: desktopicon
 
 ; Autostart is registered by the app itself (--install-startup), NOT by a
 ; [Registry] HKCU entry.  With PrivilegesRequired=admin an HKCU write from
@@ -71,6 +76,10 @@ Filename: "{app}\{#AppExeName}"; Parameters: "--install-startup"; \
     Tasks: autostart; Flags: runhidden runasoriginaluser skipifdoesntexist
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; \
     Flags: nowait postinstall skipifsilent
+; Flush the shell icon cache so the desktop/Start Menu glyph updates in the
+; same session (old dark icon was cached by the exe/shortcut path).
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-show"; \
+    Flags: runhidden skipifdoesntexist
 
 [UninstallRun]
 ; Remove login autostart (both the current and the legacy value name).
